@@ -2322,7 +2322,7 @@ MODULE G_WALL
             REAL(EB), DEVICE, DIMENSION(*) :: MWR_ZD_IN
             REAL(EB), VALUE :: R0D_IN
 
-            INTEGER :: IW, N, II, JJ, KK, IIG, JJG, KKG, IPZ, SF_IDX, IC, ICG
+            INTEGER :: IW, N, II, JJ, KK, IPZ, SF_IDX
             REAL(EB) :: RSUM_F, RHO_F_LOCAL, UN_P
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
@@ -2349,6 +2349,17 @@ MODULE G_WALL
                 ENDDO
                 RSUM_F = R0D_IN*RSUM_F
                 RHO_F_LOCAL = PBARD_IN(KK,IPZ)/(RSUM_F*WALL_TMP_FD(IW))
+            ENDIF
+
+            ! Exterior ghost cell species (CPU: end of CALCULATE_ZZ_F, i.e. before the SOLID inflow override below).
+            ! FDS 54bd18d6e5: Z_ghost=Z_F instead of 2*Z_F-Z_G, without the SOLID check (no second ghost layer II2).
+            IF (IW <= N_EXTERNAL_WALL_CELLS .AND. WALL_TOPO(IW)%BOUNDARY_TYPE /= OPEN_BOUNDARY_IN) THEN
+                II = WALL_TOPO(IW)%II
+                JJ = WALL_TOPO(IW)%JJ
+                KK = WALL_TOPO(IW)%KK
+                DO N = 1, N_TRACKED_SPECIES
+                    ZZPD(II,JJ,KK,N) = WALL_ZZ_FD(IW,N)
+                ENDDO
             ENDIF
 
             IF (WALL_TOPO(IW)%BOUNDARY_TYPE == SOLID_BOUNDARY_IN) THEN
@@ -2378,7 +2389,9 @@ MODULE G_WALL
                 II = WALL_TOPO(IW)%II
                 JJ = WALL_TOPO(IW)%JJ
                 KK = WALL_TOPO(IW)%KK
-                RHOPD(II,JJ,KK) = 2._EB*RHO_F_LOCAL - WALL_RHO_GD(IW)
+                ! FDS 54bd18d6e5: rho_ghost=RHO_F (was 2*RHO_F-RHO_G) and TMP_ghost=TMP_F (no second ghost layer II2)
+                RHOPD(II,JJ,KK) = RHO_F_LOCAL
+                TMPD(II,JJ,KK)  = WALL_TMP_FD(IW)
             ELSEIF (IW <= N_EXTERNAL_WALL_CELLS .AND. &
                     SF_THERMAL_BC_INDEXD(SF_IDX) == INFLOW_OUTFLOW_IN) THEN
                 II = WALL_TOPO(IW)%II
@@ -2389,21 +2402,6 @@ MODULE G_WALL
                 RSUMD(II,JJ,KK) = RSUM_F
                 DO N = 1, N_TRACKED_SPECIES
                     ZZPD(II,JJ,KK,N) = WALL_ZZ_FD(IW,N)
-                ENDDO
-            ENDIF
-
-            II  = WALL_TOPO(IW)%II
-            JJ  = WALL_TOPO(IW)%JJ
-            KK  = WALL_TOPO(IW)%KK
-            IIG = WALL_TOPO(IW)%IIG
-            JJG = WALL_TOPO(IW)%JJG
-            KKG = WALL_TOPO(IW)%KKG
-            IC  = CELL_INDEXD(II,JJ,KK)
-            ICG = CELL_INDEXD(IIG,JJG,KKG)
-            IF (IW <= N_EXTERNAL_WALL_CELLS .AND. WALL_TOPO(IW)%BOUNDARY_TYPE /= OPEN_BOUNDARY_IN .AND. &
-                .NOT.CELL_SOLIDD(IC) .AND. .NOT.CELL_SOLIDD(ICG)) THEN
-                DO N = 1, N_TRACKED_SPECIES
-                    ZZPD(II,JJ,KK,N) = 2._EB*WALL_ZZ_FD(IW,N) - WALL_ZZ_GD(IW,N)
                 ENDDO
             ENDIF
 
