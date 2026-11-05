@@ -2887,27 +2887,31 @@ MODULE G_VELO
                         CYCLE
                     ENDIF
 
-                    ITMP = MIN(I_MAX_TEMP_LOCAL, NINT(0.5_EB*(TMPD_IN(IIGM,JJGM,KKGM)+TMPD_IN(IIGP,JJGP,KKGP))))
-                    MU_WALL  = MU_RSQMW_ZD(ITMP,1) / RSQ_MW_ZD(1)
-                    RHO_WALL = 0.5_EB*(RHOPD(IIGM,JJGM,KKGM) + RHOPD(IIGP,JJGP,KKGP))
+                    ! WALL_MODEL_BC. FDS 4218ee295b (+15cca3a6a8): at a convex OBST corner use no-slip with
+                    ! molecular MUA instead of half-slip with wall-model stress; WALL_MODEL is not called there.
+                    IF ((IWM==0 .OR. IWP==0) .AND. (.NOT. EDGE_EXTERNAL(IE))) THEN  ! Special case for a corner
+                        VEL_GHOST = 2._EB*VEL_T - VEL_GAS
+                        EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
+                        EDGE_TAU_IN  (IE,ICD_SGN) = MUA*EDGE_OMEGA_IN(IE,ICD_SGN)
+                    ELSE
+                        ITMP = MIN(I_MAX_TEMP_LOCAL, NINT(0.5_EB*(TMPD_IN(IIGM,JJGM,KKGM)+TMPD_IN(IIGP,JJGP,KKGP))))
+                        MU_WALL  = MU_RSQMW_ZD(ITMP,1) / RSQ_MW_ZD(1)
+                        RHO_WALL = 0.5_EB*(RHOPD(IIGM,JJGM,KKGM) + RHOPD(IIGP,JJGP,KKGP))
 
-                    CALL WALL_MODEL_DEVICE( &
-                        SLIP_COEF,U_TAU,Y_PLUS, &
-                        MU_WALL/RHO_WALL, &
-                        SURF_ROUGHNESS(SURF_INDEX_USE), &
-                        0.5_EB*DXX(ICD), &
-                        VEL_GAS-VEL_T, &
-                        SIM_MODE_LOCAL,DNS_MODE_LOCAL, &
-                        VK_LOCAL,YW_LOCAL )
+                        CALL WALL_MODEL_DEVICE( &
+                            SLIP_COEF,U_TAU,Y_PLUS, &
+                            MU_WALL/RHO_WALL, &
+                            SURF_ROUGHNESS(SURF_INDEX_USE), &
+                            0.5_EB*DXX(ICD), &
+                            VEL_GAS-VEL_T, &
+                            SIM_MODE_LOCAL,DNS_MODE_LOCAL, &
+                            VK_LOCAL,YW_LOCAL )
 
-                    IF ((IWM==0 .OR. IWP==0) .AND. (.NOT. EDGE_EXTERNAL(IE))) THEN
-                        SLIP_COEF = 0._EB
+                        VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
+
+                        EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
+                        EDGE_TAU_IN  (IE,ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,EDGE_OMEGA_IN(IE,ICD_SGN))
                     ENDIF
-
-                    VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
-
-                    EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
-                    EDGE_TAU_IN  (IE,ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,EDGE_OMEGA_IN(IE,ICD_SGN))
 
                     SELECT CASE(IEC)
                     CASE(1)
