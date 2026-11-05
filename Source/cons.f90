@@ -872,12 +872,19 @@ INTEGER :: NLAMBDAT               !< Number of wavelength subdivisions
 INTEGER :: N_RADCAL_ARRAY_SIZE
 INTEGER :: RADCAL_SPECIES_INDEX(16)
 INTEGER :: N_KAPPA_T=44           !< Number of temperature points in absorption coefficient look-up table
-INTEGER :: N_KAPPA_Y=50           !< Number of species points in absorption coefficient look-up table
+INTEGER :: N_KAPPA_X=50           !< Number of species points in absorption coefficient look-up table
+REAL(EB) :: KAPPA_X_MIN=1.E-5_EB,KAPPA_X_MAX=1._EB  !< Min/max volume fraction for absorption coefficient look-up table
+REAL(EB) :: KAPPA_C_MIN=2.E-7_EB,KAPPA_C_MAX=0.2_EB !< Min/max mass fraction for soot coefficient look-up table
+REAL(EB) :: KAPPA_X_FAC,LOG_KAPPA_X_FAC             !< Scaling factor for absorption coefficient look-up table
+REAL(EB) :: KAPPA_C_FAC,LOG_KAPPA_C_FAC             !< Scaling factor for soot coefficient look-up table
 
 LOGICAL :: WIDE_BAND_MODEL        !< Non-gray gas, wide band model
 LOGICAL :: WSGG_MODEL             !< Weighted Sum of Gray Gas model
 
+! Z2RADCAL_SPECIES(N,NS): tracked species NS to RadCal species N. With MW_A of the mixture, Z2RADCAL_SPECIES*ZZ*MW_A is
+! the volume fraction of a gas, Z2RADCAL_SPECIES*ZZ the scaled mass fraction of soot (FDS 6.11.1, Y2RADCAL_SPECIES*Y).
 REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: Z2RADCAL_SPECIES
+REAL(EB), ALLOCATABLE, DIMENSION(:) :: KAPPA_COND  !< 0 for condensed (evaporating) species, removed from the kappa look-up
 REAL(EB), ALLOCATABLE, DIMENSION(:,:,:,:) :: RADCAL_SPECIES2KAPPA
 CHARACTER(LABEL_LENGTH) :: RADCAL_SPECIES_ID(16)='NULL'
 
