@@ -87,6 +87,32 @@ target_compile_options(fds PRIVATE
 # Intel MKL interfaces.
 target_compile_definitions(fds PRIVATE WITH_MKL)
 
+# Revision in .out and .smv. Without .git (source copied as a tarball) pass -DGFDS_REVISION=... and
+# -DGFDS_REVISION_DATE=...;
+# otherwise "GFDS-" + git describe of the source tree.
+set(GFDS_REVISION "" CACHE STRING "Revision string written to .out and .smv")
+set(GFDS_REVISION_DATE "" CACHE STRING "Revision date for GFDS_REVISION (git log date if empty)")
+if(NOT GFDS_REVISION)
+  execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" describe --always --dirty --abbrev=10
+                  OUTPUT_VARIABLE _gfds_rev OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _gfds_rc)
+  if(_gfds_rc EQUAL 0 AND _gfds_rev)
+    set(GFDS_REVISION "GFDS-${_gfds_rev}")
+  endif()
+endif()
+if(GFDS_REVISION)
+  target_compile_definitions(fds PRIVATE GITHASH_PP="${GFDS_REVISION}")
+  set(_gfds_date "${GFDS_REVISION_DATE}")
+  if(NOT _gfds_date)
+    execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" log -1 --format=%cd
+                    OUTPUT_VARIABLE _gfds_date OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  if(_gfds_date)
+    target_compile_definitions(fds PRIVATE GITDATE_PP="${_gfds_date}")
+  endif()
+endif()
+string(TIMESTAMP _gfds_build "%b %d, %Y %H:%M:%S")
+target_compile_definitions(fds PRIVATE BUILDDATE_PP="${_gfds_build}")
+
 if(SINGLE_PRECISION)
   target_compile_definitions(fds PRIVATE GFDS_SINGLE_PRECISION)
 endif()
