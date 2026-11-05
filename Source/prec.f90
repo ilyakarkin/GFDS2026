@@ -42,6 +42,7 @@ REAL(EB), PARAMETER :: ONE_P_EPS=1._EB+100._EB*EPSILON(1._EB) !< Number that is 
 REAL(EB), PARAMETER :: MICRON=1.E-6_EB                        !< A relatively small length (m)
 REAL(QB), PARAMETER :: TWO_EPSILON_QB=2._QB*EPSILON(1._QB)    !< A very small number 16 byte accuracy
 REAL(EB), PARAMETER :: TWO_EPSILON_EB=2._EB*EPSILON(1._EB)    !< A very small number 8 byte accuracy
+REAL(EB), PARAMETER :: TWENTY_EPSILON_EB=20._EB*EPSILON(1._EB) !< FDS 6.11.1 threshold (kappa look-up)
 REAL(FB), PARAMETER :: TWO_EPSILON_FB=2._EB*EPSILON(1._FB)    !< A very small number 4 byte accuracy
 REAL(EB), PARAMETER :: TINY_EB=TINY(1._EB)                    !< The smallest resolvable 8 byte real number
 REAL(EB), PARAMETER :: HUGE_EB=HUGE(1._EB)                    !< The largest resolvable 8 btye real number
