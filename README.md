@@ -4,6 +4,8 @@ FireCat GFDS fork is a fork of [mxd45za/GFDS2026](https://github.com/mxd45za/GFD
 engineering models (building evacuation studies: many rooms, timed burners, smoke and heat detectors).
 The goal is GPU runs **5–10 times faster than FDS 6.11.1 on CPU with the same results**.
 
+Author and maintainer of the fork: **Ilya Karkin**, [pyrosim.ru](https://pyrosim.ru).
+
 The default branch `firesim` is upstream `GFDS` plus the changes below. Each change is also a separate
 branch and a pull request to upstream, so anyone can take only what they need. Upstream changes are merged
 in from time to time.
