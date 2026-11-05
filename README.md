@@ -1,6 +1,6 @@
-# GFDS — FireSim fork
+# GFDS — FireCat GFDS fork
 
-This is a fork of [mxd45za/GFDS2026](https://github.com/mxd45za/GFDS2026) maintained for fire-safety
+FireCat GFDS fork is a fork of [mxd45za/GFDS2026](https://github.com/mxd45za/GFDS2026) maintained for fire-safety
 engineering models (building evacuation studies: many rooms, timed burners, smoke and heat detectors).
 The goal is GPU runs **5–10 times faster than FDS 6.11.1 on CPU with the same results**.
 
