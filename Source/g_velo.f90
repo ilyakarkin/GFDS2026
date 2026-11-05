@@ -2272,7 +2272,7 @@ MODULE G_VELO
 
                 IF (GM%N_EDGE_AXIS1 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS1,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2299,7 +2299,7 @@ MODULE G_VELO
                         SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
                 IF (GM%N_EDGE_AXIS2 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS2,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2326,7 +2326,7 @@ MODULE G_VELO
                         SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
                 IF (GM%N_EDGE_AXIS3 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS3,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2366,7 +2366,7 @@ MODULE G_VELO
 
                 IF (GM%N_EDGE_AXIS1 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS1,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2393,7 +2393,7 @@ MODULE G_VELO
                         SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
                 IF (GM%N_EDGE_AXIS2 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS2,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2420,7 +2420,7 @@ MODULE G_VELO
                         SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
                 IF (GM%N_EDGE_AXIS3 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS3,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
                         GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
@@ -2553,7 +2553,7 @@ MODULE G_VELO
         !--------------------------------------------------------------------------
         ! One-thread-per-edge velocity ghost kernel
         !--------------------------------------------------------------------------
-        ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_BC_GPU_GHOST_KERNEL_AXIS(UU,VV,WW,RHOPD,TMPD_IN,EDGE_GHOST_1,EDGE_GHOST_2, &
+        ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_BC_GPU_GHOST_KERNEL_AXIS(UU,VV,WW,RHOPD,TMPD_IN,MU_IN,EDGE_GHOST_1,EDGE_GHOST_2, &
             EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG, &
             EDGE_OMEGA_IN,EDGE_TAU_IN,EDGE_SIDE_ISGN_IN,EDGE_SIDE_IOR_IN,EDGE_SIDE_IS2_IN,EDGE_SIDE_ICD_IN, &
             EDGE_SIDE_IWM_IN,EDGE_SIDE_IWMI_IN,EDGE_SIDE_IWP_IN,EDGE_SIDE_IWPI_IN, &
@@ -2570,7 +2570,7 @@ MODULE G_VELO
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
 
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UU,VV,WW,RHOPD,TMPD_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UU,VV,WW,RHOPD,TMPD_IN,MU_IN
             REAL(EB), DEVICE, DIMENSION(0:*) :: EDGE_GHOST_1,EDGE_GHOST_2
             REAL(EB), DEVICE, DIMENSION(0:*) :: EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG
             REAL(EB), DEVICE, DIMENSION(EDGE_ACTIVE_LB:EDGE_ACTIVE_UB,-2:*) :: EDGE_OMEGA_IN,EDGE_TAU_IN
@@ -2876,7 +2876,8 @@ MODULE G_VELO
                         IF (IEC==1 .OR. (IEC==2 .AND. ICD==2)) VEL_T = RAMP_T*SURF_VEL_T_2(SURF_INDEX_USE)
                         IF (IEC==3 .OR. (IEC==2 .AND. ICD==1)) VEL_T = RAMP_T*SURF_VEL_T_1(SURF_INDEX_USE)
                     ENDIF
-                    MUA = 0.5_EB*(MUD(IIGM,JJGM,KKGM) + MUD(IIGP,JJGP,KKGP))
+                    ! MU of this mesh passed explicitly: the module pointer MUD points to whichever mesh was set last
+                    MUA = 0.5_EB*(MU_IN(IIGM,JJGM,KKGM) + MU_IN(IIGP,JJGP,KKGP))
 
                     IF (VELOCITY_BC_INDEX == FREE_SLIP_BC_LOCAL) THEN
                         VEL_GHOST = VEL_GAS
