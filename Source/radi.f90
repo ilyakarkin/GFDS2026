@@ -2783,7 +2783,7 @@ USE COMP_FUNCTIONS, ONLY: SHUTDOWN
 USE MIEV
 USE RADCAL_CALC
 USE WSGG_ARRAYS
-REAL(EB) :: THETAUP,THETALOW,PHIUP,PHILOW,F_THETA,PLANCK_C2,KSI,LT,RCRHO,YY,YY2,BBF,AP0,AMEAN,RADIANCE,TRANSMISSIVITY,X_N2,&
+REAL(EB) :: THETAUP,THETALOW,PHIUP,PHILOW,F_THETA,PLANCK_C2,KSI,LT,RCRHO,YY,XX,BBF,AP0,AMEAN,RADIANCE,TRANSMISSIVITY,&
             THETA,PHI,DLO
 INTEGER  :: N,I,J,K,IPC,IZERO,NN,NI,II,JJ,IIM,JJM,IBND,NS,NS2,NRA,NSB,RADCAL_TEMP(16)=0,RCT_SKIP=-1,IO
 TYPE (LAGRANGIAN_PARTICLE_CLASS_TYPE), POINTER :: LPC
@@ -3178,23 +3178,35 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
 
    BUILD_KAPPA_ARRAY: IF (N_RADCAL_ARRAY_SIZE>0) THEN
 
+      ! Look-up table in volume fraction (gases) and mass fraction (soot) on a log scale, as in FDS 6.11.1
+      ! (0eab2e6d17 "Fix kappa lookup to be accurate in volume fraction", c33b760989 condensed species).
+
+      KAPPA_X_FAC = (KAPPA_X_MAX/KAPPA_X_MIN)**(1._EB/(N_KAPPA_X-1))
+      LOG_KAPPA_X_FAC = LOG(KAPPA_X_FAC)
+      KAPPA_C_FAC = (KAPPA_C_MAX/KAPPA_C_MIN)**(1._EB/(N_KAPPA_X-1))
+      LOG_KAPPA_C_FAC = LOG(KAPPA_C_FAC)
+
       ALLOCATE(Z2RADCAL_SPECIES(N_RADCAL_ARRAY_SIZE,1:N_TRACKED_SPECIES),STAT=IZERO)
       CALL ChkMemErr('RADI','ZZ2RADCAL_SPECIES',IZERO)
       Z2RADCAL_SPECIES = 0._EB
+      ALLOCATE(KAPPA_COND(N_TRACKED_SPECIES),STAT=IZERO)
+      CALL ChkMemErr('RADI','KAPPA_COND',IZERO)
+      KAPPA_COND = 1._EB
 
       DO NS=1,N_TRACKED_SPECIES
          IF (SPECIES_MIXTURE(NS)%EVAPORATION_SMIX_INDEX>0) THEN
             CALL MEAN_CROSS_SECTIONS(SMIX_INDEX=NS)
+            KAPPA_COND(NS) = 0._EB
             CYCLE !No gas absorption for the liquid phase
          ENDIF
          DO NS2=1,N_SPECIES
             IF (SPECIES(NS2)%RADCAL_INDEX > 0) THEN
                IF (SPECIES(NS2)%RADCAL_ID/='SOOT') THEN
                   Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) = Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) + &
-                                                                   REAL(N_KAPPA_Y,EB)**4 / SPECIES(NS2)%MW * Z2Y(NS2,NS)
+                                                                   Z2Y(NS2,NS) / SPECIES(NS2)%MW
                ELSE
                   Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) = Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) + &
-                                                                   REAL(N_KAPPA_Y,EB)**4 * 5._EB * Z2Y(NS2,NS) * &
+                                                                   Z2Y(NS2,NS) * &
                                                                    SPECIES(SOOT_INDEX)%DENSITY_SOLID/SPECIES(NS2)%DENSITY_SOLID
                ENDIF
             ENDIF
@@ -3221,7 +3233,7 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
 
       ! Using RadCal, create look-up tables for the absorption coefficients for all gas species, mixture fraction or aerosols
 
-      ALLOCATE (RADCAL_SPECIES2KAPPA(N_RADCAL_ARRAY_SIZE,0:N_KAPPA_Y,0:N_KAPPA_T,NSB),STAT=IZERO)
+      ALLOCATE (RADCAL_SPECIES2KAPPA(N_RADCAL_ARRAY_SIZE,0:N_KAPPA_X,0:N_KAPPA_T,NSB),STAT=IZERO)
       CALL ChkMemErr('RADI','RADCAL_SPECIES2KAPPA',IZERO)
       RADCAL_SPECIES2KAPPA = 0._EB
       BBF = 1._EB
@@ -3242,63 +3254,67 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
             ENDIF
             RCRHO = MW_AIR*P_INF/(R0*TEMP_GAS(1))
             IF (NSB>1) BBF = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),TEMP_GAS(1))
-            Y_LOOP_Z: DO J=1,N_KAPPA_Y
-               YY = (REAL(J,EB)/REAL(N_KAPPA_Y,EB))**4
-               YY2 = 1._EB-YY
-               X_N2 = YY2/28._EB
+            ! Table index J+1 holds volume fraction XX (gases) and mass fraction YY (soot); index 0 is zero.
+            X_LOOP_Z: DO J=0,N_KAPPA_X-1
+               IF (J==N_KAPPA_X-1) THEN
+                  XX = KAPPA_X_MAX
+                  YY = KAPPA_C_MAX
+               ELSE
+                  XX = MIN(1._EB,KAPPA_X_MIN*KAPPA_X_FAC**J)
+                  YY = MIN(1._EB,KAPPA_C_MIN*KAPPA_C_FAC**J)
+               ENDIF
                N = 0
                RADCAL_SPECIES_LOOP: DO NS = 1, N_RADCAL_ARRAY_SIZE
                   PARTIAL_PRESSURES_ATM = 0._EB
                   SELECT CASE(RADCAL_SPECIES_INDEX(NS))
                      CASE(1) ! CARBON DIOXIDE
-                        PARTIAL_PRESSURES_ATM(1,1) = YY/(YY+44._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(1,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(1,1)
                      CASE(2) ! WATER VAPOR
-                        PARTIAL_PRESSURES_ATM(2,1) = YY/(YY+18._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(2,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(2,1)
                      CASE(3) ! CARBON MONOXIDE
-                        PARTIAL_PRESSURES_ATM(3,1) = YY/(YY+28._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(3,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(3,1)
                      CASE(4) ! METHANE
-                        PARTIAL_PRESSURES_ATM(4,1) = YY/(YY+16._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(4,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(4,1)
                      CASE(5) ! EHTYLENE
-                        PARTIAL_PRESSURES_ATM(5,1) = YY/(YY+28._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(5,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(5,1)
                      CASE(6) ! ETHANE
-                        PARTIAL_PRESSURES_ATM(6,1) = YY/(YY+30._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(6,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(6,1)
                      CASE(7) ! PROPYLENE
-                        PARTIAL_PRESSURES_ATM(7,1) = YY/(YY+42._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(7,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(7,1)
                      CASE(8) ! PROPANE
-                        PARTIAL_PRESSURES_ATM(8,1) = YY/(YY+44._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(8,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(8,1)
                      CASE(9) ! TOLUENE
-                        PARTIAL_PRESSURES_ATM(9,1) = YY/(YY+92._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(9,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(9,1)
                      CASE(10) ! N-HEPTANE
-                        PARTIAL_PRESSURES_ATM(10,1) = YY/(YY+100._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(10,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(10,1)
                      CASE(11) ! METHANOL
-                        PARTIAL_PRESSURES_ATM(11,1) = YY/(YY+32._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(11,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(11,1)
                      CASE(12) ! MMA
-                        PARTIAL_PRESSURES_ATM(12,1) = YY/(YY+100._EB*X_N2)
+                        PARTIAL_PRESSURES_ATM(12,1) = XX
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(12,1)
                      CASE(16) ! SOOT
-                        YY2 = 0.2_EB*YY
-                        PARTIAL_PRESSURES_ATM(16,1) = YY2*RCRHO/SPECIES(SOOT_INDEX)%DENSITY_SOLID
+                        PARTIAL_PRESSURES_ATM(16,1) = YY*RCRHO/SPECIES(SOOT_INDEX)%DENSITY_SOLID
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB
                   END SELECT
                   CALL SUB_RADCAL(AMEAN,AP0,RADIANCE,TRANSMISSIVITY)
                   IF (NSB==1 .AND. PATH_LENGTH > 0.0_EB) THEN
-                     RADCAL_SPECIES2KAPPA(NS,J,K,1) = MIN(AMEAN,AP0)
+                     RADCAL_SPECIES2KAPPA(NS,J+1,K,1) = MIN(AMEAN,AP0)
                   ELSE
-                     RADCAL_SPECIES2KAPPA(NS,J,K,IBND) = AMEAN/BBF
+                     RADCAL_SPECIES2KAPPA(NS,J+1,K,IBND) = AMEAN/BBF
                   ENDIF
                END DO RADCAL_SPECIES_LOOP
-            ENDDO Y_LOOP_Z
+            ENDDO X_LOOP_Z
          ENDDO T_LOOP_Z
          ! Interpolate KAPPA at RADTMP
          IF (RCT_SKIP == 0) THEN
@@ -4675,7 +4691,7 @@ REAL(EB) FUNCTION GET_KAPPA(Z_IN,TMP,IBND)
 
 USE PHYSICAL_FUNCTIONS, ONLY : GET_MOLECULAR_WEIGHT
 REAL(EB), INTENT(IN) :: Z_IN(1:N_TRACKED_SPECIES),TMP
-REAL(EB) :: KAPPA_TEMP,INT_FAC,KAPPA_SUM,SCALED_Y_RADCAL_SPECIES,MWA
+REAL(EB) :: KAPPA_TEMP,INT_FAC,KAPPA_SUM,SCALED_X_RADCAL_SPECIES,MWA,Z_COND(1:N_TRACKED_SPECIES)
 INTEGER, INTENT(IN) :: IBND
 INTEGER :: LBND,UBND,N,TYY
 
@@ -4683,20 +4699,21 @@ KAPPA_SUM = 0._EB
 
 TYY = MAX(0 , MIN(N_KAPPA_T,INT((TMP - RTMPMIN) * TYY_FAC)))
 
-CALL GET_MOLECULAR_WEIGHT(Z_IN,MWA)
+Z_COND = Z_IN*KAPPA_COND
+CALL GET_MOLECULAR_WEIGHT(Z_COND,MWA)
 
 DO N = 1, N_RADCAL_ARRAY_SIZE
-   SCALED_Y_RADCAL_SPECIES = DOT_PRODUCT(Z2RADCAL_SPECIES(N,:),Z_IN)
-   IF (SCALED_Y_RADCAL_SPECIES<TWO_EPSILON_EB) CYCLE
+   SCALED_X_RADCAL_SPECIES = DOT_PRODUCT(Z2RADCAL_SPECIES(N,:),Z_COND)
+   IF (SCALED_X_RADCAL_SPECIES<TWENTY_EPSILON_EB) CYCLE
    IF (RADCAL_SPECIES_INDEX(N)==16) THEN
-      INT_FAC = MAX(0._EB,SCALED_Y_RADCAL_SPECIES)**0.25_EB
+      INT_FAC = MAX(0._EB,MIN(REAL(N_KAPPA_X,EB),LOG(SCALED_X_RADCAL_SPECIES/KAPPA_C_MIN)/LOG_KAPPA_C_FAC+1._EB))
    ELSE
-      INT_FAC = MAX(0._EB,SCALED_Y_RADCAL_SPECIES*MWA)**0.25_EB
+      INT_FAC = MAX(0._EB,MIN(REAL(N_KAPPA_X,EB),LOG(SCALED_X_RADCAL_SPECIES*MWA/KAPPA_X_MIN)/LOG_KAPPA_X_FAC+1._EB))
    ENDIF
    LBND = INT(INT_FAC)
    INT_FAC = INT_FAC - LBND
-   LBND = MIN(LBND,N_KAPPA_Y)
-   UBND = MIN(LBND+1,N_KAPPA_Y)
+   LBND = MIN(LBND,N_KAPPA_X)
+   UBND = MIN(LBND+1,N_KAPPA_X)
    KAPPA_TEMP = RADCAL_SPECIES2KAPPA(N,LBND,TYY,IBND)
    KAPPA_SUM  = KAPPA_SUM + KAPPA_TEMP + INT_FAC*(RADCAL_SPECIES2KAPPA(N,UBND,TYY,IBND)-KAPPA_TEMP)
 ENDDO
