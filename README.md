@@ -17,22 +17,31 @@ in from time to time.
 | `gpu-vent-activation` | `VENT`s with `DEVC_ID`/`CTRL_ID` switch on and off on GPU; `OBST`/`HOLE` created or removed during a run stop it with a message instead of being ignored | [#3](https://github.com/mxd45za/GFDS2026/pull/3) |
 | `gpu-zone-perf` | Models with many pressure zones: 1.8x faster time stepping (165 zones) | [#4](https://github.com/mxd45za/GFDS2026/pull/4) |
 | `gpu-radiation-sweep` | Faster radiation sweep, identical results (6–11 % faster runs) | [#5](https://github.com/mxd45za/GFDS2026/pull/5) |
+| `gpu-mw-correction` | `FLUX_LIMITER_MW_CORRECTION` on GPU (was ignored) and on by default, as in FDS 6.11.1 | — |
+| `fds-kappa-volume-fraction` | FDS fix `0eab2e6d17`/`c33b760989`: gas absorption coefficient looked up in volume fraction (ambient air 0.085 1/m as in FDS 6.11.1, was 0.109) | — |
 
 Every change is checked against FDS 6.11.1 on CPU, on FDS verification cases and on building models; the
 details are in the pull requests.
 
 ### Known differences from FDS 6.11.1
 
-GFDS is based on the FDS development version of 6 May 2025 (`66384f83df`), not on FDS 6.11.1. Both the CPU
-path (`--c`) and the GPU path inherit the differences, among them:
+GFDS is based on the FDS development version of 6 May 2025 (`66384f83df`), not on FDS 6.11.1, so both the
+CPU path (`--c`) and the GPU path inherit the FDS changes made after that date. The ones that matter for
+building models are ported here one by one:
 
-- the gas absorption coefficient lookup (fixed in FDS by `0eab2e6d17`): ambient air gets 0.109 1/m instead
-  of 0.085 1/m;
-- `FLUX_LIMITER_MW_CORRECTION` is off unless `SIMULATION_MODE='LES'` (on by default in FDS 6.11.1) and is
-  not implemented in the GPU kernels. In models with many closed rooms this lets the background pressure of
-  the closed zones drift.
+- `FLUX_LIMITER_MW_CORRECTION` (consistent equation of state at cell faces) — ported to the GPU kernels and
+  on by default (`gpu-mw-correction`). Check: a 4-mesh propane case matches `--c` to all printed digits,
+  module by module and as a whole.
+- gas absorption coefficient look-up (`0eab2e6d17`, `c33b760989`) — ported (`fds-kappa-volume-fraction`);
+  kappa of air and of propane products with soot equals FDS 6.11.1 to all printed digits on CPU and GPU.
 
-Porting these fixes is the current work in this fork.
+The background pressure of closed rooms is very sensitive (1 Pa is about 0.003 K of the mean room
+temperature) and still differs from FDS 6.11.1 by a few pascals.
+
+**Known GPU issue (under investigation):** in a model with 165 pressure zones, closed rooms next to the fire
+room sometimes become unstable on GPU after 130–360 s: temperature swings by tens of degrees (down to
+negative °C) and the zone pressure runs away. FDS 6.11.1 and the GFDS CPU path do not show it. Models with
+many closed rooms should be checked against a CPU run until this is fixed.
 
 ### Output
 
