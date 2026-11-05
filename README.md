@@ -1,3 +1,49 @@
+# GFDS — FireSim fork
+
+This is a fork of [mxd45za/GFDS2026](https://github.com/mxd45za/GFDS2026) maintained for fire-safety
+engineering models (building evacuation studies: many rooms, timed burners, smoke and heat detectors).
+The goal is GPU runs **5–10 times faster than FDS 6.11.1 on CPU with the same results**.
+
+The default branch `firesim` is upstream `GFDS` plus the changes below. Each change is also a separate
+branch and a pull request to upstream, so anyone can take only what they need. Upstream changes are merged
+in from time to time.
+
+| Branch | Change | Upstream PR |
+|---|---|---|
+| `gpu-detector-fields` | Smoke and heat detectors (`CHAMBER OBSCURATION`, `PATH OBSCURATION`, `TRANSMISSION`, `LINK TEMPERATURE`) no longer stop a `--g` run | [#1](https://github.com/mxd45za/GFDS2026/pull/1) |
+| `gpu-radiative-heat-flux-gas` | `RADIATIVE HEAT FLUX GAS` devices with `ORIENTATION` report the flux on GPU (were 0) | [#2](https://github.com/mxd45za/GFDS2026/pull/2) |
+| `gpu-vent-activation` | `VENT`s with `DEVC_ID`/`CTRL_ID` switch on and off on GPU; `OBST`/`HOLE` created or removed during a run stop it with a message instead of being ignored | [#3](https://github.com/mxd45za/GFDS2026/pull/3) |
+| `gpu-zone-perf` | Models with many pressure zones: 1.8x faster time stepping (165 zones) | [#4](https://github.com/mxd45za/GFDS2026/pull/4) |
+| `gpu-radiation-sweep` | Faster radiation sweep, identical results (6–11 % faster runs) | [#5](https://github.com/mxd45za/GFDS2026/pull/5) |
+
+Every change is checked against FDS 6.11.1 on CPU, on FDS verification cases and on building models; the
+details are in the pull requests.
+
+### Known differences from FDS 6.11.1
+
+GFDS is based on the FDS development version of 6 May 2025 (`66384f83df`), not on FDS 6.11.1. Both the CPU
+path (`--c`) and the GPU path inherit the differences, among them:
+
+- the gas absorption coefficient lookup (fixed in FDS by `0eab2e6d17`): ambient air gets 0.109 1/m instead
+  of 0.085 1/m;
+- `FLUX_LIMITER_MW_CORRECTION` is off unless `SIMULATION_MODE='LES'` (on by default in FDS 6.11.1) and is
+  not implemented in the GPU kernels. In models with many closed rooms this lets the background pressure of
+  the closed zones drift.
+
+Porting these fixes is the current work in this fork.
+
+### Output
+
+Same files as FDS, plus `CHID_MODEL_TIME.csv` (time per module). Differences: device names in `_devc.csv`
+are quoted, the third Smoke3D channel is labelled `TEMPERATURE`, `.out` shows `Revision: unknown`.
+
+### Running several jobs on one GPU
+
+Start the CUDA MPS daemon (`nvidia-cuda-mps-control -d`) and run multi-mesh cases with one MPI process per
+mesh: on an A100 a 3-mesh case ran 1.7x faster than with one process, and 3–4 jobs can share one card.
+
+---
+
 # GFDS
 
 Version: 1.0
