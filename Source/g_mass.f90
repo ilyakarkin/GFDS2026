@@ -580,9 +580,10 @@ MODULE G_MASS
 
             IF (N_TRACKED_SPECIES == 1) RETURN
 
+            ! IWORK1D(0,0,1) counts clipped cells over all species; it is not reset per species, so the
+            ! final normalization runs if any species was clipped (FDS 48399d97ad)
             DO N=1,N_TRACKED_SPECIES
                 GM%WORK11D = 0._EB
-                GM%IWORK1D(0,0,1) = 0
                 CALL CHECK_MASS_DENSITY_RHO_ZZ_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     RHOPD,RHO_ZZD,GM%WORK11D,GM%DXD,GM%DYD,GM%DZD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%CELL_WALL_INDEX, &
                     GM%IWORK1D,TWO_EPSILON_EB,IBAR,JBAR,KBAR,N,GM%CELL_LB,GM%CELL_UB)
