@@ -602,4 +602,77 @@ MODULE G_FUNC
 
         END SUBROUTINE FINAL_BLOCKMAX_REDUCE_KERNEL
 
+        !--------------------------------------------------------------------------
+        ! FLUX_LIMITER_MW_CORRECTION (mass.f90 and divg.f90, FACE_CORRECTION_IF)
+        !--------------------------------------------------------------------------
+
+        ! RHO_RMW = RHO/MW over 0:IBP1,0:JBP1,0:KBP1; also zero the RHO/MW face arrays.
+        ATTRIBUTES(GLOBAL) SUBROUTINE MW_RHO_RMW_KERNEL(RHOP,ZZP,MWR,RHO_RMW,FX0,FY0,FZ0,N_TRACKED,IBP1,JBP1,KBP1)
+            INTEGER, VALUE :: N_TRACKED,IBP1,JBP1,KBP1
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RHOP,RHO_RMW
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZP,FX0,FY0,FZ0
+            REAL(EB), DEVICE, DIMENSION(*) :: MWR
+            INTEGER :: I,J,K,N
+            REAL(EB) :: RMW
+
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y-1)*BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z-1)*BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I<0 .OR. I>IBP1 .OR. J<0 .OR. J>JBP1 .OR. K<0 .OR. K>KBP1) RETURN
+
+            RMW = 0._EB
+            DO N=1,N_TRACKED
+                RMW = RMW + MWR(N)*ZZP(I,J,K,N)
+            ENDDO
+            RHO_RMW(I,J,K) = RHOP(I,J,K)*RMW
+            FX0(I,J,K,1) = 0._EB
+            FY0(I,J,K,1) = 0._EB
+            FZ0(I,J,K,1) = 0._EB
+        END SUBROUTINE MW_RHO_RMW_KERNEL
+
+        ! Correct the largest species face value so that SUM(RHO*ZZ/MW)_FACE = (RHO/MW)_FACE
+        ! on all faces 0:IBAR, 0:JBAR, 0:KBAR (same as the CPU loop).
+        ATTRIBUTES(GLOBAL) SUBROUTINE MW_FACE_CORRECTION_KERNEL(FX,FY,FZ,FX0,FY0,FZ0,MWR,N_TRACKED,IBAR,JBAR,KBAR)
+            INTEGER, VALUE :: N_TRACKED,IBAR,JBAR,KBAR
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: FX,FY,FZ,FX0,FY0,FZ0
+            REAL(EB), DEVICE, DIMENSION(*) :: MWR
+            INTEGER :: I,J,K,N,NMAX
+            REAL(EB) :: FMAX,S
+
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y-1)*BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z-1)*BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I<0 .OR. I>IBAR .OR. J<0 .OR. J>JBAR .OR. K<0 .OR. K>KBAR) RETURN
+
+            NMAX = 1; FMAX = FX(I,J,K,1)
+            DO N=2,N_TRACKED
+                IF (FX(I,J,K,N)>FMAX) THEN; NMAX = N; FMAX = FX(I,J,K,N); ENDIF
+            ENDDO
+            S = 0._EB
+            DO N=1,N_TRACKED
+                IF (N/=NMAX) S = S + FX(I,J,K,N)*MWR(N)
+            ENDDO
+            FX(I,J,K,NMAX) = MAX(0._EB,FX0(I,J,K,1)-S)/MWR(NMAX)
+
+            NMAX = 1; FMAX = FY(I,J,K,1)
+            DO N=2,N_TRACKED
+                IF (FY(I,J,K,N)>FMAX) THEN; NMAX = N; FMAX = FY(I,J,K,N); ENDIF
+            ENDDO
+            S = 0._EB
+            DO N=1,N_TRACKED
+                IF (N/=NMAX) S = S + FY(I,J,K,N)*MWR(N)
+            ENDDO
+            FY(I,J,K,NMAX) = MAX(0._EB,FY0(I,J,K,1)-S)/MWR(NMAX)
+
+            NMAX = 1; FMAX = FZ(I,J,K,1)
+            DO N=2,N_TRACKED
+                IF (FZ(I,J,K,N)>FMAX) THEN; NMAX = N; FMAX = FZ(I,J,K,N); ENDIF
+            ENDDO
+            S = 0._EB
+            DO N=1,N_TRACKED
+                IF (N/=NMAX) S = S + FZ(I,J,K,N)*MWR(N)
+            ENDDO
+            FZ(I,J,K,NMAX) = MAX(0._EB,FZ0(I,J,K,1)-S)/MWR(NMAX)
+        END SUBROUTINE MW_FACE_CORRECTION_KERNEL
+
 END MODULE G_FUNC

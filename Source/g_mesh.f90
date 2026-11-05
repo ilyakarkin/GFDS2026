@@ -156,6 +156,8 @@ MODULE G_MESH
         REAL(EB), DEVICE, ALLOCATABLE :: ZZD(:,:,:,:),ZZSD(:,:,:,:)
         REAL(EB), DEVICE, ALLOCATABLE :: FXD(:,:,:,:),FYD(:,:,:,:),FZD(:,:,:,:)
         REAL(EB), DEVICE, ALLOCATABLE :: SWORK1D(:,:,:,:),SWORK2D(:,:,:,:),SWORK3D(:,:,:,:),SWORK4D(:,:,:,:)
+        ! FLUX_LIMITER_MW_CORRECTION: face values of RHO/MW and the cell field RHO/MW
+        REAL(EB), DEVICE, ALLOCATABLE :: FX0D(:,:,:,:),FY0D(:,:,:,:),FZ0D(:,:,:,:),RHO_RMWD(:,:,:)
         REAL(EB), DEVICE, ALLOCATABLE :: DEL_RHO_D_DEL_ZD(:,:,:,:),M_DOT_PPPD(:,:,:,:)
 
         REAL(EB), DEVICE, ALLOCATABLE :: UD(:,:,:),VD(:,:,:),WD(:,:,:)

@@ -791,7 +791,7 @@ MODULE G_WALL
                     TWO_EPSILON_EB,R0,IBP1,JBP1,KBP1,SIZE(OM_RHOPD,1),SIZE(OM_RHOPD,2),SIZE(OM_RHOPD,3), &
                     SIZE(CELL_INDEX_OTHERD,1),SIZE(CELL_INDEX_OTHERD,2),GM%WALL_LB,GM%WALL_UB, &
                     USE_ATMOSPHERIC_INTERPOLATION.AND.STRATIFICATION,DZ_OTHERD,GPU_MESHES(NOM)%P_0D,GM%TMPD,GM%RSUMD, &
-                    MERGE(1,0,RADIATION),GM%WALL_EMISSIVITY,GM%WALL_Q_RAD_OUT)
+                    MERGE(1,0,RADIATION),GM%WALL_EMISSIVITY,GM%WALL_Q_RAD_OUT,FLUX_LIMITER_MW_CORRECTION)
                 IF (N_TOTAL_SCALARS > 1) THEN
                     CALL INTERPOLATED_DIFFUSIVE_FLUX_VLES_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(N_EXTERNAL_WALL_CELLS,N_TRACKED_SPECIES, &
                         GM%WALL_TOPO_AOS,GM%EXTERNAL_WALL_NOMD,GM%EXTERNAL_WALL_NICD,GM%WALL_IIO,GM%WALL_JJO,GM%WALL_KKO,GM%WALL_IIO_MAX, &
@@ -1553,7 +1553,8 @@ MODULE G_WALL
             CELL_INDEX_LOCAL,CELL_SOLID_LOCAL,CELL_INDEX_OTHER,CELL_SOLID_OTHER,INTERPOLATED_BOUNDARY_IN, &
             I_FLUX_LIMITER_IN,NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K,TWO_EPSILON_EB_IN,R0D_IN, &
             IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK,OTHER_NI,OTHER_NJ,WALL_LB,WALL_UB, &
-            USE_ATMOSPHERIC_INTERPOLATION_IN,DZ_OTHER,P_0_OTHER,TMPD,RSUMD,RADIATION_FLAG,WALL_EMISSIVITYD,WALL_Q_RAD_OUTD)
+            USE_ATMOSPHERIC_INTERPOLATION_IN,DZ_OTHER,P_0_OTHER,TMPD,RSUMD,RADIATION_FLAG,WALL_EMISSIVITYD,WALL_Q_RAD_OUTD, &
+            MW_CORR)
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
@@ -1583,9 +1584,11 @@ MODULE G_WALL
             INTEGER, DEVICE, DIMENSION(0:OTHER_NI-1,0:OTHER_NJ-1,0:*) :: CELL_INDEX_OTHER
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_LOCAL,CELL_SOLID_OTHER
             REAL(EB), VALUE :: R0D_IN
-            LOGICAL, VALUE :: USE_ATMOSPHERIC_INTERPOLATION_IN
+            LOGICAL, VALUE :: USE_ATMOSPHERIC_INTERPOLATION_IN,MW_CORR
 
             INTEGER :: IW,IOR,II,JJ,KK,IIG,JJG,KKG,IIO,JJO,KKO,IPZ,ICG,ICO,N
+            INTEGER :: NMAX,DI,DJ,DK
+            REAL(EB) :: R_G,R_G2,R_O,R_O2,S_MW
             REAL(EB) :: FACE_VEL,Q0,Q1,Q2,Q3,PBAR_F,RSUM_F,RHO_G_2,RHO_OTHER,RHO_OTHER_2
             REAL(EB) :: RHO_ZZ_F,RHO_ZZ_G,RHO_ZZ_G_2,RHO_ZZ_OTHER,RHO_ZZ_OTHER_2
             REAL(EB) :: DDO,RSUM_GHOST,TMP_G,DENOM
@@ -1741,6 +1744,34 @@ MODULE G_WALL
                     RETURN
             END SELECT
 
+            ! FLUX_LIMITER_MW_CORRECTION (wall.f90): interpolate RHO/MW instead of RHO
+            IF (MW_CORR) THEN
+                R_G = 0._EB; R_O = 0._EB
+                DO N=1,N_TRACKED_SPECIES
+                    R_G = R_G + MWR_ZD_IN(N)*ZZPD(IIG,JJG,KKG,N)
+                    R_O = R_O + MWR_ZD_IN(N)*ZZPD(II,JJ,KK,N)
+                ENDDO
+                R_G2 = R_G; R_O2 = R_O
+                IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
+                    DI = 0; DJ = 0; DK = 0
+                    SELECT CASE(ABS(IOR))
+                        CASE(1); DI = SIGN(1,IOR)
+                        CASE(2); DJ = SIGN(1,IOR)
+                        CASE(3); DK = SIGN(1,IOR)
+                    END SELECT
+                    R_G2 = 0._EB; R_O2 = 0._EB
+                    DO N=1,N_TRACKED_SPECIES
+                        R_G2 = R_G2 + MWR_ZD_IN(N)*ZZPD(IIG+DI,JJG+DJ,KKG+DK,N)
+                        R_O2 = R_O2 + MWR_ZD_IN(N)*OM_ZZP(IIO-DI-OM_LB_I,JJO-DJ-OM_LB_J,KKO-DK-OM_LB_K,N)
+                    ENDDO
+                ENDIF
+                IF (IOR>0) THEN
+                    Q0 = Q0*R_O2; Q1 = Q1*R_O; Q2 = Q2*R_G; Q3 = Q3*R_G2
+                ELSE
+                    Q0 = Q0*R_G2; Q1 = Q1*R_G; Q2 = Q2*R_O; Q3 = Q3*R_O2
+                ENDIF
+            ENDIF
+
             WALL_RHO_FD(IW) = SCALAR_FACE_VALUE_LOCAL(FACE_VEL,Q0,Q1,Q2,Q3,I_FLUX_LIMITER_IN,TWO_EPSILON_EB_IN)
 
             IF (N_TOTAL_SCALARS == 1) THEN
@@ -1816,8 +1847,34 @@ MODULE G_WALL
                     END SELECT
 
                     RHO_ZZ_F = SCALAR_FACE_VALUE_LOCAL(FACE_VEL,Q0,Q1,Q2,Q3,I_FLUX_LIMITER_IN,TWO_EPSILON_EB_IN)
-                    WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_F/WALL_RHO_FD(IW)))
+                    IF (MW_CORR) THEN
+                        WALL_ZZ_FD(IW,N) = RHO_ZZ_F
+                    ELSE
+                        WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_F/WALL_RHO_FD(IW)))
+                    ENDIF
                 ENDDO
+
+                ! FLUX_LIMITER_MW_CORRECTION: WALL_ZZ_FD holds RHO*ZZ at the face, WALL_RHO_FD holds RHO/MW.
+                ! Reset the largest species so that SUM(RHO*ZZ/MW) = RHO/MW, then RHO_F = SUM(RHO*ZZ).
+                IF (MW_CORR) THEN
+                    NMAX = 1
+                    DO N=2,N_TRACKED_SPECIES
+                        IF (WALL_ZZ_FD(IW,N)>WALL_ZZ_FD(IW,NMAX)) NMAX = N
+                    ENDDO
+                    S_MW = 0._EB
+                    DO N=1,N_TRACKED_SPECIES
+                        IF (N/=NMAX) S_MW = S_MW + WALL_ZZ_FD(IW,N)*MWR_ZD_IN(N)
+                    ENDDO
+                    WALL_ZZ_FD(IW,NMAX) = MAX(0._EB,WALL_RHO_FD(IW)-S_MW)/MWR_ZD_IN(NMAX)
+                    S_MW = 0._EB
+                    DO N=1,N_TRACKED_SPECIES
+                        S_MW = S_MW + WALL_ZZ_FD(IW,N)
+                    ENDDO
+                    WALL_RHO_FD(IW) = S_MW
+                    DO N=1,N_TOTAL_SCALARS
+                        WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,WALL_ZZ_FD(IW,N)/WALL_RHO_FD(IW)))
+                    ENDDO
+                ENDIF
             ENDIF
 
             SELECT CASE(IOR)
