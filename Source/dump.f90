@@ -2437,7 +2437,7 @@ MESH_LOOP: DO NM=1,NMESHES
       ELSE
          COLOR_INDEX = VT%COLOR_INDICATOR
       ENDIF
-      IF (VT%RGB(1)<0) THEN
+      IF (VT%RGB(1)<0 .OR. VT%RGB(1)>255) THEN   ! >255: unset colour seen as garbage (GFDS), write as in FDS 6.11.1
          WRITE(MYSTR,'(8I5,A,I5)') MAX(0,VT%I1),MIN(M%IBAR,VT%I2), &
                                    MAX(0,VT%J1),MIN(M%JBAR,VT%J2), &
                                    MAX(0,VT%K1),MIN(M%KBAR,VT%K2),COLOR_INDEX,VT%TYPE_INDICATOR,' ! ',VT%IOR; CALL ADDSTR
@@ -2455,7 +2455,7 @@ MESH_LOOP: DO NM=1,NMESHES
       VRGB        = -1
       EP => M%EXTERIOR_PATCH(N)
       IF (EP%VENT_INDEX>0) VRGB = M%VENTS(EP%VENT_INDEX)%RGB
-      IF (VRGB(1)<0) THEN
+      IF (VRGB(1)<0 .OR. VRGB(1)>255) THEN
          WRITE(MYSTR,'(8I5)') EP%I1,EP%I2,EP%J1,EP%J2,EP%K1,EP%K2,COLOR_INDEX,TYPE_INDEX; CALL ADDSTR
       ELSE
          WRITE(MYSTR,'(8I5,4F13.5)') EP%I1,EP%I2,EP%J1,EP%J2,EP%K1,EP%K2,COLOR_INDEX,TYPE_INDEX, &
@@ -2481,7 +2481,7 @@ MESH_LOOP: DO NM=1,NMESHES
       IF (VT%RADIUS<0._EB) CYCLE
       IF (VT%BOUNDARY_TYPE==OPEN_BOUNDARY) COLOR_INDEX = -VT%COLOR_INDICATOR
       IF (VT%BOUNDARY_TYPE/=OPEN_BOUNDARY) COLOR_INDEX =  VT%COLOR_INDICATOR
-      IF (VT%RGB(1)<0) THEN
+      IF (VT%RGB(1)<0 .OR. VT%RGB(1)>255) THEN   ! >255: unset colour seen as garbage (GFDS), write as in FDS 6.11.1
          WRITE(MYSTR,'(8I5)')        MAX(0,VT%I1),MIN(M%IBAR,VT%I2), &
                                      MAX(0,VT%J1),MIN(M%JBAR,VT%J2), &
                                      MAX(0,VT%K1),MIN(M%KBAR,VT%K2),COLOR_INDEX,VT%TYPE_INDICATOR; CALL ADDSTR
