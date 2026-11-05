@@ -693,7 +693,7 @@ MODULE G_VELO
             REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD,KRESD
 
             INTEGER :: X,II,JJ,KK,IIG,JJG,KKG,IC,BTYPE,ICG,IOR,IW
-            LOGICAL :: AFTER_SOLID
+            LOGICAL :: AFTER_SOLID,LAST_WALL
 
             X = (blockIdx%x - 1) * blockDim%x + threadIdx%x
 
@@ -716,10 +716,25 @@ MODULE G_VELO
             IF (KKG < 1 .OR. KKG > KBAR) RETURN
 
             IC = CELL_INDEXD(II,JJ,KK)
+            ! A solid cell on an OBST edge or vertex borders several gas cells, i.e. several wall cells. The CPU WALL
+            ! loop leaves the value of the wall with the largest index; a parallel write here would leave a random one.
+            ! Since FDS 4218ee295b this value enters MUA at convex OBST corners, so only the last wall writes.
             IF (SOLID_GHOSTS) THEN
-                IF (BTYPE == SOLID_BOUNDARY .AND. CELL_SOLID(IC)) MUD(II,JJ,KK) = MUD(IIG,JJG,KKG)
+                IF (BTYPE == SOLID_BOUNDARY .AND. CELL_SOLID(IC)) THEN
+                    LAST_WALL = LAST_WALL_OF_SOLID_CELL(X,II,JJ,KK,.TRUE.,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+                        CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+                    IF (LAST_WALL) MUD(II,JJ,KK) = MUD(IIG,JJG,KKG)
+                ENDIF
             ELSE
-                IF (CELL_SOLID(IC) .OR. CELL_EXTERIOR(IC)) KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                IF (CELL_EXTERIOR(IC)) THEN
+                    KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                ELSEIF (CELL_SOLID(IC)) THEN
+                    LAST_WALL = LAST_WALL_OF_SOLID_CELL(X,II,JJ,KK,.FALSE.,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+                        CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+                    IF (LAST_WALL) KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                ENDIF
             ENDIF
             IF (BTYPE == OPEN_BOUNDARY .OR. BTYPE == MIRROR_BOUNDARY) THEN
                 ! Preserve whether the CPU WALL loop has already updated the adjacent gas cell.
@@ -734,6 +749,42 @@ MODULE G_VELO
             ENDIF
 
         END SUBROUTINE COPY_GHOST_MU_KRES
+
+        ! True if no wall cell with a larger index than X has the solid cell (I0,J0,K0) as its ghost cell.
+        ! The candidates are the wall cells of the gas cells next to (I0,J0,K0). SOLID_ONLY: count only
+        ! SOLID_BOUNDARY walls (MU), otherwise all non-NULL walls (KRES), as in the CPU WALL loop of COMPUTE_VISCOSITY.
+        ATTRIBUTES(DEVICE) LOGICAL FUNCTION LAST_WALL_OF_SOLID_CELL(X,I0,J0,K0,SOLID_ONLY,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+            CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1,N_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+            INTEGER, INTENT(IN) :: X,I0,J0,K0,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1,N_WALL_CELLS
+            INTEGER, INTENT(IN) :: NULL_BOUNDARY,SOLID_BOUNDARY
+            LOGICAL, INTENT(IN) :: SOLID_ONLY
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER, DEVICE :: CELL_WALL_INDEX(CELL_LB:CELL_UB,-3:3)
+            INTEGER, DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: CELL_INDEXD
+            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID
+            INTEGER :: D,I1,J1,K1,ICN,IORN,IWN
+            LAST_WALL_OF_SOLID_CELL = .TRUE.
+            DO D=-3,3
+                IF (D==0) CYCLE
+                I1 = I0; J1 = J0; K1 = K0
+                IF (ABS(D)==1) I1 = I0 + SIGN(1,D)
+                IF (ABS(D)==2) J1 = J0 + SIGN(1,D)
+                IF (ABS(D)==3) K1 = K0 + SIGN(1,D)
+                IF (I1<1 .OR. I1>IBAR .OR. J1<1 .OR. J1>JBAR .OR. K1<1 .OR. K1>KBAR) CYCLE
+                ICN = CELL_INDEXD(I1,J1,K1)
+                IF (CELL_SOLID(ICN)) CYCLE
+                DO IORN=-3,3
+                    IF (IORN==0) CYCLE
+                    IWN = CELL_WALL_INDEX(ICN,IORN)
+                    IF (IWN<=X .OR. IWN>N_WALL_CELLS) CYCLE
+                    IF (WALL_TOPO(IWN)%II/=I0 .OR. WALL_TOPO(IWN)%JJ/=J0 .OR. WALL_TOPO(IWN)%KK/=K0) CYCLE
+                    IF (WALL_TOPO(IWN)%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
+                    IF (SOLID_ONLY .AND. WALL_TOPO(IWN)%BOUNDARY_TYPE/=SOLID_BOUNDARY) CYCLE
+                    LAST_WALL_OF_SOLID_CELL = .FALSE.
+                    RETURN
+                ENDDO
+            ENDDO
+        END FUNCTION LAST_WALL_OF_SOLID_CELL
         !--------------------------------------------------------------------------
         ! Momentum-flux host orchestration and kernels
         !--------------------------------------------------------------------------
