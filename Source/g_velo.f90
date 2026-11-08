@@ -125,7 +125,8 @@ MODULE G_VELO
                 UP_HAT,VP_HAT,WP_HAT,IBAR,JBAR,KBAR,IBP1,JBP1,KBP1)
 
             CALL COMPUTE_MU_KRES<<<GRDD,BLKD,0,GM%STRM>>>(UP , VP , WP , UP_HAT,VP_HAT,WP_HAT,RHOP , GM%LES_FILTER_WIDTHD , GM%MU_DNSD , &
-                                                GM%MUD , UU,VV,WW ,GM%KRESD,IBAR,JBAR,KBAR,IBP1,JBP1,KBP1,C_DEARDORFF)
+                                                GM%MUD , UU,VV,WW ,GM%KRESD,IBAR,JBAR,KBAR,IBP1,JBP1,KBP1,C_DEARDORFF, &
+                                                MERGE(1,0,TURB_MODEL==NO_TURB_MODEL))
 
             CALL COPY_GHOST_MU_KRES<<<(N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS+256-1)/256,256,0,GM%STRM>>> (GM%WALL_TOPO_AOS, &
                     GM%CELL_INDEXD, GM%CELL_SOLID, GM%CELL_EXTERIOR, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, &
@@ -137,7 +138,7 @@ MODULE G_VELO
 
             CALL COMPUTE_BOUNDARY_VISCOSITY_ACCUM<<<(N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS+256-1)/256,256,0,GM%STRM>>> (GM%WALL_TOPO_AOS, &
                     GM%LES_FILTER_WIDTHD, GM%RDXD, GM%RDYD, GM%RDZD, UU, VV, WW, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, GM%MU_DNSD, &
-                    GM%WORK7D, RHOP, GM%IWORK1D, IBAR, JBAR, KBAR)
+                    GM%WORK7D, RHOP, GM%IWORK1D, IBAR, JBAR, KBAR, MERGE(1,0,SIM_MODE==DNS_MODE), C_WALE)
 
             CALL FINALIZE_BOUNDARY_VISCOSITY<<<GRDD,BLKD,0,GM%STRM>>>(GM%WORK7D,GM%IWORK1D,GM%MUD,IBAR,JBAR,KBAR)
 
@@ -167,8 +168,9 @@ MODULE G_VELO
             INTEGER, VALUE :: IBAR,JBAR,KBAR,IBP1,JBP1,KBP1
             REAL(EB) , DEVICE ,DIMENSION(*) :: RSQ_MW_ZD
             REAL(EB) , DEVICE ,DIMENSION(0:I_MAX_TEMP_IN,1:*) :: MU_RSQMW_ZD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*)    :: MU_DNSD, TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MU_DNSD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: TMPD
             INTEGER , DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*)    :: CELL_INDEXD
             LOGICAL , DEVICE, DIMENSION(0:*)           :: CELL_SOLID
 
@@ -235,7 +237,9 @@ MODULE G_VELO
 
             INTEGER, VALUE :: IBAR,JBAR,KBAR
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UPD,VPD,WPD
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UUD,VVD,WWD
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UUD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VVD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WWD
             INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
@@ -482,10 +486,15 @@ MODULE G_VELO
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMPUTE_MU_KRES(UPD , VPD , WPD , UP_HATD,VP_HATD,WP_HATD,RHOPD , LES_FILTER_WIDTHD , &
                                                        MU_DNSD , MUD , UUD,VVD,WWD ,KRESD,IBAR,JBAR,KBAR,IBP1,JBP1,KBP1, &
-                                                       C_DEARDORFF_IN)
-            INTEGER , VALUE :: IBAR ,JBAR,KBAR , IBP1 , JBP1, KBP1
+                                                       C_DEARDORFF_IN,NO_TURB_FLAG)
+            INTEGER , VALUE :: IBAR ,JBAR,KBAR , IBP1 , JBP1, KBP1, NO_TURB_FLAG
             REAL(EB), VALUE :: C_DEARDORFF_IN
-            REAL(EB) ,DEVICE,DIMENSION(0:IBP1,0:JBP1,0:*):: UPD,VPD,WPD,UP_HATD,VP_HATD,WP_HATD , RHOPD, LES_FILTER_WIDTHD , MU_DNSD , MUD , UUD,VVD,WWD , KRESD
+            REAL(EB) ,DEVICE,DIMENSION(0:IBP1,0:JBP1,0:*) :: UPD, VPD, WPD, UP_HATD, VP_HATD, WP_HATD, LES_FILTER_WIDTHD, &
+                MU_DNSD, MUD, KRESD
+            REAL(EB) ,DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD
+            REAL(EB) ,DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UUD
+            REAL(EB) ,DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VVD
+            REAL(EB) ,DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WWD
             INTEGER :: I,J,K
             REAL(EB) :: DELTA,KSGS,NU_EDDY,U2,V2,W2
 
@@ -502,6 +511,7 @@ MODULE G_VELO
                             (VPD(I,J,K)-VP_HATD(I,J,K))**2 + &
                             (WPD(I,J,K)-WP_HATD(I,J,K))**2)
             NU_EDDY = C_DEARDORFF_IN * DELTA * SQRT(KSGS)
+            IF (NO_TURB_FLAG==1) NU_EDDY = 0._EB   ! velo.f90 CASE(NO_TURB_MODEL) (DNS): MU = MU_DNS
 
             MUD(I,J,K) = MU_DNSD(I,J,K) + RHOPD(I,J,K)*NU_EDDY
 
@@ -573,12 +583,18 @@ MODULE G_VELO
         END SUBROUTINE COMPUTE_BOUNDARY_VISCOSITY_ADD_K
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMPUTE_BOUNDARY_VISCOSITY_ACCUM(WALL_TOPO, LES_FILTER_WIDTHD, RDXD, RDYD, RDZD, UUD, &
-            VVD, WWD, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, MU_DNSD, MU_SUMD, RHOPD, IWORK1D, IBAR, JBAR, KBAR)
+            VVD, WWD, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, MU_DNSD, MU_SUMD, RHOPD, IWORK1D, IBAR, JBAR, KBAR, DNS_FLAG, &
+            C_WALE_IN)
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
-            INTEGER , VALUE :: N_EXTERNAL_WALL_CELLS , N_INTERNAL_WALL_CELLS,IBAR,JBAR,KBAR
+            INTEGER , VALUE :: N_EXTERNAL_WALL_CELLS , N_INTERNAL_WALL_CELLS,IBAR,JBAR,KBAR,DNS_FLAG
+            REAL(EB), VALUE :: C_WALE_IN   ! MISC C_WALE of turb.f90 WALE_VISCOSITY (default 0.60)
             REAL(EB) , DEVICE ,DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: LES_FILTER_WIDTHD
             REAL(EB) , DEVICE , DIMENSION(0:*) :: RDXD,RDYD,RDZD
-            REAL(EB) ,DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*):: UUD,VVD,WWD,RHOPD,MU_DNSD,MU_SUMD
+            REAL(EB) ,DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: MU_DNSD, MU_SUMD
+            REAL(EB) ,DEVICE , DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UUD
+            REAL(EB) ,DEVICE , DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VVD
+            REAL(EB) ,DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WWD
+            REAL(EB) ,DEVICE , DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOPD
             INTEGER , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: IWORK1D
 
             INTEGER :: X , IIG ,JJG ,KKG , IERR
@@ -646,11 +662,12 @@ MODULE G_VELO
             IF (SD2 < 0._EB) SD2 = 0._EB
 
             DENOM = S2**2.5_EB + SD2**1.25_EB
-            IF (DENOM > TWO_EPSILON_EB) THEN
-                NU_EDDY = (0.60_EB*DELTA)**2 * SD2**1.5_EB / DENOM
+            IF (DENOM > TWENTY_EPSILON_EB) THEN
+                NU_EDDY = (C_WALE_IN*DELTA)**2 * SD2**1.5_EB / DENOM
             ELSE
                 NU_EDDY = 0._EB
             ENDIF
+            IF (DNS_FLAG==1) NU_EDDY = 0._EB   ! velo.f90 WALL_LOOP, DNS: MU(IIG,JJG,KKG) = MU_DNS
 
             TEMPER = MU_DNSD(IIG,JJG,KKG) + RHOPD(IIG,JJG,KKG)*NU_EDDY
 
@@ -693,7 +710,7 @@ MODULE G_VELO
             REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD,KRESD
 
             INTEGER :: X,II,JJ,KK,IIG,JJG,KKG,IC,BTYPE,ICG,IOR,IW
-            LOGICAL :: AFTER_SOLID
+            LOGICAL :: AFTER_SOLID,LAST_WALL
 
             X = (blockIdx%x - 1) * blockDim%x + threadIdx%x
 
@@ -716,10 +733,25 @@ MODULE G_VELO
             IF (KKG < 1 .OR. KKG > KBAR) RETURN
 
             IC = CELL_INDEXD(II,JJ,KK)
+            ! A solid cell on an OBST edge or vertex borders several gas cells, i.e. several wall cells. The CPU WALL
+            ! loop leaves the value of the wall with the largest index; a parallel write here would leave a random one.
+            ! Since FDS 4218ee295b this value enters MUA at convex OBST corners, so only the last wall writes.
             IF (SOLID_GHOSTS) THEN
-                IF (BTYPE == SOLID_BOUNDARY .AND. CELL_SOLID(IC)) MUD(II,JJ,KK) = MUD(IIG,JJG,KKG)
+                IF (BTYPE == SOLID_BOUNDARY .AND. CELL_SOLID(IC)) THEN
+                    LAST_WALL = LAST_WALL_OF_SOLID_CELL(X,II,JJ,KK,.TRUE.,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+                        CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+                    IF (LAST_WALL) MUD(II,JJ,KK) = MUD(IIG,JJG,KKG)
+                ENDIF
             ELSE
-                IF (CELL_SOLID(IC) .OR. CELL_EXTERIOR(IC)) KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                IF (CELL_EXTERIOR(IC)) THEN
+                    KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                ELSEIF (CELL_SOLID(IC)) THEN
+                    LAST_WALL = LAST_WALL_OF_SOLID_CELL(X,II,JJ,KK,.FALSE.,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+                        CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+                    IF (LAST_WALL) KRESD(II,JJ,KK) = KRESD(IIG,JJG,KKG)
+                ENDIF
             ENDIF
             IF (BTYPE == OPEN_BOUNDARY .OR. BTYPE == MIRROR_BOUNDARY) THEN
                 ! Preserve whether the CPU WALL loop has already updated the adjacent gas cell.
@@ -734,6 +766,42 @@ MODULE G_VELO
             ENDIF
 
         END SUBROUTINE COPY_GHOST_MU_KRES
+
+        ! True if no wall cell with a larger index than X has the solid cell (I0,J0,K0) as its ghost cell.
+        ! The candidates are the wall cells of the gas cells next to (I0,J0,K0). SOLID_ONLY: count only
+        ! SOLID_BOUNDARY walls (MU), otherwise all non-NULL walls (KRES), as in the CPU WALL loop of COMPUTE_VISCOSITY.
+        ATTRIBUTES(DEVICE) LOGICAL FUNCTION LAST_WALL_OF_SOLID_CELL(X,I0,J0,K0,SOLID_ONLY,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+            CELL_WALL_INDEX,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1,N_WALL_CELLS,NULL_BOUNDARY,SOLID_BOUNDARY)
+            INTEGER, INTENT(IN) :: X,I0,J0,K0,CELL_LB,CELL_UB,IBAR,JBAR,KBAR,IBP1,JBP1,N_WALL_CELLS
+            INTEGER, INTENT(IN) :: NULL_BOUNDARY,SOLID_BOUNDARY
+            LOGICAL, INTENT(IN) :: SOLID_ONLY
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER, DEVICE :: CELL_WALL_INDEX(CELL_LB:CELL_UB,-3:3)
+            INTEGER, DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: CELL_INDEXD
+            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID
+            INTEGER :: D,I1,J1,K1,ICN,IORN,IWN
+            LAST_WALL_OF_SOLID_CELL = .TRUE.
+            DO D=-3,3
+                IF (D==0) CYCLE
+                I1 = I0; J1 = J0; K1 = K0
+                IF (ABS(D)==1) I1 = I0 + SIGN(1,D)
+                IF (ABS(D)==2) J1 = J0 + SIGN(1,D)
+                IF (ABS(D)==3) K1 = K0 + SIGN(1,D)
+                IF (I1<1 .OR. I1>IBAR .OR. J1<1 .OR. J1>JBAR .OR. K1<1 .OR. K1>KBAR) CYCLE
+                ICN = CELL_INDEXD(I1,J1,K1)
+                IF (CELL_SOLID(ICN)) CYCLE
+                DO IORN=-3,3
+                    IF (IORN==0) CYCLE
+                    IWN = CELL_WALL_INDEX(ICN,IORN)
+                    IF (IWN<=X .OR. IWN>N_WALL_CELLS) CYCLE
+                    IF (WALL_TOPO(IWN)%II/=I0 .OR. WALL_TOPO(IWN)%JJ/=J0 .OR. WALL_TOPO(IWN)%KK/=K0) CYCLE
+                    IF (WALL_TOPO(IWN)%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
+                    IF (SOLID_ONLY .AND. WALL_TOPO(IWN)%BOUNDARY_TYPE/=SOLID_BOUNDARY) CYCLE
+                    LAST_WALL_OF_SOLID_CELL = .FALSE.
+                    RETURN
+                ENDDO
+            ENDDO
+        END FUNCTION LAST_WALL_OF_SOLID_CELL
         !--------------------------------------------------------------------------
         ! Momentum-flux host orchestration and kernels
         !--------------------------------------------------------------------------
@@ -840,7 +908,7 @@ MODULE G_VELO
                 GM%V_WINDD = V_WIND
                 GM%W_WINDD = W_WIND
             ENDIF
-            IF (ANY(ABS(FVEC)>TWO_EPSILON_EB) .OR. CTRL_DIRECT_FORCE .OR. ANY(ABS(OVEC)>TWO_EPSILON_EB)) &
+            IF (ANY(ABS(FVEC)>TWENTY_EPSILON_EB) .OR. CTRL_DIRECT_FORCE .OR. ANY(ABS(OVEC)>TWENTY_EPSILON_EB)) &
                 CALL WIND_FORCES_GPU(T,UU,VV,WW,RHOP)
 
             IF (GPU_DEBUG_H2D_D2H) THEN
@@ -857,8 +925,10 @@ MODULE G_VELO
             USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
             USE CONTROL_VARIABLES, ONLY: CONTROL,N_CTRL
             REAL(EB), INTENT(IN) :: T
-            REAL(EB), DEVICE :: UU(0:IBP1,0:JBP1,0:KBP1),VV(0:IBP1,0:JBP1,0:KBP1), &
-                WW(0:IBP1,0:JBP1,0:KBP1),RHOP(0:IBP1,0:JBP1,0:KBP1)
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:KBP1) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:KBP1) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:KBP1) :: WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1) :: RHOP
             REAL(EB) :: FORCE(3),DIRECTION_FACTOR(3),THETA
             INTEGER :: N,RAMP_INDEX(3)
             LOGICAL :: ROTATING
@@ -877,12 +947,12 @@ MODULE G_VELO
             RAMP_INDEX = (/I_RAMP_FVX_T,I_RAMP_FVY_T,I_RAMP_FVZ_T/)
             FORCE = 0._EB
             DO N=1,3
-                IF (ABS(FVEC(N))<=TWO_EPSILON_EB) CYCLE
+                IF (ABS(FVEC(N))<=TWENTY_EPSILON_EB) CYCLE
                 IF (RAMP_INDEX(N)<=0) RAMP_INDEX(N) = MAX(0,I_RAMP_PGF_T)
                 FORCE(N) = FVEC(N)*EVALUATE_RAMP(T,RAMP_INDEX(N))*DIRECTION_FACTOR(N)
             ENDDO
 
-            ROTATING = ANY(ABS(OVEC)>TWO_EPSILON_EB)
+            ROTATING = ANY(ABS(OVEC)>TWENTY_EPSILON_EB)
             IF (ROTATING) THEN
                 IF (GPU_DEBUG_H2D_D2H) THEN
                     GM%U_GHOSTD = U_GHOST
@@ -902,6 +972,32 @@ MODULE G_VELO
                 GM%FVXD,GM%FVYD,GM%FVZD,RHOP,GM%WORK7D,GM%WORK8D,GM%WORK9D, &
                 FORCE(1),FORCE(2),FORCE(3),OVEC(1),OVEC(2),OVEC(3),ROTATING,IBAR,JBAR,KBAR)
         END SUBROUTINE WIND_FORCES_GPU
+
+        !> \brief part.f90 PARTICLE_MOMENTUM_TRANSFER on the device: add the particle drag FVX_D, FVY_D, FVZ_D to FVX, FVY,
+        !> FVZ. The drag is computed on the host by MOVE_PARTICLES, limited to |u|/dt there (CLIP_PARTICLE_DRAG), summed
+        !> at mesh interfaces (MESH_EXCHANGE(20) and PARTICLE_MOMENTUM_TRANSFER of the corrector) and copied to
+        !> GM%PART_FV*_D; as in FDS 6.11.1 the predictor adds the values of the previous corrector.
+        SUBROUTINE PARTICLE_MOMENTUM_TRANSFER_GPU(NM)
+            INTEGER, INTENT(IN) :: NM
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            IF (.NOT.GM%PART_DRAG_ACTIVE) RETURN
+            CALL PARTICLE_DRAG_KERNEL_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                GM%FVXD,GM%FVYD,GM%FVZD,GM%PART_FVX_D,GM%PART_FVY_D,GM%PART_FVZ_D,IBAR,JBAR,KBAR)
+        END SUBROUTINE PARTICLE_MOMENTUM_TRANSFER_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE PARTICLE_DRAG_KERNEL_GPU(FVX,FVY,FVZ,FVX_D,FVY_D,FVZ_D,IBAR,JBAR,KBAR)
+            INTEGER, VALUE :: IBAR,JBAR,KBAR
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX,FVY,FVZ,FVX_D,FVY_D,FVZ_D
+            INTEGER :: I,J,K
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X+THREADIDX%X-1
+            J = (BLOCKIDX%Y-1)*BLOCKDIM%Y+THREADIDX%Y-1
+            K = (BLOCKIDX%Z-1)*BLOCKDIM%Z+THREADIDX%Z-1
+            IF (I>IBAR+1 .OR. J>JBAR+1 .OR. K>KBAR+1) RETURN
+            FVX(I,J,K) = FVX(I,J,K) + FVX_D(I,J,K)
+            FVY(I,J,K) = FVY(I,J,K) + FVY_D(I,J,K)
+            FVZ(I,J,K) = FVZ(I,J,K) + FVZ_D(I,J,K)
+        END SUBROUTINE PARTICLE_DRAG_KERNEL_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE WIND_FORCE_GHOST_GPU(UP,VP,WP,U_GHOST,V_GHOST,W_GHOST,WALL_TOPO,NW,IBP1,JBP1)
             INTEGER, VALUE :: NW,IBP1,JBP1
@@ -923,7 +1019,8 @@ MODULE G_VELO
             INTEGER, VALUE :: IBAR,JBAR,KBAR
             LOGICAL, VALUE :: ROTATING
             REAL(EB), VALUE :: FX,FY,FZ,OX,OY,OZ
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX,FVY,FVZ,RHOP,UP,VP,WP
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX, FVY, FVZ, UP, VP, WP
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER :: I,J,K
             I = (BLOCKIDX%X-1)*BLOCKDIM%X+THREADIDX%X-1
             J = (BLOCKIDX%Y-1)*BLOCKDIM%Y+THREADIDX%Y-1
@@ -1011,7 +1108,10 @@ MODULE G_VELO
         ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_FLUX_KERNEL_1(OMX,OMY,OMZ,TXY,TXZ,TYZ,UU,VV,WW,RDXN,RDYN,RDZN,MU ,IBAR,JBAR,KBAR)
             IMPLICIT NONE
             INTEGER , VALUE :: IBAR , JBAR ,KBAR
-            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX , OMY , OMZ , TXY , TXZ , TYZ , UU , VV , WW , MU
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX, OMY, OMZ, TXY, TXZ, TYZ, MU
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
             REAL(EB) , DEVICE , DIMENSION(0:*) :: RDXN , RDYN , RDZN
             REAL(EB) ::DWDX, DUDY , DVDX , DUDZ , DVDZ , DWDY , MUX ,MUY ,MUZ
             INTEGER :: I,J,K
@@ -1046,7 +1146,11 @@ MODULE G_VELO
                                                               RDXN,RDY,RDZ,MU,GX,IBAR,JBAR,KBAR,RHO_0,FVX,RRHO_X, &
                                                               CELL_LB,CELL_UB,EDGE_LB,EDGE_UB)
             INTEGER , VALUE :: IBAR,JBAR,KBAR,CELL_LB,CELL_UB,EDGE_LB,EDGE_UB
-            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX , OMY , OMZ , TXY , TXZ , TYZ , UU , VV , WW , MU , RHOP , DP ,FVX,RRHO_X
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX, OMY, OMZ, TXY, TXZ, TYZ, MU, DP, FVX, RRHO_X
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
             INTEGER , DEVICE , DIMENSION(CELL_LB:CELL_UB,1:*) :: CELL_EDGE_INDEX
             REAL(EB), DEVICE, DIMENSION(EDGE_LB:EDGE_UB,-2:*) :: EDGE_OMEGA,EDGE_TAU
@@ -1129,7 +1233,11 @@ MODULE G_VELO
                                                               CELL_LB,CELL_UB,EDGE_LB,EDGE_UB)
                 IMPLICIT NONE
             INTEGER , VALUE :: IBAR,JBAR,KBAR,CELL_LB,CELL_UB,EDGE_LB,EDGE_UB
-            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX , OMY , OMZ , TXY , TXZ , TYZ , UU , VV , WW , MU , RHOP , DP ,FVY,RRHO_Y
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX, OMY, OMZ, TXY, TXZ, TYZ, MU, DP, FVY, RRHO_Y
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
             INTEGER , DEVICE , DIMENSION(CELL_LB:CELL_UB,1:*) :: CELL_EDGE_INDEX
             REAL(EB), DEVICE, DIMENSION(EDGE_LB:EDGE_UB,-2:*) :: EDGE_OMEGA,EDGE_TAU
@@ -1211,7 +1319,11 @@ MODULE G_VELO
                                                               CELL_LB,CELL_UB,EDGE_LB,EDGE_UB)
                 IMPLICIT NONE
             INTEGER , VALUE :: IBAR,JBAR,KBAR,CELL_LB,CELL_UB,EDGE_LB,EDGE_UB
-            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX , OMY , OMZ , TXY , TXZ , TYZ , UU , VV , WW , MU , RHOP , DP ,FVZ,RRHO_Z
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: OMX, OMY, OMZ, TXY, TXZ, TYZ, MU, DP, FVZ, RRHO_Z
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
             INTEGER , DEVICE , DIMENSION(CELL_LB:CELL_UB,1:*) :: CELL_EDGE_INDEX
             REAL(EB), DEVICE, DIMENSION(EDGE_LB:EDGE_UB,-2:*) :: EDGE_OMEGA,EDGE_TAU
@@ -1291,6 +1403,7 @@ MODULE G_VELO
         ! Velocity predictor, stability reduction, and corrector
         !--------------------------------------------------------------------------
         SUBROUTINE VELOCITY_PREDICTOR_GPU(T,DT,DT_NEW,NM)
+            USE GLOBAL_CONSTANTS, ONLY: PRES_FLAG,GLMAT_FLAG,UGLMAT_FLAG,ULMAT_FLAG
             USE TURBULENCE, ONLY: COMPRESSION_WAVE
             USE MANUFACTURED_SOLUTIONS, ONLY: UF_MMS,WF_MMS,VD2D_MMS_U,VD2D_MMS_V
             USE CC_SCALARS, ONLY : CC_PROJECT_VELOCITY
@@ -1335,6 +1448,8 @@ MODULE G_VELO
                 CALL UVW_PREDICTOR_KERNEL<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%USD,GM%VSD,GM%WSD,GM%UD,GM%VD,GM%WD,GM%FVXD,GM%FVYD,GM%FVZD, &
                     GM%RDXND,GM%RDYND,GM%RDZND,GM%HD,DT,IBAR,JBAR,KBAR)
+                IF (PRES_FLAG==GLMAT_FLAG .OR. PRES_FLAG==UGLMAT_FLAG .OR. PRES_FLAG==ULMAT_FLAG) &
+                    CALL WALL_VELOCITY_NO_GRADH_GPU(NM,DT,.FALSE.)
             ENDIF
 
             IF (GPU_DEBUG_H2D_D2H) THEN
@@ -1349,28 +1464,18 @@ MODULE G_VELO
 
             ! Check the stability criteria, and if the time step is too small, send back a signal to kill the job
 
-            CALL CHECK_STABILITY_GPU(DT,DT_NEW,T,NM)
-
-            IF (DT_NEW(NM)<DT_INITIAL*LIMITING_DT_RATIO .AND. (T+DT_NEW(NM)<(T_END-TWO_EPSILON_EB))) STOP_STATUS = INSTABILITY_STOP
+            CALL CHECK_STABILITY_GPU(DT,NM)
 
             CONTAINS
 
-            SUBROUTINE CHECK_STABILITY_GPU(DT,DT_NEW,T,NM)
+            !> Launch the CFL (and VN) block-max reductions of the mesh into MESH_REDUCE_D. VELOCITY_PREDICTOR_FINISH_GPU
+            !> reads them back for all meshes at once and applies the time step logic of velo.f90:CHECK_STABILITY.
 
-                USE CC_SCALARS, ONLY : CHECK_CFLVN_LINKED_CELLS
-                USE OUTPUT_CLOCKS, ONLY: RAMP_TIME_INDEX,RAMP_DT_INDEX
-                USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
+            SUBROUTINE CHECK_STABILITY_GPU(DT,NM)
 
                 INTEGER, INTENT(IN) :: NM
-                REAL(EB), INTENT(IN) :: DT,T
-                REAL(EB) :: UODX,VODY,WODZ,UVW,UVWMAX,R_DX2,MU_MAX,MUTRM,PART_CFL,MU_TMP, UVWMAX_TMP, DT_CLIP, T_NOW
-                REAL(EB) :: DT_NEW(NMESHES)
-                INTEGER  :: I,J,K,IW,IIG,JJG,KKG, ICFL_TMP, JCFL_TMP, KCFL_TMP
-                REAL(EB), PARAMETER :: DT_EPS = 1.E-10_EB
-                TYPE(WALL_TYPE), POINTER :: WC
-                TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
-                TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
-                TYPE(RAMPS_TYPE), POINTER :: RP
+                REAL(EB), INTENT(IN) :: DT
+                REAL(EB) :: T_NOW
 
                 ! GPU reduction workspace.
                 INTEGER, PARAMETER :: BS1 = 256
@@ -1379,16 +1484,6 @@ MODULE G_VELO
 
                 T_NOW = CURRENT_TIME()
 
-                UVWMAX = 0._EB
-                VN     = 0._EB
-                MUTRM  = 1.E-9_EB
-                R_DX2  = 1.E-9_EB
-                ICFL   = 0; JCFL   = 0; KCFL   = 0
-                I_VN   = 0; J_VN   = 0; K_VN   = 0
-
-                !--------------------------------------------------------------
-                ! CFL maximum reduction
-                !--------------------------------------------------------------
                 NCELL  = IBAR*JBAR*KBAR
                 NBLK   = (NCELL + BS1 - 1) / BS1
                 BLOCK1 = DIM3(BS1,1,1)
@@ -1414,28 +1509,12 @@ MODULE G_VELO
                     GM%CFL_BLOCKMAX_D, GM%CFL_BLOCKI_D, GM%CFL_BLOCKJ_D, GM%CFL_BLOCKK_D, &
                     GM%USD, GM%VSD, GM%WSD, GM%DS_D, GM%RDXD, GM%RDYD, GM%RDZD, GM%CELL_INDEXD, GM%CELL_SOLID, IBAR, JBAR, KBAR, CFL_VELOCITY_NORM)
 
-                IF (.NOT.ALLOCATED(GM%FINAL_BLOCK_RESULT_D)) ALLOCATE(GM%FINAL_BLOCK_RESULT_D(4))
-
+                CALL MESH_REDUCE_ENSURE(NMESHES)
                 CALL FINAL_BLOCKMAX_REDUCE_KERNEL<<<1,BS1,0,GM%STRM>>>( &
-                    GM%FINAL_BLOCK_RESULT_D, &
-                    GM%CFL_BLOCKMAX_D,GM%CFL_BLOCKI_D,GM%CFL_BLOCKJ_D,GM%CFL_BLOCKK_D,NBLK)
+                    MESH_REDUCE_D, &
+                    GM%CFL_BLOCKMAX_D,GM%CFL_BLOCKI_D,GM%CFL_BLOCKJ_D,GM%CFL_BLOCKK_D,NBLK,MESH_REDUCE_OFFSET(MR_CFL,NM))
 
-                CALL GPU_WAIT(GM%STRM)
-                GM%FINAL_BLOCK_RESULT_H = GM%FINAL_BLOCK_RESULT_D
-                UVWMAX = GM%FINAL_BLOCK_RESULT_H(1)
-                ICFL = NINT(GM%FINAL_BLOCK_RESULT_H(2))
-                JCFL = NINT(GM%FINAL_BLOCK_RESULT_H(3))
-                KCFL = NINT(GM%FINAL_BLOCK_RESULT_H(4))
-
-                CFL = DT*UVWMAX
-
-                ! Include surface vegetation drag if necessary
-                PART_CFL = 0._EB
-
-                !--------------------------------------------------------------
-                ! VN maximum reduction
-                !--------------------------------------------------------------
-                PARABOLIC_IF: IF (CHECK_VN) THEN
+                IF (CHECK_VN) THEN
 
                     IF (.NOT.ALLOCATED(GM%VN_BLOCKMAX_D)) THEN
                         ALLOCATE(GM%VN_BLOCKMAX_D(NBLK),GM%VN_BLOCKMAX_H(NBLK))
@@ -1458,67 +1537,137 @@ MODULE G_VELO
                         GM%D_Z_MAXD, GM%MUD, GM%RHOSD, GM%CELL_INDEXD, GM%CELL_SOLID, IBAR, JBAR, KBAR)
 
                     CALL FINAL_BLOCKMAX_REDUCE_KERNEL<<<1,BS1,0,GM%STRM>>>( &
-                        GM%FINAL_BLOCK_RESULT_D, &
-                        GM%VN_BLOCKMAX_D,GM%VN_BLOCKI_D,GM%VN_BLOCKJ_D,GM%VN_BLOCKK_D,NBLK)
+                        MESH_REDUCE_D, &
+                        GM%VN_BLOCKMAX_D,GM%VN_BLOCKI_D,GM%VN_BLOCKJ_D,GM%VN_BLOCKK_D,NBLK,MESH_REDUCE_OFFSET(MR_VN,NM))
 
-                    CALL GPU_WAIT(GM%STRM)
-                    GM%FINAL_BLOCK_RESULT_H = GM%FINAL_BLOCK_RESULT_D
-                    MU_MAX = GM%FINAL_BLOCK_RESULT_H(1)
-                    I_VN = NINT(GM%FINAL_BLOCK_RESULT_H(2))
-                    J_VN = NINT(GM%FINAL_BLOCK_RESULT_H(3))
-                    K_VN = NINT(GM%FINAL_BLOCK_RESULT_H(4))
+                ENDIF
 
-                    IF (TWO_D) THEN
-                        R_DX2 = RDX(I_VN)**2 + RDZ(K_VN)**2
-                    ELSE
-                        R_DX2 = RDX(I_VN)**2 + RDY(J_VN)**2 + RDZ(K_VN)**2
-                    ENDIF
-
-                    MUTRM = MU_MAX
-                    VN = DT*2._EB*R_DX2*MUTRM
-
-                ENDIF PARABOLIC_IF
-
-                ! Attempt DT restriction to avoid clippings
-                DT_CLIP = HUGE(1._EB)
-
-                RAMP_TIME_IF: IF (RAMP_TIME_INDEX>0) THEN
-
-                    ! Keep the RAMP_TIME_INDEX-controlled time step unchanged.
-
-                ELSE RAMP_TIME_IF
-
-                    ! Adjust time step size if necessary
-                    IF ((CFL<CFL_MAX .AND. VN<VN_MAX .AND. PART_CFL<PARTICLE_CFL_MAX) .OR. LOCK_TIME_STEP) THEN
-                        DT_NEW(NM) = DT
-                        IF (CFL<=CFL_MIN .AND. VN<VN_MIN .AND. PART_CFL<PARTICLE_CFL_MIN .AND. .NOT.LOCK_TIME_STEP) THEN
-                            SELECT CASE (RESTRICT_TIME_STEP)
-                            CASE (.TRUE.)
-                                DT_NEW(NM) = MIN(1.1_EB*DT,DT_INITIAL)
-                            CASE (.FALSE.)
-                                DT_NEW(NM) = 1.1_EB*DT
-                            END SELECT
-                            CHANGE_TIME_STEP_INDEX(NM) = 1
-                        ELSE
-                            CHANGE_TIME_STEP_INDEX(NM) = 0
-                        ENDIF
-                    ELSE
-                        DT_NEW(NM) = 0.9_EB*MIN( CFL_MAX/MAX(UVWMAX,DT_EPS)               , &
-                                                VN_MAX/(2._EB*R_DX2*MAX(MUTRM,DT_EPS))   , &
-                                                PARTICLE_CFL_MAX/MAX(PART_UVWMAX,DT_EPS) , &
-                                                DT_CLIP)
-                        CHANGE_TIME_STEP_INDEX(NM) = -1
-                    ENDIF
-
-                    IF (RAMP_DT_INDEX > 0) DT_NEW(NM) = MIN(DT_NEW(NM),EVALUATE_RAMP(T,RAMP_DT_INDEX))
-
-                ENDIF RAMP_TIME_IF
+                MESH_REDUCE_PENDING(MR_CFL,NM) = .TRUE.
 
                 T_USED(4)=T_USED(4)+CURRENT_TIME()-T_NOW
 
             END SUBROUTINE CHECK_STABILITY_GPU
 
         END SUBROUTINE VELOCITY_PREDICTOR_GPU
+
+        !> After the mesh loop of VELOCITY_PREDICTOR_GPU: one device wait and one read-back of the CFL/VN maxima of all
+        !> meshes, then the time step logic per mesh as velo.f90:CHECK_STABILITY and the instability check.
+
+        SUBROUTINE VELOCITY_PREDICTOR_FINISH_GPU(T,DT,DT_NEW)
+            REAL(EB), INTENT(IN) :: T,DT
+            REAL(EB) :: DT_NEW(NMESHES)
+            INTEGER :: NM
+
+            IF (.NOT.MESH_REDUCE_FETCH(MR_CFL)) RETURN
+            DO NM=1,NMESHES
+                IF (.NOT.MESH_REDUCE_PENDING(MR_CFL,NM)) CYCLE
+                MESH_REDUCE_PENDING(MR_CFL,NM) = .FALSE.
+                CALL POINT_TO_MESH(NM)
+                CALL CHECK_STABILITY_FINISH_GPU(DT,DT_NEW,T,NM)
+                IF (DT_NEW(NM)<DT_INITIAL*LIMITING_DT_RATIO .AND. (T+DT_NEW(NM)<(T_END-TWENTY_EPSILON_EB))) STOP_STATUS = INSTABILITY_STOP
+            ENDDO
+
+        END SUBROUTINE VELOCITY_PREDICTOR_FINISH_GPU
+
+        SUBROUTINE CHECK_STABILITY_FINISH_GPU(DT,DT_NEW,T,NM)
+
+            USE OUTPUT_CLOCKS, ONLY: RAMP_TIME_INDEX,RAMP_DT_INDEX
+            USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
+
+            INTEGER, INTENT(IN) :: NM
+            REAL(EB), INTENT(IN) :: DT,T
+            REAL(EB) :: UVWMAX,R_DX2,MU_MAX,MUTRM,PART_CFL,DT_CLIP,T_NOW
+            REAL(EB) :: DT_NEW(NMESHES)
+            INTEGER  :: I0
+            REAL(EB), PARAMETER :: DT_EPS = 1.E-10_EB
+            TYPE(RAMPS_TYPE), POINTER :: RP
+
+            T_NOW = CURRENT_TIME()
+
+            UVWMAX = 0._EB
+            VN     = 0._EB
+            MUTRM  = 1.E-9_EB
+            R_DX2  = 1.E-9_EB
+            ICFL   = 0; JCFL   = 0; KCFL   = 0
+            I_VN   = 0; J_VN   = 0; K_VN   = 0
+
+            I0 = MESH_REDUCE_OFFSET(MR_CFL,NM)
+            UVWMAX = MESH_REDUCE_H(I0+1)
+            ICFL = NINT(MESH_REDUCE_H(I0+2))
+            JCFL = NINT(MESH_REDUCE_H(I0+3))
+            KCFL = NINT(MESH_REDUCE_H(I0+4))
+
+            CFL = DT*UVWMAX
+
+            ! Include surface vegetation drag if necessary
+            PART_CFL = 0._EB
+
+            PARABOLIC_IF: IF (CHECK_VN) THEN
+
+                I0 = MESH_REDUCE_OFFSET(MR_VN,NM)
+                MU_MAX = MESH_REDUCE_H(I0+1)
+                I_VN = NINT(MESH_REDUCE_H(I0+2))
+                J_VN = NINT(MESH_REDUCE_H(I0+3))
+                K_VN = NINT(MESH_REDUCE_H(I0+4))
+
+                IF (TWO_D) THEN
+                    R_DX2 = RDX(I_VN)**2 + RDZ(K_VN)**2
+                ELSE
+                    R_DX2 = RDX(I_VN)**2 + RDY(J_VN)**2 + RDZ(K_VN)**2
+                ENDIF
+
+                MUTRM = MU_MAX
+                VN = DT*2._EB*R_DX2*MUTRM
+
+            ENDIF PARABOLIC_IF
+
+            ! Attempt DT restriction to avoid clippings
+            DT_CLIP = HUGE(1._EB)
+
+            RAMP_TIME_IF: IF (RAMP_TIME_INDEX>0) THEN
+
+                ! User-specified time increments (velo.f90:CHECK_STABILITY)
+                RP=>RAMPS(RAMP_TIME_INDEX)
+                IF (ICYC==RP%NUMBER_DATA_POINTS) THEN
+                    DT_NEW(NM) = T_END - RP%INDEPENDENT_DATA(ICYC)
+                ELSEIF (ICYC<=RP%NUMBER_DATA_POINTS-1) THEN
+                    DT_NEW(NM) = RP%INDEPENDENT_DATA(ICYC+1) - RP%INDEPENDENT_DATA(ICYC)
+                ELSE
+                    DT_NEW(NM) = MAX(0._EB,T_END - T)
+                ENDIF
+                CHANGE_TIME_STEP_INDEX(NM) = 1
+
+            ELSE RAMP_TIME_IF
+
+                ! Adjust time step size if necessary
+                IF ((CFL<CFL_MAX .AND. VN<VN_MAX .AND. PART_CFL<PARTICLE_CFL_MAX) .OR. LOCK_TIME_STEP) THEN
+                    DT_NEW(NM) = DT
+                    IF (CFL<=CFL_MIN .AND. VN<VN_MIN .AND. PART_CFL<PARTICLE_CFL_MIN .AND. .NOT.LOCK_TIME_STEP) THEN
+                        SELECT CASE (RESTRICT_TIME_STEP)
+                        CASE (.TRUE.)
+                            DT_NEW(NM) = MIN(1.1_EB*DT,DT_INITIAL)
+                        CASE (.FALSE.)
+                            DT_NEW(NM) = 1.1_EB*DT
+                        END SELECT
+                        CHANGE_TIME_STEP_INDEX(NM) = 1
+                    ELSE
+                        CHANGE_TIME_STEP_INDEX(NM) = 0
+                    ENDIF
+                ELSE
+                    DT_NEW(NM) = 0.9_EB*MIN( CFL_MAX/MAX(UVWMAX,DT_EPS)               , &
+                                            VN_MAX/(2._EB*R_DX2*MAX(MUTRM,DT_EPS))   , &
+                                            PARTICLE_CFL_MAX/MAX(PART_UVWMAX,DT_EPS) , &
+                                            DT_CLIP)
+                    CHANGE_TIME_STEP_INDEX(NM) = -1
+                ENDIF
+
+                IF (RAMP_DT_INDEX > 0) DT_NEW(NM) = MIN(DT_NEW(NM),EVALUATE_RAMP(T,RAMP_DT_INDEX))
+
+            ENDIF RAMP_TIME_IF
+
+            T_USED(4)=T_USED(4)+CURRENT_TIME()-T_NOW
+
+        END SUBROUTINE CHECK_STABILITY_FINISH_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE CFL_SCAN_BLOCKMAX_KERNEL( &
             BLOCKMAX, BLOCKI, BLOCKJ, BLOCKK, &
@@ -1529,7 +1678,10 @@ MODULE G_VELO
             INTEGER, VALUE :: IBAR, JBAR, KBAR, CFL_NORM
             REAL(EB), DEVICE, DIMENSION(*)         :: BLOCKMAX
             INTEGER,  DEVICE, DIMENSION(*)         :: BLOCKI, BLOCKJ, BLOCKK
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: US, VS, WS, DS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DS
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: US
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WS
             REAL(EB), DEVICE, DIMENSION(0:*)        :: RDX, RDY, RDZ
             INTEGER,  DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: CELL_INDEX
             LOGICAL,  DEVICE, DIMENSION(0:*)         :: CELL_SOLID
@@ -1680,7 +1832,8 @@ MODULE G_VELO
             INTEGER, VALUE :: IBAR, JBAR, KBAR
             REAL(EB), DEVICE, DIMENSION(*)         :: BLOCKMAX
             INTEGER,  DEVICE, DIMENSION(*)         :: BLOCKI, BLOCKJ, BLOCKK
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: D_Z_MAX, MU, RHOS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: D_Z_MAX, MU
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOS
             INTEGER,  DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: CELL_INDEX
             LOGICAL,  DEVICE, DIMENSION(0:*)         :: CELL_SOLID
 
@@ -1811,7 +1964,10 @@ MODULE G_VELO
             IBAR,JBAR,KBAR)
 
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: US,VS,WS,U,V,W,FVX,FVY,FVZ,H
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX, FVY, FVZ, H
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: US,U
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VS,V
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WS,W
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN,RDYN,RDZN
             REAL(EB), VALUE :: DT
 
@@ -1832,7 +1988,105 @@ MODULE G_VELO
 
         END SUBROUTINE UVW_PREDICTOR_KERNEL
 
+        !> GPU version of WALL_VELOCITY_NO_GRADH (velo.f90): with GLMAT, UGLMAT or ULMAT the normal velocity on
+        !> solid, null and mirror wall cells is advanced without the pressure gradient. STORE_UN in the corrector
+        !> keeps the start-of-step normal velocities for the corrector update.
+        SUBROUTINE WALL_VELOCITY_NO_GRADH_GPU(NM,DT,STORE_UN)
+            USE GLOBAL_CONSTANTS, ONLY: PRES_ON_WHOLE_DOMAIN,PREDICTOR,CORRECTOR,SOLID_BOUNDARY,NULL_BOUNDARY, &
+                                        MIRROR_BOUNDARY
+            INTEGER, INTENT(IN) :: NM
+            REAL(EB), INTENT(IN) :: DT
+            LOGICAL, INTENT(IN) :: STORE_UN
+            INTEGER :: N_WALLS,MODE,BLK,GRD
+
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            N_WALLS = N_EXTERNAL_WALL_CELLS
+            IF (.NOT.PRES_ON_WHOLE_DOMAIN) N_WALLS = N_EXTERNAL_WALL_CELLS + N_INTERNAL_WALL_CELLS
+            IF (STORE_UN) THEN
+                IF (.NOT.CORRECTOR) RETURN
+                MODE = 0
+            ELSEIF (PREDICTOR) THEN
+                MODE = 1
+            ELSE
+                MODE = 2
+            ENDIF
+            IF (N_WALLS<1) RETURN
+            IF (ALLOCATED(GM%UN_WALLS_NO_GRADH_D)) THEN
+                IF (SIZE(GM%UN_WALLS_NO_GRADH_D)<N_WALLS) DEALLOCATE(GM%UN_WALLS_NO_GRADH_D)
+            ENDIF
+            IF (.NOT.ALLOCATED(GM%UN_WALLS_NO_GRADH_D)) ALLOCATE(GM%UN_WALLS_NO_GRADH_D(N_WALLS))
+            BLK = 128
+            GRD = (N_WALLS+BLK-1)/BLK
+            CALL WALL_VELOCITY_NO_GRADH_KERNEL<<<GRD,BLK,0,GM%STRM>>>(N_WALLS,MODE,DT,GM%WALL_TOPO_AOS, &
+                GM%CELL_INDEXD,GM%CELL_SOLID,GM%UN_WALLS_NO_GRADH_D,GM%UD,GM%VD,GM%WD,GM%USD,GM%VSD,GM%WSD, &
+                GM%FVXD,GM%FVYD,GM%FVZD,IBAR,JBAR,KBAR,SOLID_BOUNDARY,NULL_BOUNDARY,MIRROR_BOUNDARY)
+        END SUBROUTINE WALL_VELOCITY_NO_GRADH_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE WALL_VELOCITY_NO_GRADH_KERNEL(N_WALLS,MODE,DT,WALL_TOPO,CELL_INDEXD,CELL_SOLID, &
+            UN_WALLS,U,V,W,US,VS,WS,FVX,FVY,FVZ,IBAR,JBAR,KBAR,SOLID_B,NULL_B,MIRROR_B)
+            INTEGER, VALUE :: N_WALLS,MODE,IBAR,JBAR,KBAR,SOLID_B,NULL_B,MIRROR_B
+            REAL(EB), VALUE :: DT
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER , DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
+            LOGICAL , DEVICE, DIMENSION(0:*) :: CELL_SOLID
+            REAL(EB), DEVICE, DIMENSION(*) :: UN_WALLS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX,FVY,FVZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: US,U
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VS,V
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WS,W
+            INTEGER :: IW,BTYPE,IOR,II,JJ,KK,IIG,JJG,KKG
+            REAL(EB) :: VEL_N
+
+            IW = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (IW<1 .OR. IW>N_WALLS) RETURN
+            BTYPE = WALL_TOPO(IW)%BOUNDARY_TYPE
+            IOR = WALL_TOPO(IW)%IOR
+            II  = WALL_TOPO(IW)%II;  JJ  = WALL_TOPO(IW)%JJ;  KK  = WALL_TOPO(IW)%KK
+            IIG = WALL_TOPO(IW)%IIG; JJG = WALL_TOPO(IW)%JJG; KKG = WALL_TOPO(IW)%KKG
+
+            IF (MODE==0) THEN
+                SELECT CASE(IOR)
+                    CASE( 1); UN_WALLS(IW) = U(IIG-1,JJG  ,KKG  )
+                    CASE(-1); UN_WALLS(IW) = U(IIG  ,JJG  ,KKG  )
+                    CASE( 2); UN_WALLS(IW) = V(IIG  ,JJG-1,KKG  )
+                    CASE(-2); UN_WALLS(IW) = V(IIG  ,JJG  ,KKG  )
+                    CASE( 3); UN_WALLS(IW) = W(IIG  ,JJG  ,KKG-1)
+                    CASE(-3); UN_WALLS(IW) = W(IIG  ,JJG  ,KKG  )
+                    CASE DEFAULT; UN_WALLS(IW) = 0._EB
+                END SELECT
+                RETURN
+            ENDIF
+
+            IF (BTYPE/=SOLID_B .AND. BTYPE/=NULL_B .AND. BTYPE/=MIRROR_B) RETURN
+            IF (BTYPE==NULL_B) THEN
+                IF (.NOT.CELL_SOLID(CELL_INDEXD(IIG,JJG,KKG)) .AND. .NOT.CELL_SOLID(CELL_INDEXD(II,JJ,KK))) RETURN
+            ENDIF
+
+            IF (MODE==1) THEN
+                SELECT CASE(IOR)
+                    CASE( 1); US(IIG-1,JJG  ,KKG  ) = U(IIG-1,JJG  ,KKG  ) - DT*FVX(IIG-1,JJG  ,KKG  )
+                    CASE(-1); US(IIG  ,JJG  ,KKG  ) = U(IIG  ,JJG  ,KKG  ) - DT*FVX(IIG  ,JJG  ,KKG  )
+                    CASE( 2); VS(IIG  ,JJG-1,KKG  ) = V(IIG  ,JJG-1,KKG  ) - DT*FVY(IIG  ,JJG-1,KKG  )
+                    CASE(-2); VS(IIG  ,JJG  ,KKG  ) = V(IIG  ,JJG  ,KKG  ) - DT*FVY(IIG  ,JJG  ,KKG  )
+                    CASE( 3); WS(IIG  ,JJG  ,KKG-1) = W(IIG  ,JJG  ,KKG-1) - DT*FVZ(IIG  ,JJG  ,KKG-1)
+                    CASE(-3); WS(IIG  ,JJG  ,KKG  ) = W(IIG  ,JJG  ,KKG  ) - DT*FVZ(IIG  ,JJG  ,KKG  )
+                END SELECT
+            ELSE
+                VEL_N = UN_WALLS(IW)
+                SELECT CASE(IOR)
+                    CASE( 1); U(IIG-1,JJG  ,KKG  ) = 0.5_EB*(VEL_N + US(IIG-1,JJG  ,KKG  ) - DT*FVX(IIG-1,JJG  ,KKG  ))
+                    CASE(-1); U(IIG  ,JJG  ,KKG  ) = 0.5_EB*(VEL_N + US(IIG  ,JJG  ,KKG  ) - DT*FVX(IIG  ,JJG  ,KKG  ))
+                    CASE( 2); V(IIG  ,JJG-1,KKG  ) = 0.5_EB*(VEL_N + VS(IIG  ,JJG-1,KKG  ) - DT*FVY(IIG  ,JJG-1,KKG  ))
+                    CASE(-2); V(IIG  ,JJG  ,KKG  ) = 0.5_EB*(VEL_N + VS(IIG  ,JJG  ,KKG  ) - DT*FVY(IIG  ,JJG  ,KKG  ))
+                    CASE( 3); W(IIG  ,JJG  ,KKG-1) = 0.5_EB*(VEL_N + WS(IIG  ,JJG  ,KKG-1) - DT*FVZ(IIG  ,JJG  ,KKG-1))
+                    CASE(-3); W(IIG  ,JJG  ,KKG  ) = 0.5_EB*(VEL_N + WS(IIG  ,JJG  ,KKG  ) - DT*FVZ(IIG  ,JJG  ,KKG  ))
+                END SELECT
+            ENDIF
+        END SUBROUTINE WALL_VELOCITY_NO_GRADH_KERNEL
+
         SUBROUTINE VELOCITY_CORRECTOR_GPU(T,DT,NM)
+            USE GLOBAL_CONSTANTS, ONLY: PRES_FLAG,GLMAT_FLAG,UGLMAT_FLAG,ULMAT_FLAG
 
             USE TURBULENCE, ONLY: COMPRESSION_WAVE
             USE MANUFACTURED_SOLUTIONS, ONLY: UF_MMS,WF_MMS,VD2D_MMS_U,VD2D_MMS_V
@@ -1870,9 +2124,13 @@ MODULE G_VELO
                 GM%VD = GM%VSD
                 GM%WD = GM%WSD
             ELSE
+                IF (PRES_FLAG==GLMAT_FLAG .OR. PRES_FLAG==UGLMAT_FLAG .OR. PRES_FLAG==ULMAT_FLAG) &
+                    CALL WALL_VELOCITY_NO_GRADH_GPU(NM,DT,.TRUE.)
                 CALL UVW_CORRECTOR_KERNEL<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%UD,GM%VD,GM%WD,GM%USD,GM%VSD,GM%WSD,GM%FVXD,GM%FVYD,GM%FVZD, &
                     GM%RDXND,GM%RDYND,GM%RDZND,GM%HSD,DT,IBAR,JBAR,KBAR)
+                IF (PRES_FLAG==GLMAT_FLAG .OR. PRES_FLAG==UGLMAT_FLAG .OR. PRES_FLAG==ULMAT_FLAG) &
+                    CALL WALL_VELOCITY_NO_GRADH_GPU(NM,DT,.FALSE.)
             ENDIF
 
             IF (GPU_DEBUG_H2D_D2H) THEN
@@ -1888,7 +2146,10 @@ MODULE G_VELO
             IBAR,JBAR,KBAR)
 
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: U,V,W,US,VS,WS,FVX,FVY,FVZ,HS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX, FVY, FVZ, HS
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: U,US
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: V,VS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: W,WS
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN,RDYN,RDZN
             REAL(EB), VALUE :: DT
 
@@ -2068,7 +2329,8 @@ MODULE G_VELO
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, DEVICE :: WALL_SF_INDEX(0:*)
             REAL(EB), DEVICE :: WALL_RDN(0:*),WALL_U_TANG(0:*),SURF_ROUGHNESS(0:*),WALL_U_TAU(0:*),WALL_Y_PLUS(0:*)
-            REAL(EB), DEVICE :: MU_DNSD(0:IBP1,0:JBP1,0:*),RHOD(0:IBP1,0:JBP1,0:*)
+            REAL(EB), DEVICE :: MU_DNSD(0:IBP1,0:JBP1,0:*)
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOD
             INTEGER, VALUE :: TOTAL_WALL_CELLS,IBP1,JBP1,SOLID_BOUNDARY_LOCAL,SIM_MODE_LOCAL,DNS_MODE_LOCAL
             REAL(EB), DEVICE :: VON_KARMAN_CONSTANT_LOCAL,Y_WERNER_WENGLE_LOCAL
 
@@ -2098,6 +2360,64 @@ MODULE G_VELO
 
         END SUBROUTINE WALL_MODEL_OUTPUT_KERNEL
 
+        !> \brief Send the synthetic eddies of the SEM VENTs (turb.f90 SYNTHETIC_TURBULENCE, run on the host) to the device
+        !> \details Per WALL cell of a VENT with N_EDDY>0: U_EDDY, V_EDDY, W_EDDY of the VENT at the cell, as indexed in
+        !> divg.f90 PREDICT_NORMAL_VELOCITY and velo.f90 VELOCITY_BC, the profile factor of the normal velocity
+        !> (|U_NORMAL_0/VEL| for a SURF PROFILE) and the VENT index. Called after SYNTHETIC_TURBULENCE, as on the CPU.
+        SUBROUTINE SEM_EDDIES_TO_GPU(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW
+            REAL(EB), ALLOCATABLE :: SEM_H(:,:)
+            INTEGER, ALLOCATABLE :: SEM_VENT_H(:)
+            TYPE(WALL_TYPE), POINTER :: WC
+            TYPE(VENTS_TYPE), POINTER :: VT
+            TYPE(SURFACE_TYPE), POINTER :: SF
+            TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
+            TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
+
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            ALLOCATE(SEM_H(4,LBOUND(GM%WALL_SEM_VENT,1):UBOUND(GM%WALL_SEM_VENT,1)))
+            ALLOCATE(SEM_VENT_H(LBOUND(GM%WALL_SEM_VENT,1):UBOUND(GM%WALL_SEM_VENT,1)))
+            SEM_H = 0._EB
+            SEM_VENT_H = 0
+            DO IW=1,MIN(N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,UBOUND(SEM_VENT_H,1))
+                WC => WALL(IW)
+                IF (WC%VENT_INDEX<=0) CYCLE
+                VT => VENTS(WC%VENT_INDEX)
+                IF (VT%N_EDDY<=0) CYCLE
+                ! Any boundary type, as velo.f90 takes an edge between two WALL cells of the same SEM VENT (only SOLID
+                ! SEM VENTs reach the device; divg.f90 adds the eddies to the normal velocity of SOLID cells only)
+                BC => BOUNDARY_COORD(WC%BC_INDEX)
+                B1 => BOUNDARY_PROP1(WC%B1_INDEX)
+                SF => SURFACE(WC%SURF_INDEX)
+                SELECT CASE(ABS(BC%IOR))
+                    CASE(1)
+                        SEM_H(1,IW) = VT%U_EDDY(BC%JJ,BC%KK)
+                        SEM_H(2,IW) = VT%V_EDDY(BC%JJ,BC%KK)
+                        SEM_H(3,IW) = VT%W_EDDY(BC%JJ,BC%KK)
+                    CASE(2)
+                        SEM_H(1,IW) = VT%U_EDDY(BC%II,BC%KK)
+                        SEM_H(2,IW) = VT%V_EDDY(BC%II,BC%KK)
+                        SEM_H(3,IW) = VT%W_EDDY(BC%II,BC%KK)
+                    CASE(3)
+                        SEM_H(1,IW) = VT%U_EDDY(BC%II,BC%JJ)
+                        SEM_H(2,IW) = VT%V_EDDY(BC%II,BC%JJ)
+                        SEM_H(3,IW) = VT%W_EDDY(BC%II,BC%JJ)
+                END SELECT
+                IF (SF%PROFILE/=0 .AND. ABS(SF%VEL)>TWENTY_EPSILON_EB) THEN
+                    SEM_H(4,IW) = ABS(B1%U_NORMAL_0/SF%VEL)
+                ELSE
+                    SEM_H(4,IW) = 1._EB
+                ENDIF
+                SEM_VENT_H(IW) = WC%VENT_INDEX
+            ENDDO
+            CALL GPU_WAIT(GM%STRM)
+            GM%WALL_SEM = SEM_H
+            GM%WALL_SEM_VENT = SEM_VENT_H
+            DEALLOCATE(SEM_H,SEM_VENT_H)
+        END SUBROUTINE SEM_EDDIES_TO_GPU
+
         SUBROUTINE VELOCITY_BC_GPU(T,NM,APPLY_TO_ESTIMATED_VARIABLES)
             IMPLICIT NONE
             REAL(EB) :: T
@@ -2110,7 +2430,9 @@ MODULE G_VELO
             TYPE(DIM3) :: BLK,GRD,GRD_AXIS1,GRD_AXIS2,GRD_AXIS3,GRD_PREP
             INTEGER :: EDGE_ACTIVE_LB, EDGE_ACTIVE_UB, NEDGE_ACTIVE
             REAL(EB), ALLOCATABLE :: EDGE_OMEGA_H(:,:), EDGE_TAU_H(:,:)
-            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: OM_VEL_1D(:,:,:),OM_VEL_2D(:,:,:)
+            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: OM_VEL_1D(:,:,:),OM_VEL_2D(:,:,:),OM_VEL_AXD(:,:,:)
+            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: OM_UD(:,:,:),OM_VD(:,:,:),OM_WD(:,:,:)
+            REAL(EB), DEVICE, POINTER, DIMENSION(:,:,:) :: UUD_BC,VVD_BC,WWD_BC
             INTEGER, DEVICE, POINTER, CONTIGUOUS :: EDGE_AXIS_LISTD(:)
 
             CALL POINT_TO_MESH(NM)
@@ -2123,6 +2445,50 @@ MODULE G_VELO
             ENDIF
 
             DRAG_UVWMAX = 0._EB
+
+            ! FDS 6.11.1 (3825fb9dd2, 6385fa6513): normal velocity of the neighbouring mesh one face beyond the
+            ! external boundary (UU(-1), UU(IBP1) etc.). One thread per external wall cell, each writes its own face.
+            IF (N_EXTERNAL_WALL_CELLS > 0 .AND. ALLOCATED(GM%OMESH)) THEN
+                IF (APPLY_TO_ESTIMATED_VARIABLES) THEN
+                    UUD_BC => GM%USD ; VVD_BC => GM%VSD ; WWD_BC => GM%WSD
+                    IF (GPU_DEBUG_H2D_D2H) THEN
+                        GM%USD = US ; GM%VSD = VS ; GM%WSD = WS
+                    ENDIF
+                ELSE
+                    UUD_BC => GM%UD ; VVD_BC => GM%VD ; WWD_BC => GM%WD
+                    IF (GPU_DEBUG_H2D_D2H) THEN
+                        GM%UD = U ; GM%VD = V ; GM%WD = W
+                    ENDIF
+                ENDIF
+                DO NOM=1,NMESHES
+                    GOM_LOCAL => GM%OMESH(NOM)
+                    IF (.NOT.GOM_LOCAL%ACTIVE) CYCLE
+                    OM => MESHES(NM)%OMESH(NOM)
+                    IF (APPLY_TO_ESTIMATED_VARIABLES) THEN
+                        IF (GPU_DEBUG_H2D_D2H) THEN
+                            GOM_LOCAL%US_D = OM%US ; GOM_LOCAL%VS_D = OM%VS ; GOM_LOCAL%WS_D = OM%WS
+                        ENDIF
+                        OM_UD => GOM_LOCAL%US_D ; OM_VD => GOM_LOCAL%VS_D ; OM_WD => GOM_LOCAL%WS_D
+                    ELSE
+                        IF (GPU_DEBUG_H2D_D2H) THEN
+                            GOM_LOCAL%U_D = OM%U ; GOM_LOCAL%V_D = OM%V ; GOM_LOCAL%W_D = OM%W
+                        ENDIF
+                        OM_UD => GOM_LOCAL%U_D ; OM_VD => GOM_LOCAL%V_D ; OM_WD => GOM_LOCAL%W_D
+                    ENDIF
+                    CALL VELOCITY_BC_INTERFACE_NORMAL_GPU<<<GM%GRDD_EXTERNAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                        N_EXTERNAL_WALL_CELLS,GM%WALL_TOPO_AOS,GM%EXTERNAL_WALL_NOMD,GM%WALL_IIO,GM%WALL_JJO,GM%WALL_KKO, &
+                        GM%WALL_IIO_MAX,GM%WALL_JJO_MAX,GM%WALL_KKO_MAX,OM_UD,OM_VD,OM_WD,UUD_BC,VVD_BC,WWD_BC,NOM, &
+                        LBOUND(OM_UD,1),UBOUND(OM_UD,1),LBOUND(OM_UD,2),UBOUND(OM_UD,2),LBOUND(OM_UD,3),IBP1,JBP1)
+                ENDDO
+                IF (GPU_DEBUG_H2D_D2H) THEN
+                    CALL GPU_WAIT(GM%STRM)
+                    IF (APPLY_TO_ESTIMATED_VARIABLES) THEN
+                        US = GM%USD ; VS = GM%VSD ; WS = GM%WSD
+                    ELSE
+                        U = GM%UD ; V = GM%VD ; W = GM%WD
+                    ENDIF
+                ENDIF
+            ENDIF
 
             EDGE_ACTIVE_LB = 1
             EDGE_ACTIVE_UB = EDGE_COUNT(NM)
@@ -2199,6 +2565,20 @@ MODULE G_VELO
                             STRIDE_2 = 1
                     END SELECT
                     IF (NEDGE_PREP <= 0) CYCLE
+                    ! Axial neighbour velocity for the corner ghosts (used in the CORRECTOR only, OM%U/V/W)
+                    IF (.NOT.APPLY_TO_ESTIMATED_VARIABLES) THEN
+                        SELECT CASE(AXIS)
+                            CASE(1); OM_VEL_AXD => GOM_LOCAL%U_D
+                            CASE(2); OM_VEL_AXD => GOM_LOCAL%V_D
+                            CASE(3); OM_VEL_AXD => GOM_LOCAL%W_D
+                        END SELECT
+                        CALL PREPARE_VELOCITY_BC_EDGE_CORNER_GPU<<<GRD_PREP,BLK,0,GM%STRM>>>(GM%EDGE_CORNER_1, &
+                            GM%EDGE_CORNER_2,OM_VEL_AXD,EDGE_AXIS_LISTD,NEDGE_PREP,GM%EDGE_NOM_1,GM%EDGE_NOM_2, &
+                            GM%EDGE_IIO_1,GM%EDGE_JJO_1,GM%EDGE_KKO_1,GM%EDGE_IIO_2,GM%EDGE_JJO_2,GM%EDGE_KKO_2, &
+                            GM%EDGE_I,GM%EDGE_J,GM%EDGE_K,NOM,AXIS,IBAR,JBAR,KBAR, &
+                            LBOUND(OM_VEL_AXD,1),UBOUND(OM_VEL_AXD,1),LBOUND(OM_VEL_AXD,2),UBOUND(OM_VEL_AXD,2), &
+                            LBOUND(OM_VEL_AXD,3),GM%EDGE_LB)
+                    ENDIF
                     CALL PREPARE_VELOCITY_BC_EDGE_GHOST_GPU<<<GRD_PREP,BLK,0,GM%STRM>>>(GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,OM_VEL_1D, &
                         OM_VEL_2D,EDGE_AXIS_LISTD,NEDGE_PREP,GM%EDGE_NOM_1,GM%EDGE_NOM_2,GM%EDGE_IIO_1,GM%EDGE_JJO_1,GM%EDGE_KKO_1, &
                         GM%EDGE_IIO_2,GM%EDGE_JJO_2,GM%EDGE_KKO_2,GM%EDGE_INTERP_1,GM%EDGE_INTERP_2,NOM,STRIDE_1,STRIDE_2, &
@@ -2221,8 +2601,8 @@ MODULE G_VELO
 
                 IF (GM%N_EDGE_AXIS1 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS1,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2245,11 +2625,14 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 IF (GM%N_EDGE_AXIS2 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS2,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2272,11 +2655,14 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 IF (GM%N_EDGE_AXIS3 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS3,BLK,0,GM%STRM>>>( &
-                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%USD,GM%VSD,GM%WSD,GM%RHOSD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2299,7 +2685,10 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,3,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,3,GM%EDGE_LB,GM%EDGE_UB,0,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 CALL VELOCITY_BC_GPU_TAU_OMEGA_KERNEL<<<GRD,BLK,0,GM%STRM>>>( &
                     GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_LB,GM%EDGE_UB,EDGE_ACTIVE_LB,EDGE_ACTIVE_UB)
             ELSE
@@ -2315,8 +2704,8 @@ MODULE G_VELO
 
                 IF (GM%N_EDGE_AXIS1 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS1,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2339,11 +2728,14 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,1,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 IF (GM%N_EDGE_AXIS2 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS2,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2366,11 +2758,14 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,2,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 IF (GM%N_EDGE_AXIS3 > 0) &
                     CALL VELOCITY_BC_GPU_GHOST_KERNEL_AXIS<<<GRD_AXIS3,BLK,0,GM%STRM>>>( &
-                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD, &
-                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2, &
+                        GM%UD,GM%VD,GM%WD,GM%RHOD,GM%TMPD,GM%MUD, &
+                        GM%EDGE_GHOST_1,GM%EDGE_GHOST_2,GM%EDGE_CORNER_1,GM%EDGE_CORNER_2, &
                         GM%EDGE_U_AVG,GM%EDGE_V_AVG,GM%EDGE_W_AVG, &
                         GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_SIDE_ISGN,GM%EDGE_SIDE_IOR, &
                         GM%EDGE_SIDE_IS2,GM%EDGE_SIDE_ICD,GM%EDGE_SIDE_IWM,GM%EDGE_SIDE_IWMI, &
@@ -2393,7 +2788,10 @@ MODULE G_VELO
                         IBAR,JBAR,KBAR,I_MAX_TEMP, &
                         SOLID_BOUNDARY,FREE_SLIP_BC,NO_SLIP_BC,WALL_MODEL_BC, &
                         INTERPOLATED_BOUNDARY, &
-                        SIM_MODE,DNS_MODE,3,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD)
+                        SIM_MODE,DNS_MODE,3,GM%EDGE_LB,GM%EDGE_UB,1,OPEN_WIND_BOUNDARY,GM%U_WINDD,GM%V_WINDD,GM%W_WINDD, &
+                        GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD),GM%WALL_U_NORMAL_0,GM%WALL_U_NORMAL_S, &
+                        SF_T_IGN, &
+                        SURF_PROFILE_D,SURF_VEL_D,SURF_RAMP_VPZ_D,GM%ZCD,T_BEGIN)
                 CALL VELOCITY_BC_GPU_TAU_OMEGA_KERNEL<<<GRD,BLK,0,GM%STRM>>>( &
                     GM%EDGE_OMEGA,GM%EDGE_TAU,GM%EDGE_LB,GM%EDGE_UB,EDGE_ACTIVE_LB,EDGE_ACTIVE_UB)
             ENDIF
@@ -2467,6 +2865,104 @@ MODULE G_VELO
 
         END SUBROUTINE PREPARE_VELOCITY_BC_EDGE_GHOST_GPU
 
+        ! Corner ghost values for interpolated edges (velo.f90 VELOCITY_BC, FDS 6.11.1 35b423dac8). OM_VEL is the
+        ! component along the edge axis (OM%U for IEC=1, OM%V for IEC=2, OM%W for IEC=3). ICD=1/2 are the sides
+        ! |IOR|=2/3 (IEC=1), 3/1 (IEC=2) and 1/2 (IEC=3); the neighbour index is shifted along the other transverse axis.
+        ATTRIBUTES(GLOBAL) SUBROUTINE PREPARE_VELOCITY_BC_EDGE_CORNER_GPU(EDGE_CORNER_1,EDGE_CORNER_2,OM_VEL, &
+            EDGE_AXIS_LIST,NEDGE_AXIS,EDGE_NOM_1,EDGE_NOM_2,EDGE_IIO_1,EDGE_JJO_1,EDGE_KKO_1,EDGE_IIO_2,EDGE_JJO_2, &
+            EDGE_KKO_2,EDGE_I,EDGE_J,EDGE_K,NOM_FILTER,IEC,IBAR,JBAR,KBAR,OLI,OUI,OLJ,OUJ,OLK,EDGE_LB)
+            IMPLICIT NONE
+
+            INTEGER, VALUE :: NEDGE_AXIS,NOM_FILTER,IEC,IBAR,JBAR,KBAR,OLI,OUI,OLJ,OUJ,OLK,EDGE_LB
+            REAL(EB), DEVICE, DIMENSION(EDGE_LB:*) :: EDGE_CORNER_1,EDGE_CORNER_2
+            REAL(EB), DEVICE, DIMENSION(OLI:OUI,OLJ:OUJ,OLK:*) :: OM_VEL
+            INTEGER, DEVICE, DIMENSION(*) :: EDGE_AXIS_LIST
+            INTEGER, DEVICE, DIMENSION(EDGE_LB:*) :: EDGE_NOM_1,EDGE_NOM_2
+            INTEGER, DEVICE, DIMENSION(EDGE_LB:*) :: EDGE_IIO_1,EDGE_JJO_1,EDGE_KKO_1
+            INTEGER, DEVICE, DIMENSION(EDGE_LB:*) :: EDGE_IIO_2,EDGE_JJO_2,EDGE_KKO_2
+            INTEGER, DEVICE, DIMENSION(EDGE_LB:*) :: EDGE_I,EDGE_J,EDGE_K
+            INTEGER :: IDX,IE,II,JJ,KK,DI,DJ,DK
+
+            IDX = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IDX < 1 .OR. IDX > NEDGE_AXIS) RETURN
+            IE = EDGE_AXIS_LIST(IDX)
+            II = EDGE_I(IE)
+            JJ = EDGE_J(IE)
+            KK = EDGE_K(IE)
+            DI = MERGE(-1,1,II==0)
+            DJ = MERGE(-1,1,JJ==0)
+            DK = MERGE(-1,1,KK==0)
+
+            SELECT CASE(IEC)
+                CASE(1)
+                    IF (.NOT.((JJ==0 .OR. JJ==JBAR) .AND. (KK==0 .OR. KK==KBAR))) RETURN
+                    IF (ABS(EDGE_NOM_1(IE))==NOM_FILTER) EDGE_CORNER_1(IE) = OM_VEL(EDGE_IIO_1(IE),EDGE_JJO_1(IE),EDGE_KKO_1(IE)+DK)
+                    IF (ABS(EDGE_NOM_2(IE))==NOM_FILTER) EDGE_CORNER_2(IE) = OM_VEL(EDGE_IIO_2(IE),EDGE_JJO_2(IE)+DJ,EDGE_KKO_2(IE))
+                CASE(2)
+                    IF (.NOT.((II==0 .OR. II==IBAR) .AND. (KK==0 .OR. KK==KBAR))) RETURN
+                    IF (ABS(EDGE_NOM_1(IE))==NOM_FILTER) EDGE_CORNER_1(IE) = OM_VEL(EDGE_IIO_1(IE)+DI,EDGE_JJO_1(IE),EDGE_KKO_1(IE))
+                    IF (ABS(EDGE_NOM_2(IE))==NOM_FILTER) EDGE_CORNER_2(IE) = OM_VEL(EDGE_IIO_2(IE),EDGE_JJO_2(IE),EDGE_KKO_2(IE)+DK)
+                CASE(3)
+                    IF (.NOT.((II==0 .OR. II==IBAR) .AND. (JJ==0 .OR. JJ==JBAR))) RETURN
+                    IF (ABS(EDGE_NOM_1(IE))==NOM_FILTER) EDGE_CORNER_1(IE) = OM_VEL(EDGE_IIO_1(IE),EDGE_JJO_1(IE)+DJ,EDGE_KKO_1(IE))
+                    IF (ABS(EDGE_NOM_2(IE))==NOM_FILTER) EDGE_CORNER_2(IE) = OM_VEL(EDGE_IIO_2(IE)+DI,EDGE_JJO_2(IE),EDGE_KKO_2(IE))
+            END SELECT
+
+        END SUBROUTINE PREPARE_VELOCITY_BC_EDGE_CORNER_GPU
+
+        ! Normal velocity of the neighbouring mesh one face beyond the external boundary, averaged over the
+        ! abutting cells (velo.f90 VELOCITY_BC WALL_LOOP, FDS 6.11.1 3825fb9dd2, 6385fa6513).
+        ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_BC_INTERFACE_NORMAL_GPU(N_EXTERNAL_WALL_CELLS,WALL_TOPO,EXT_NOMD, &
+            EXT_IIOD,EXT_JJOD,EXT_KKOD,EXT_IIOD_MAX,EXT_JJOD_MAX,EXT_KKOD_MAX,OM_UU,OM_VV,OM_WW,UU,VV,WW,NOM_FILTER, &
+            OLI,OUI,OLJ,OUJ,OLK,IBP1,JBP1)
+            IMPLICIT NONE
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,NOM_FILTER,OLI,OUI,OLJ,OUJ,OLK,IBP1,JBP1
+            INTEGER, DEVICE, DIMENSION(1:*) :: EXT_NOMD,EXT_IIOD,EXT_JJOD,EXT_KKOD,EXT_IIOD_MAX,EXT_JJOD_MAX,EXT_KKOD_MAX
+            REAL(EB), DEVICE, DIMENSION(OLI:OUI,OLJ:OUJ,OLK:*) :: OM_UU,OM_VV,OM_WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WW
+            INTEGER :: IW,IOR,II,JJ,KK,IIOO,JJOO,KKOO,N_INT_CELLS
+            REAL(EB) :: UN_OTHER
+
+            IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS) RETURN
+            IF (EXT_NOMD(IW) /= NOM_FILTER) RETURN
+
+            IOR = WALL_TOPO(IW)%IOR
+            II  = WALL_TOPO(IW)%II
+            JJ  = WALL_TOPO(IW)%JJ
+            KK  = WALL_TOPO(IW)%KK
+
+            UN_OTHER = 0._EB
+            DO KKOO=EXT_KKOD(IW),EXT_KKOD_MAX(IW)
+                DO JJOO=EXT_JJOD(IW),EXT_JJOD_MAX(IW)
+                    DO IIOO=EXT_IIOD(IW),EXT_IIOD_MAX(IW)
+                        SELECT CASE(IOR)
+                            CASE(-1) ; UN_OTHER = UN_OTHER + OM_UU(IIOO  ,JJOO  ,KKOO  )
+                            CASE( 1) ; UN_OTHER = UN_OTHER + OM_UU(IIOO-1,JJOO  ,KKOO  )
+                            CASE(-2) ; UN_OTHER = UN_OTHER + OM_VV(IIOO  ,JJOO  ,KKOO  )
+                            CASE( 2) ; UN_OTHER = UN_OTHER + OM_VV(IIOO  ,JJOO-1,KKOO  )
+                            CASE(-3) ; UN_OTHER = UN_OTHER + OM_WW(IIOO  ,JJOO  ,KKOO  )
+                            CASE( 3) ; UN_OTHER = UN_OTHER + OM_WW(IIOO  ,JJOO  ,KKOO-1)
+                        END SELECT
+                    ENDDO
+                ENDDO
+            ENDDO
+            N_INT_CELLS = (EXT_IIOD_MAX(IW)-EXT_IIOD(IW)+1)*(EXT_JJOD_MAX(IW)-EXT_JJOD(IW)+1)*(EXT_KKOD_MAX(IW)-EXT_KKOD(IW)+1)
+            UN_OTHER = UN_OTHER/REAL(N_INT_CELLS,EB)
+            SELECT CASE(IOR)
+                CASE(-1) ; UU(II  ,JJ,KK) = UN_OTHER
+                CASE( 1) ; UU(II-1,JJ,KK) = UN_OTHER
+                CASE(-2) ; VV(II,JJ  ,KK) = UN_OTHER
+                CASE( 2) ; VV(II,JJ-1,KK) = UN_OTHER
+                CASE(-3) ; WW(II,JJ,KK  ) = UN_OTHER
+                CASE( 3) ; WW(II,JJ,KK-1) = UN_OTHER
+            END SELECT
+
+        END SUBROUTINE VELOCITY_BC_INTERFACE_NORMAL_GPU
+
         ATTRIBUTES(DEVICE) SUBROUTINE STORE_EDGE_VELOCITY_AVG(EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG,IE,IEC,ICD, &
             VEL_GHOST,VEL_GAS)
             IMPLICIT NONE
@@ -2502,8 +2998,8 @@ MODULE G_VELO
         !--------------------------------------------------------------------------
         ! One-thread-per-edge velocity ghost kernel
         !--------------------------------------------------------------------------
-        ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_BC_GPU_GHOST_KERNEL_AXIS(UU,VV,WW,RHOPD,TMPD_IN,EDGE_GHOST_1,EDGE_GHOST_2, &
-            EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG, &
+        ATTRIBUTES(GLOBAL) SUBROUTINE VELOCITY_BC_GPU_GHOST_KERNEL_AXIS(UU,VV,WW,RHOPD,TMPD_IN,MU_IN,EDGE_GHOST_1,EDGE_GHOST_2, &
+            EDGE_CORNER_1,EDGE_CORNER_2,EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG, &
             EDGE_OMEGA_IN,EDGE_TAU_IN,EDGE_SIDE_ISGN_IN,EDGE_SIDE_IOR_IN,EDGE_SIDE_IS2_IN,EDGE_SIDE_ICD_IN, &
             EDGE_SIDE_IWM_IN,EDGE_SIDE_IWMI_IN,EDGE_SIDE_IWP_IN,EDGE_SIDE_IWPI_IN, &
             EDGE_AXIS_LIST, NEDGE_AXIS, EDGE_I, EDGE_J, EDGE_K, EDGE_CELL_INDEX_MM, EDGE_CELL_INDEX_PM, &
@@ -2515,12 +3011,25 @@ MODULE G_VELO
             Y_WERNER_WENGLED, IBAR, &
             JBAR, KBAR, I_MAX_TEMP_LOCAL, SOLID_BOUNDARY_LOCAL, FREE_SLIP_BC_LOCAL, NO_SLIP_BC_LOCAL, WALL_MODEL_BC_LOCAL, &
             INTERPOLATED_BOUNDARY_LOCAL,SIM_MODE_LOCAL,DNS_MODE_LOCAL,IEC_TARGET_LOCAL,EDGE_ACTIVE_LB,EDGE_ACTIVE_UB, &
-            CORRECTOR_LOCAL,WIND_BOUNDARY,U_WIND,V_WIND,W_WIND)
+            CORRECTOR_LOCAL,WIND_BOUNDARY,U_WIND,V_WIND,W_WIND, &
+            WALL_SEM,WALL_SEM_VENT,SEM_FLAG,WALL_U_NORMAL_0_IN,WALL_U_NORMAL_S_IN,SF_T_IGN_IN,SURF_PROFILE_IN,SURF_VEL_IN, &
+            SURF_RAMP_VPZ_IN, &
+            ZC_IN,T_BEGIN_IN)
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            REAL(EB), DEVICE :: WALL_SEM(4,0:*)
+            INTEGER, DEVICE :: WALL_SEM_VENT(0:*)
+            INTEGER, VALUE :: SEM_FLAG
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_U_NORMAL_0_IN,WALL_U_NORMAL_S_IN,SF_T_IGN_IN,SURF_VEL_IN,ZC_IN
+            INTEGER, DEVICE, DIMENSION(0:*) :: SURF_PROFILE_IN,SURF_RAMP_VPZ_IN
+            REAL(EB), VALUE :: T_BEGIN_IN
 
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UU,VV,WW,RHOPD,TMPD_IN
-            REAL(EB), DEVICE, DIMENSION(0:*) :: EDGE_GHOST_1,EDGE_GHOST_2
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: MU_IN
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOPD,TMPD_IN
+            REAL(EB), DEVICE, DIMENSION(0:*) :: EDGE_GHOST_1,EDGE_GHOST_2,EDGE_CORNER_1,EDGE_CORNER_2
             REAL(EB), DEVICE, DIMENSION(0:*) :: EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG
             REAL(EB), DEVICE, DIMENSION(EDGE_ACTIVE_LB:EDGE_ACTIVE_UB,-2:*) :: EDGE_OMEGA_IN,EDGE_TAU_IN
             INTEGER, DEVICE, DIMENSION(EDGE_ACTIVE_LB:EDGE_ACTIVE_UB,1:*) :: EDGE_SIDE_ISGN_IN,EDGE_SIDE_IOR_IN
@@ -2581,17 +3090,22 @@ MODULE G_VELO
             REAL(EB) :: U_NORM,WIND_NORMAL
 
             LOGICAL  :: ALL_BLOCKED, OPEN_M, OPEN_P, INTERPOLATED_EDGE, WIND_INFLOW
+            LOGICAL  :: ANY_INTERPOLATED_SIDE
+            REAL(EB) :: VEL_CORNER
+            LOGICAL  :: SEM_EDGE
+            INTEGER  :: IWM_F,IWP_F,IC_EDDY
+            REAL(EB) :: VEL_EDDY,TSI,PROFILE_FACTOR,VEL_N,VEL_T_SF
 
 
             IDX = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
             IF (IDX < 1 .OR. IDX > NEDGE_AXIS) RETURN
             IE = EDGE_AXIS_LIST(IDX)
 
-            IF (CORRECTOR_LOCAL /= 0) THEN
-                EDGE_U_AVG(IE) = -1.E6_EB
-                EDGE_V_AVG(IE) = -1.E6_EB
-                EDGE_W_AVG(IE) = -1.E6_EB
-            ENDIF
+            EDGE_U_AVG(IE) = -1.E6_EB
+            EDGE_V_AVG(IE) = -1.E6_EB
+            EDGE_W_AVG(IE) = -1.E6_EB
+            ! CPU INTERPOLATED_EDGE: once set by one side it stays set for the remaining sides of this edge
+            ANY_INTERPOLATED_SIDE = .FALSE.
 
             DO L=-2,2
                 EDGE_OMEGA_IN(IE,L) = -1.E6_EB
@@ -2654,15 +3168,44 @@ MODULE G_VELO
 
                     IF (IWM == 0 .AND. IWP == 0) CYCLE
 
-                    IF (IWM > 0 .AND. IWMI > 0) THEN
-                        IF (WALL_TOPO(IWMI)%BOUNDARY_TYPE == SOLID_BOUNDARY_LOCAL) THEN
-                            IF (SURF_VELOCITY_BC_INDEX(WALL_SF_INDEX(IWM)) /= FREE_SLIP_BC_LOCAL) CYCLE
-                        ENDIF
+                    ! velo.f90: a solid wall separates the two wall cells. As there, a missing wall cell (IWM or IWP = 0)
+                    ! is WALL(0), whose SURFace (DEFAULT_SURF_INDEX) decides, e.g. where a thin OBST meets the domain boundary.
+                    IF (WALL_TOPO(IWMI)%BOUNDARY_TYPE == SOLID_BOUNDARY_LOCAL) THEN
+                        IF (SURF_VELOCITY_BC_INDEX(WALL_SF_INDEX(IWM)) /= FREE_SLIP_BC_LOCAL) CYCLE
                     ENDIF
 
-                    IF (IWP > 0 .AND. IWPI > 0) THEN
-                        IF (WALL_TOPO(IWPI)%BOUNDARY_TYPE == SOLID_BOUNDARY_LOCAL) THEN
-                            IF (SURF_VELOCITY_BC_INDEX(WALL_SF_INDEX(IWP)) /= FREE_SLIP_BC_LOCAL) CYCLE
+                    IF (WALL_TOPO(IWPI)%BOUNDARY_TYPE == SOLID_BOUNDARY_LOCAL) THEN
+                        IF (SURF_VELOCITY_BC_INDEX(WALL_SF_INDEX(IWP)) /= FREE_SLIP_BC_LOCAL) CYCLE
+                    ENDIF
+
+                    ! If both adjacent wall cells are NULL (e.g. the faces of a removed or not yet created OBST), cycle out,
+                    ! as in velo.f90. A missing wall cell takes the type of the other one.
+                    IF (IWM > 0) THEN
+                        BOUNDARY_TYPE_M = WALL_TOPO(IWM)%BOUNDARY_TYPE
+                    ELSE
+                        BOUNDARY_TYPE_M = WALL_TOPO(IWP)%BOUNDARY_TYPE
+                    ENDIF
+                    IF (IWP > 0) THEN
+                        BOUNDARY_TYPE_P = WALL_TOPO(IWP)%BOUNDARY_TYPE
+                    ELSE
+                        BOUNDARY_TYPE_P = WALL_TOPO(IWM)%BOUNDARY_TYPE
+                    ENDIF
+                    IF (BOUNDARY_TYPE_M == NULL_BOUNDARY .AND. BOUNDARY_TYPE_P == NULL_BOUNDARY) CYCLE
+
+                    ! velo.f90: synthetic eddy method if both wall cells belong to the same VENT with N_EDDY>0. The
+                    ! eddy velocity of the ghost component (W/V for IEC=1, U/W for IEC=2, V/U for IEC=3) is the mean of
+                    ! the two wall cells (only SOLID SEM VENTs without wind reach the device, CHECK_GPU_FEATURE_SUPPORT).
+                    SEM_EDGE = .FALSE.
+                    VEL_EDDY = 0._EB
+                    IF (SEM_FLAG == 1 .AND. IWM > 0 .AND. IWP > 0) THEN
+                        IF (WALL_SEM_VENT(IWM) > 0 .AND. WALL_SEM_VENT(IWM) == WALL_SEM_VENT(IWP)) THEN
+                            SEM_EDGE = .TRUE.
+                            SELECT CASE(IEC)
+                                CASE(1); IC_EDDY = MERGE(3,2,ICD==1)
+                                CASE(2); IC_EDDY = MERGE(1,3,ICD==1)
+                                CASE DEFAULT; IC_EDDY = MERGE(2,1,ICD==1)
+                            END SELECT
+                            VEL_EDDY = 0.5_EB*(WALL_SEM(IC_EDDY,IWM)+WALL_SEM(IC_EDDY,IWP))
                         ENDIF
                     ENDIF
 
@@ -2717,7 +3260,15 @@ MODULE G_VELO
                                 IF (JJ==JBAR .AND. IOR==-2) UU(II,JBAR+1,KK) = MERGE(U_WIND(KK),UU(II,JBAR,KK),WIND_INFLOW)
                         END SELECT
 
-                        IF (IWM /= 0 .AND. IWP /= 0) RETURN
+                        IF (IWM /= 0 .AND. IWP /= 0) THEN
+                            ! velo.f90 leaves the edge here (CYCLE EDGE_LOOP) before it stores the gradients of the
+                            ! sides already done, e.g. a thin OBST meeting an OPEN boundary: drop them as well.
+                            DO L=-2,2
+                                EDGE_OMEGA_IN(IE,L) = -1.E6_EB
+                                EDGE_TAU_IN(IE,L) = -1.E6_EB
+                            ENDDO
+                            RETURN
+                        ENDIF
                         CYCLE
                     ENDIF
 
@@ -2775,8 +3326,27 @@ MODULE G_VELO
                             IF (JJ==JBAR .AND. IOR==-2) UU(II,JJ+1,KK) = VEL_GHOST
                         END SELECT
 
-                        IF (CORRECTOR_LOCAL /= 0) CALL STORE_EDGE_VELOCITY_AVG( &
-                            EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG,IE,IEC,ICD,VEL_GHOST,VEL_GAS)
+                        ! FDS 6.11.1 (35b423dac8): in the CORRECTOR, the velocity component along the edge in the corner
+                        ! ghost cell is taken from the neighbouring mesh (one-step time lag); U_AVG etc. are not set.
+                        ANY_INTERPOLATED_SIDE = .TRUE.
+                        IF (CORRECTOR_LOCAL /= 0) THEN
+                            IF (ICD == 1) THEN
+                                VEL_CORNER = EDGE_CORNER_1(IE)
+                            ELSE
+                                VEL_CORNER = EDGE_CORNER_2(IE)
+                            ENDIF
+                            SELECT CASE(IEC)
+                            CASE(1)
+                                IF ((JJ==0 .OR. JJ==JBAR) .AND. (KK==0 .OR. KK==KBAR) .AND. (ABS(IOR)==2 .OR. ABS(IOR)==3)) &
+                                    UU(II,JJ+MERGE(0,1,JJ==0),KK+MERGE(0,1,KK==0)) = VEL_CORNER
+                            CASE(2)
+                                IF ((II==0 .OR. II==IBAR) .AND. (KK==0 .OR. KK==KBAR) .AND. (ABS(IOR)==1 .OR. ABS(IOR)==3)) &
+                                    VV(II+MERGE(0,1,II==0),JJ,KK+MERGE(0,1,KK==0)) = VEL_CORNER
+                            CASE(3)
+                                IF ((II==0 .OR. II==IBAR) .AND. (JJ==0 .OR. JJ==JBAR) .AND. (ABS(IOR)==1 .OR. ABS(IOR)==2)) &
+                                    WW(II+MERGE(0,1,II==0),JJ+MERGE(0,1,JJ==0),KK) = VEL_CORNER
+                            END SELECT
+                        ENDIF
 
                         CYCLE
                     ENDIF
@@ -2790,6 +3360,7 @@ MODULE G_VELO
                     ENDIF
 
                     VELOCITY_BC_INDEX = SURF_VELOCITY_BC_INDEX(SURF_INDEX_USE)
+                    IF (SEM_EDGE) VELOCITY_BC_INDEX = NO_SLIP_BC_LOCAL
                     IF (IWM > 0 .AND. SURF_ROUGHNESS(SURF_INDEX_USE) > 2._EB/WALL_RDN(IWM)) &
                         VELOCITY_BC_INDEX = NO_SLIP_BC_LOCAL
 
@@ -2817,15 +3388,55 @@ MODULE G_VELO
                         IIGP = CELL_I(ICPP); JJGP = CELL_J(ICPP); KKGP = CELL_K(ICPP)
                     ENDIF
 
+                    ! velo.f90: tangential velocity of a SURF with VEL_T or of a SEM VENT. A missing wall cell takes the
+                    ! properties of the other one (WCM, WCP). With a user-specified normal velocity VEL (or no normal
+                    ! velocity at all): time ramp from the SURF T_IGN; inflow (VEL<0) RAMP_V_Z profile factor and VEL_T plus
+                    ! the eddies; exhaust (VEL>0) PROFILE and RAMP_V_Z profile factor and the eddies only; VEL=0 VEL_T only.
+                    ! Otherwise (normal velocity from a MASS_FLUX etc.) VEL_T scaled by the inflow velocity. (HVAC tangential
+                    ! velocity: HVAC is refused on the GPU.)
                     VEL_T = 0._EB
-                    IF (SURF_SPECIFIED_TANGENTIAL_VELOCITY(SURF_INDEX_USE)) THEN
-                        RAMP_T = EVALUATE_RAMP_DEVICE(T_IN,SF_RAMP_VELO_INDEX(SURF_INDEX_USE), &
-                            SF_RAMP_VELO_TAU(SURF_INDEX_USE),RAMP_T_MIN,RAMP_SPAN,RAMP_RDT, &
-                            RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
-                        IF (IEC==1 .OR. (IEC==2 .AND. ICD==2)) VEL_T = RAMP_T*SURF_VEL_T_2(SURF_INDEX_USE)
-                        IF (IEC==3 .OR. (IEC==2 .AND. ICD==1)) VEL_T = RAMP_T*SURF_VEL_T_1(SURF_INDEX_USE)
+                    IF (SURF_SPECIFIED_TANGENTIAL_VELOCITY(SURF_INDEX_USE) .OR. SEM_EDGE) THEN
+                        IWM_F = IWM ; IF (IWM_F == 0) IWM_F = IWP
+                        IWP_F = IWP ; IF (IWP_F == 0) IWP_F = IWM
+                        IF (IEC==1 .OR. (IEC==2 .AND. ICD==2)) THEN
+                            VEL_T_SF = SURF_VEL_T_2(SURF_INDEX_USE)
+                        ELSE
+                            VEL_T_SF = SURF_VEL_T_1(SURF_INDEX_USE)
+                        ENDIF
+                        VEL_N = 0.5_EB*(WALL_U_NORMAL_S_IN(IWM_F)+WALL_U_NORMAL_S_IN(IWP_F))
+                        IF (ABS(SURF_VEL_IN(SURF_INDEX_USE)) > 0._EB .OR. VEL_N == 0._EB) THEN
+                            IF (ABS(SF_T_IGN_IN(SURF_INDEX_USE)-T_BEGIN_IN) <= SPACING(SF_T_IGN_IN(SURF_INDEX_USE)) .AND. &
+                                SF_RAMP_VELO_INDEX(SURF_INDEX_USE) >= 1) THEN
+                                TSI = T_IN
+                            ELSE
+                                TSI = T_IN - SF_T_IGN_IN(SURF_INDEX_USE)
+                            ENDIF
+                            PROFILE_FACTOR = 1._EB
+                            RAMP_T = EVALUATE_RAMP_DEVICE(TSI,SF_RAMP_VELO_INDEX(SURF_INDEX_USE), &
+                                SF_RAMP_VELO_TAU(SURF_INDEX_USE),RAMP_T_MIN,RAMP_SPAN,RAMP_RDT, &
+                                RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
+                            IF (SURF_VEL_IN(SURF_INDEX_USE) < 0._EB) THEN
+                                IF (SURF_RAMP_VPZ_IN(SURF_INDEX_USE) > 0) &
+                                    PROFILE_FACTOR = EVALUATE_RAMP_DEVICE(ZC_IN(KK),SURF_RAMP_VPZ_IN(SURF_INDEX_USE),0._EB, &
+                                        RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
+                                VEL_T = RAMP_T*(PROFILE_FACTOR*(VEL_T_SF + VEL_EDDY))
+                            ELSEIF (SURF_VEL_IN(SURF_INDEX_USE) > 0._EB) THEN
+                                IF (SURF_PROFILE_IN(SURF_INDEX_USE) /= 0) &
+                                    PROFILE_FACTOR = ABS(0.5_EB*(WALL_U_NORMAL_0_IN(IWM_F)+WALL_U_NORMAL_0_IN(IWP_F))/ &
+                                                         SURF_VEL_IN(SURF_INDEX_USE))
+                                IF (SURF_RAMP_VPZ_IN(SURF_INDEX_USE) > 0) &
+                                    PROFILE_FACTOR = EVALUATE_RAMP_DEVICE(ZC_IN(KK),SURF_RAMP_VPZ_IN(SURF_INDEX_USE),0._EB, &
+                                        RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
+                                VEL_T = RAMP_T*PROFILE_FACTOR*VEL_EDDY
+                            ELSE
+                                VEL_T = RAMP_T*VEL_T_SF
+                            ENDIF
+                        ELSEIF (VEL_N < 0._EB) THEN
+                            VEL_T = -VEL_T_SF*VEL_N
+                        ENDIF
                     ENDIF
-                    MUA = 0.5_EB*(MUD(IIGM,JJGM,KKGM) + MUD(IIGP,JJGP,KKGP))
+                    ! MU of this mesh passed explicitly: the module pointer MUD points to whichever mesh was set last
+                    MUA = 0.5_EB*(MU_IN(IIGM,JJGM,KKGM) + MU_IN(IIGP,JJGP,KKGP))
 
                     IF (VELOCITY_BC_INDEX == FREE_SLIP_BC_LOCAL) THEN
                         VEL_GHOST = VEL_GAS
@@ -2851,7 +3462,7 @@ MODULE G_VELO
                             IF (JJ==JBAR .AND. IOR==-2) UU(II,JJ+1,KK) = VEL_GHOST
                         END SELECT
 
-                        IF (CORRECTOR_LOCAL /= 0) CALL STORE_EDGE_VELOCITY_AVG( &
+                        IF (CORRECTOR_LOCAL /= 0 .AND. .NOT.ANY_INTERPOLATED_SIDE) CALL STORE_EDGE_VELOCITY_AVG( &
                             EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG,IE,IEC,ICD,VEL_GHOST,VEL_GAS)
 
                         CYCLE
@@ -2881,33 +3492,37 @@ MODULE G_VELO
                             IF (JJ==JBAR .AND. IOR==-2) UU(II,JJ+1,KK) = VEL_GHOST
                         END SELECT
 
-                        IF (CORRECTOR_LOCAL /= 0) CALL STORE_EDGE_VELOCITY_AVG( &
+                        IF (CORRECTOR_LOCAL /= 0 .AND. .NOT.ANY_INTERPOLATED_SIDE) CALL STORE_EDGE_VELOCITY_AVG( &
                             EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG,IE,IEC,ICD,VEL_GHOST,VEL_GAS)
 
                         CYCLE
                     ENDIF
 
-                    ITMP = MIN(I_MAX_TEMP_LOCAL, NINT(0.5_EB*(TMPD_IN(IIGM,JJGM,KKGM)+TMPD_IN(IIGP,JJGP,KKGP))))
-                    MU_WALL  = MU_RSQMW_ZD(ITMP,1) / RSQ_MW_ZD(1)
-                    RHO_WALL = 0.5_EB*(RHOPD(IIGM,JJGM,KKGM) + RHOPD(IIGP,JJGP,KKGP))
+                    ! WALL_MODEL_BC. FDS 4218ee295b (+15cca3a6a8): at a convex OBST corner use no-slip with
+                    ! molecular MUA instead of half-slip with wall-model stress; WALL_MODEL is not called there.
+                    IF ((IWM==0 .OR. IWP==0) .AND. (.NOT. EDGE_EXTERNAL(IE))) THEN  ! Special case for a corner
+                        VEL_GHOST = 2._EB*VEL_T - VEL_GAS
+                        EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
+                        EDGE_TAU_IN  (IE,ICD_SGN) = MUA*EDGE_OMEGA_IN(IE,ICD_SGN)
+                    ELSE
+                        ITMP = MIN(I_MAX_TEMP_LOCAL, NINT(0.5_EB*(TMPD_IN(IIGM,JJGM,KKGM)+TMPD_IN(IIGP,JJGP,KKGP))))
+                        MU_WALL  = MU_RSQMW_ZD(ITMP,1) / RSQ_MW_ZD(1)
+                        RHO_WALL = 0.5_EB*(RHOPD(IIGM,JJGM,KKGM) + RHOPD(IIGP,JJGP,KKGP))
 
-                    CALL WALL_MODEL_DEVICE( &
-                        SLIP_COEF,U_TAU,Y_PLUS, &
-                        MU_WALL/RHO_WALL, &
-                        SURF_ROUGHNESS(SURF_INDEX_USE), &
-                        0.5_EB*DXX(ICD), &
-                        VEL_GAS-VEL_T, &
-                        SIM_MODE_LOCAL,DNS_MODE_LOCAL, &
-                        VK_LOCAL,YW_LOCAL )
+                        CALL WALL_MODEL_DEVICE( &
+                            SLIP_COEF,U_TAU,Y_PLUS, &
+                            MU_WALL/RHO_WALL, &
+                            SURF_ROUGHNESS(SURF_INDEX_USE), &
+                            0.5_EB*DXX(ICD), &
+                            VEL_GAS-VEL_T, &
+                            SIM_MODE_LOCAL,DNS_MODE_LOCAL, &
+                            VK_LOCAL,YW_LOCAL )
 
-                    IF ((IWM==0 .OR. IWP==0) .AND. (.NOT. EDGE_EXTERNAL(IE))) THEN
-                        SLIP_COEF = 0._EB
+                        VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
+
+                        EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
+                        EDGE_TAU_IN  (IE,ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,EDGE_OMEGA_IN(IE,ICD_SGN))
                     ENDIF
-
-                    VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
-
-                    EDGE_OMEGA_IN(IE,ICD_SGN) = I_SGN*(VEL_GAS - VEL_GHOST)/DXX(ICD)
-                    EDGE_TAU_IN  (IE,ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,EDGE_OMEGA_IN(IE,ICD_SGN))
 
                     SELECT CASE(IEC)
                     CASE(1)
@@ -2927,11 +3542,20 @@ MODULE G_VELO
                         IF (JJ==JBAR .AND. IOR==-2) UU(II,JJ+1,KK) = VEL_GHOST
                     END SELECT
 
-                    IF (CORRECTOR_LOCAL /= 0) CALL STORE_EDGE_VELOCITY_AVG( &
+                    IF (CORRECTOR_LOCAL /= 0 .AND. .NOT.ANY_INTERPOLATED_SIDE) CALL STORE_EDGE_VELOCITY_AVG( &
                         EDGE_U_AVG,EDGE_V_AVG,EDGE_W_AVG,IE,IEC,ICD,VEL_GHOST,VEL_GAS)
 
 
             ENDDO
+
+            ! velo.f90: an edge on an interpolated boundary with no solid cell around it keeps no gradients
+            IF (ANY_INTERPOLATED_SIDE .AND. .NOT.CELL_SOLID(ICMM) .AND. .NOT.CELL_SOLID(ICPM) .AND. &
+                .NOT.CELL_SOLID(ICMP) .AND. .NOT.CELL_SOLID(ICPP)) THEN
+                DO L=-2,2
+                    EDGE_OMEGA_IN(IE,L) = -1.E6_EB
+                    EDGE_TAU_IN(IE,L) = -1.E6_EB
+                ENDDO
+            ENDIF
 
         END SUBROUTINE VELOCITY_BC_GPU_GHOST_KERNEL_AXIS
 
@@ -3479,7 +4103,9 @@ MODULE G_VELO
 
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,IBAR_LOCAL,JBAR_LOCAL,KBAR_LOCAL,INTERPOLATED_BOUNDARY_VALUE
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_LOCAL+1,0:JBAR_LOCAL+1,0:*) :: UU,VV,WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_LOCAL+1,0:JBAR_LOCAL+1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_LOCAL+1,-1:JBAR_LOCAL+1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_LOCAL+1,0:JBAR_LOCAL+1,-1:*) :: WW
             REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:*) :: OM_UU,OM_VV,OM_WW
             REAL(EB), DEVICE, DIMENSION(1:*) :: U_GHOST,V_GHOST,W_GHOST,UVW_SAVE_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: EXTERNAL_WALL_AREA_RATIO

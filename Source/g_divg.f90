@@ -3,7 +3,7 @@
 ! Purpose: GPU divergence-source, enthalpy-transport, and density-derivative assembly.
 !------------------------------------------------------------------------------
 MODULE G_DIVG
-    USE G_ERRO, ONLY: GPU_WAIT
+    USE G_ERRO, ONLY: GPU_WAIT,GPU_FILL
     USE G_MESH_POINTERS
     USE G_CONS
     USE G_FUNC
@@ -15,10 +15,14 @@ MODULE G_DIVG
         !--------------------------------------------------------------------------
 
         ATTRIBUTES(GLOBAL) SUBROUTINE DIVG_GET_SCALAR_FACE_VALUE_KERNEL_XYZ(AX,AY,AZ,U,FX,FY,FZ, &
-            IBAR,JBAR,KBAR,N,TWO_EPSILON_EB)
+            IBAR,JBAR,KBAR,N,TWENTY_EPSILON_EB,LIMITER)
+            INTEGER, VALUE :: LIMITER
             INTEGER, VALUE :: IBAR, JBAR, KBAR, N
-            REAL(EB), VALUE :: TWO_EPSILON_EB
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: AX,AY,AZ,U
+            REAL(EB), VALUE :: TWENTY_EPSILON_EB
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: AX
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: AY
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: AZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: U
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: FX,FY,FZ
             INTEGER :: I,J,K,S,NEG,IUP,IDN,IUP2,JUP,JDN,JUP2,KUP,KDN,KUP2
             REAL(EB) :: R,B,DU_UP,DU_LOC,U_UP,U_DN,U_UP2
@@ -27,7 +31,7 @@ MODULE G_DIVG
             J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
             K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
 
-            IF (I>=1 .AND. I<=IBAR-1 .AND. J>=1 .AND. J<=JBAR .AND. K>=1 .AND. K<=KBAR) THEN
+            IF (I>=0 .AND. I<=IBAR .AND. J>=1 .AND. J<=JBAR .AND. K>=1 .AND. K<=KBAR) THEN
                 NEG = MERGE(0,1,AX(I,J,K)>0._EB)
                 S = 1-2*NEG
                 IUP = I+NEG
@@ -36,14 +40,10 @@ MODULE G_DIVG
                 U_UP = U(IUP,J,K)
                 U_DN = U(IDN,J,K)
                 U_UP2 = U(IUP2,J,K)
-                DU_LOC = S*(U_DN-U_UP)
-                DU_UP = S*(U_UP-U_UP2)
-                R = DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC))
-                B = MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                FX(I,J,K,N) = U_UP+0.5_EB*S*B*DU_LOC
+                FX(I,J,K,N) = FLUX_LIMITED_FACE_VALUE(LIMITER,S,U_UP2,U_UP,U_DN,TWENTY_EPSILON_EB)
             ENDIF
 
-            IF (I>=1 .AND. I<=IBAR .AND. J>=1 .AND. J<=JBAR-1 .AND. K>=1 .AND. K<=KBAR) THEN
+            IF (I>=1 .AND. I<=IBAR .AND. J>=0 .AND. J<=JBAR .AND. K>=1 .AND. K<=KBAR) THEN
                 NEG = MERGE(0,1,AY(I,J,K)>0._EB)
                 S = 1-2*NEG
                 JUP = J+NEG
@@ -52,14 +52,10 @@ MODULE G_DIVG
                 U_UP = U(I,JUP,K)
                 U_DN = U(I,JDN,K)
                 U_UP2 = U(I,JUP2,K)
-                DU_LOC = S*(U_DN-U_UP)
-                DU_UP = S*(U_UP-U_UP2)
-                R = DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC))
-                B = MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                FY(I,J,K,N) = U_UP+0.5_EB*S*B*DU_LOC
+                FY(I,J,K,N) = FLUX_LIMITED_FACE_VALUE(LIMITER,S,U_UP2,U_UP,U_DN,TWENTY_EPSILON_EB)
             ENDIF
 
-            IF (I>=1 .AND. I<=IBAR .AND. J>=1 .AND. J<=JBAR .AND. K>=1 .AND. K<=KBAR-1) THEN
+            IF (I>=1 .AND. I<=IBAR .AND. J>=1 .AND. J<=JBAR .AND. K>=0 .AND. K<=KBAR) THEN
                 NEG = MERGE(0,1,AZ(I,J,K)>0._EB)
                 S = 1-2*NEG
                 KUP = K+NEG
@@ -68,26 +64,26 @@ MODULE G_DIVG
                 U_UP = U(I,J,KUP)
                 U_DN = U(I,J,KDN)
                 U_UP2 = U(I,J,KUP2)
-                DU_LOC = S*(U_DN-U_UP)
-                DU_UP = S*(U_UP-U_UP2)
-                R = DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC))
-                B = MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                FZ(I,J,K,N) = U_UP+0.5_EB*S*B*DU_LOC
+                FZ(I,J,K,N) = FLUX_LIMITED_FACE_VALUE(LIMITER,S,U_UP2,U_UP,U_DN,TWENTY_EPSILON_EB)
             ENDIF
         END SUBROUTINE DIVG_GET_SCALAR_FACE_VALUE_KERNEL_XYZ
 
         ATTRIBUTES(GLOBAL) SUBROUTINE DIVG_GET_SCALAR_FACE_VALUE_KERNEL_BOUNDARY(WALL_TOPO,CELL_INDEXD,CELL_WALL_INDEX, &
             CELL_SOLID,CELL_EXTERIOR,WALL_RHO_F,RHOD,UD,VD,WD,FXD,FYD,FZD, &
-            N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N,TWO_EPSILON_EB,IBP1,JBP1,KBP1,CELL_LB,CELL_UB)
+            N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N,TWENTY_EPSILON_EB,IBP1,JBP1,KBP1,CELL_LB,CELL_UB,LIMITER)
+            INTEGER, VALUE :: LIMITER
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N,IBP1,JBP1,KBP1,CELL_LB,CELL_UB
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RHOD,UD,VD,WD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WD
             REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: FXD,FYD,FZD
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_RHO_F
             INTEGER, DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: CELL_INDEXD
             INTEGER, DEVICE, DIMENSION(CELL_LB:CELL_UB,-3:*) :: CELL_WALL_INDEX
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID,CELL_EXTERIOR
-            REAL(EB), DEVICE :: TWO_EPSILON_EB
+            REAL(EB), DEVICE :: TWENTY_EPSILON_EB
             REAL(EB) :: R,B,DU_UP,DU_LOC
             INTEGER :: IW,II,JJ,KK,IOR,S,VEL_INDEX,ADJ_INDEX
             REAL(EB) :: Q0,Q1,Q2
@@ -112,14 +108,10 @@ MODULE G_DIVG
                         .NOT.(CELL_WALL_INDEX(CELL_INDEXD(ADJ_INDEX,JJ,KK),IOR)>0)) THEN
                         IF (S > 0) THEN
                             Q0=RHOD(II+1,JJ,KK); Q1=RHOD(II+1,JJ,KK); Q2=RHOD(II+2,JJ,KK)
-                            DU_LOC=Q2-Q1; DU_UP=Q1-Q0
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FXD(VEL_INDEX,JJ,KK,N)=Q1+0.5_EB*B*DU_LOC
+                            FXD(VEL_INDEX,JJ,KK,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,1,Q0,Q1,Q2,TWENTY_EPSILON_EB)
                         ELSE
                             Q0=RHOD(II-2,JJ,KK); Q1=RHOD(II-1,JJ,KK); Q2=RHOD(II-1,JJ,KK)
-                            DU_LOC=Q1-Q0; DU_UP=Q2-Q1
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FXD(VEL_INDEX,JJ,KK,N)=Q1-0.5_EB*B*DU_LOC
+                            FXD(VEL_INDEX,JJ,KK,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,-1,Q2,Q1,Q0,TWENTY_EPSILON_EB)
                         ENDIF
                     ENDIF
                 CASE(2)
@@ -130,14 +122,10 @@ MODULE G_DIVG
                         .NOT.(CELL_WALL_INDEX(CELL_INDEXD(II,ADJ_INDEX,KK),IOR)>0)) THEN
                         IF (S > 0) THEN
                             Q0=RHOD(II,JJ+1,KK); Q1=RHOD(II,JJ+1,KK); Q2=RHOD(II,JJ+2,KK)
-                            DU_LOC=Q2-Q1; DU_UP=Q1-Q0
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FYD(II,VEL_INDEX,KK,N)=Q1+0.5_EB*B*DU_LOC
+                            FYD(II,VEL_INDEX,KK,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,1,Q0,Q1,Q2,TWENTY_EPSILON_EB)
                         ELSE
                             Q0=RHOD(II,JJ-2,KK); Q1=RHOD(II,JJ-1,KK); Q2=RHOD(II,JJ-1,KK)
-                            DU_LOC=Q1-Q0; DU_UP=Q2-Q1
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FYD(II,VEL_INDEX,KK,N)=Q1-0.5_EB*B*DU_LOC
+                            FYD(II,VEL_INDEX,KK,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,-1,Q2,Q1,Q0,TWENTY_EPSILON_EB)
                         ENDIF
                     ENDIF
                 CASE(3)
@@ -148,14 +136,10 @@ MODULE G_DIVG
                         .NOT.(CELL_WALL_INDEX(CELL_INDEXD(II,JJ,ADJ_INDEX),IOR)>0)) THEN
                         IF (S > 0) THEN
                             Q0=RHOD(II,JJ,KK+1); Q1=RHOD(II,JJ,KK+1); Q2=RHOD(II,JJ,KK+2)
-                            DU_LOC=Q2-Q1; DU_UP=Q1-Q0
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FZD(II,JJ,VEL_INDEX,N)=Q1+0.5_EB*B*DU_LOC
+                            FZD(II,JJ,VEL_INDEX,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,1,Q0,Q1,Q2,TWENTY_EPSILON_EB)
                         ELSE
                             Q0=RHOD(II,JJ,KK-2); Q1=RHOD(II,JJ,KK-1); Q2=RHOD(II,JJ,KK-1)
-                            DU_LOC=Q1-Q0; DU_UP=Q2-Q1
-                            R=DU_UP/(DU_LOC+SIGN(TWO_EPSILON_EB,DU_LOC)); B=MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                            FZD(II,JJ,VEL_INDEX,N)=Q1-0.5_EB*B*DU_LOC
+                            FZD(II,JJ,VEL_INDEX,N)=FLUX_LIMITED_FACE_VALUE(LIMITER,-1,Q2,Q1,Q0,TWENTY_EPSILON_EB)
                         ENDIF
                     ENDIF
             END SELECT
@@ -176,6 +160,7 @@ MODULE G_DIVG
             USE MATH_FUNCTIONS, ONLY: INTERPOLATE1D_UNIFORM
 
             USE TURBULENCE, ONLY: TENSOR_DIFFUSIVITY_MODEL
+            USE DIVG, ONLY: MERGE_PRESSURE_ZONES
             IMPLICIT NONE
 
             REAL(EB), POINTER, DIMENSION(:,:,:) :: UU,VV,WW,RHOP
@@ -197,7 +182,6 @@ MODULE G_DIVG
             REAL(EB), ALLOCATABLE, DIMENSION(:) :: WALL_K_G_H_TMP, WALL_DUNDT_H_TMP
             REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: WALL_ZZ_F_H_TMP, WALL_RHO_D_F_H_TMP, WALL_RHO_D_DZDN_F_H_TMP
             REAL(EB), ALLOCATABLE, DIMENSION(:) :: WALL_Q_CON_F_H_TMP, WALL_RHO_F_H_TMP, WALL_TMP_F_H_TMP
-            REAL(EB), ALLOCATABLE, DIMENSION(:) :: DSUM_ZONE_H, PSUM_ZONE_H, USUM_ZONE_H
             INTEGER, ALLOCATABLE, DIMENSION(:) :: WALL_PRESSURE_ZONE_H_TMP
             TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
 
@@ -221,6 +205,11 @@ MODULE G_DIVG
             TNOW=CURRENT_TIME()
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
+
+            ! Determine if pressure ZONEs have merged (CPU DIVERGENCE_PART_1). The wall types and solid cells on the host
+            ! are current: GPU_CREATE_OR_REMOVE_OBSTRUCTIONS ran the CPU REASSIGN_WALL_CELLS.
+            IF (N_ZONE>0 .AND. OBST_CREATED_OR_REMOVED) CALL MERGE_PRESSURE_ZONES
+
             HAS_D_SOURCE  = ALLOCATED(MESHES(NM)%D_SOURCE)
             HAS_M_DOT_PPP = ALLOCATED(MESHES(NM)%M_DOT_PPP)
 
@@ -277,9 +266,9 @@ MODULE G_DIVG
             CPD    => GM%WORK5D
             R_H_GD => GM%WORK9D
 
-            IF (.NOT.ALLOCATED(GM%WALL_K_G_WORKD)) ALLOCATE(GM%WALL_K_G_WORKD(LBOUND(WALL,1):UBOUND(WALL,1)))
-            WALL_K_G_D_TMP => GM%WALL_K_G_WORKD
-            WALL_K_G_D_TMP = 0._EB
+            ! KDTDN_GPU_BOUNDARY stores the gas conductivity at the wall (B1%K_G in divg.f90) for WALL_BC_GPU: the
+            ! Q_CON_F of OPEN boundaries (INFLOW_OUTFLOW) and the Q_COND output use it.
+            WALL_K_G_D_TMP => GM%WALL_K_G
             IF (CHECK_VN) GM%D_Z_MAXD = 0._EB
 
             IF (GPU_DEBUG_H2D_D2H) THEN
@@ -380,7 +369,8 @@ MODULE G_DIVG
                 GM%WALL_U_NORMAL,GM%WALL_U_NORMAL_S,GM%WALL_U_NORMAL_0,GM%WALL_RHO_F,GM%WALL_T_IGN,GM%WALL_TOPO_AOS, &
                 GM%WALL_SF_INDEX,SF_SPECIES_BC_INDEX,SF_MASS_FLUX_TOTAL,SF_RAMP_VELO_INDEX,SF_RAMP_VELO_TAU, &
                 RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D,RAMP_NPOINTS_D,RAMP_OFFSET_D,RAMP_INTERP_D, &
-                UUD,VVD,WWD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,MERGE(1,0,PREDICTOR),T,DT,T_BEGIN,RHOA,IBP1,JBP1)
+                UUD,VVD,WWD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,MERGE(1,0,PREDICTOR),T,DT,T_BEGIN,RHOA,IBP1,JBP1, &
+                GM%WALL_SEM,GM%WALL_SEM_VENT,MERGE(1,0,SYNTHETIC_EDDY_METHOD))
             CALL UPDATE_WALL_DUNDT_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>( &
                 GM%WALL_DUNDTD,GM%WALL_U_NORMAL,GM%WALL_U_NORMAL_S,N_EXTERNAL_WALL_CELLS,DT,MERGE(1,0,PREDICTOR))
 
@@ -388,16 +378,35 @@ MODULE G_DIVG
                 CALL ZERO_DIFFUSIVE_WORK_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%DEL_RHO_D_DEL_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,IBP1,JBP1,KBP1,N_TOTAL_SCALARS)
 
-                CALL SPECIES_RHO_D_VLES_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
+                IF (SIM_MODE/=DNS_MODE .AND. SIM_MODE/=LES_MODE) &
+                    CALL SPECIES_RHO_D_VLES_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%MUD,GM%WORK4D,RSC,GM%D_Z_MAXD,RHOPD,IBP1,JBP1,KBP1,MERGE(1,0,CHECK_VN))
 
+                ! divg.f90 DIFFUSIVE_FLUX_LOOP: rho*D del Z of all species, then (DNS, LES) the correction that makes
+                ! the diffusive fluxes sum to zero, then the heat terms species by species.
                 DO N=1,N_TRACKED_SPECIES
+                    IF (SIM_MODE==DNS_MODE .OR. SIM_MODE==LES_MODE) &
+                        CALL SPECIES_RHO_D_DNS_LES_GPU<<<GRDD,BLKD,0,GM%STRM>>>(GM%MUD,GM%MU_DNSD,RHOPD,GM%TMPD, &
+                        D_Z_TABLED,GM%WORK4D,GM%D_Z_MAXD,RSC,SPECIES_SC_FAC_D,IBP1,JBP1,KBP1,N,I_MAX_TEMP, &
+                        MERGE(1,0,SIM_MODE==LES_MODE .AND. .NOT.TENSOR_DIFFUSIVITY),MERGE(1,0,CHECK_VN))
+
                     CALL SPECIES_DIFFUSIVE_FLUX_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                         ZZPD,GM%WORK4D,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,GM%RDXND,GM%RDYND,GM%RDZND,IBAR,JBAR,KBAR,N)
 
                     CALL SPECIES_DIFFUSIVE_FLUX_BOUNDARY_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(GM%SWORK1D, GM%SWORK2D, GM%SWORK3D, GM%WALL_RHO_D_DZDN_F, &
                         GM%WALL_TOPO_AOS,GM%EXTERNAL_WALL_NICD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N, &
                         IBP1,JBP1,KBP1,GM%WALL_LB,GM%WALL_UB)
+                ENDDO
+
+                IF (SIM_MODE==DNS_MODE .OR. SIM_MODE==LES_MODE) &
+                    CALL SPECIES_FLUX_SUM_ZERO_GPU<<<GRDD,BLKD,0,GM%STRM>>>(ZZPD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D, &
+                    IBAR,JBAR,KBAR,N_TRACKED_SPECIES)
+
+                DO N=1,N_TRACKED_SPECIES
+                    ! divg.f90, STORE_SPECIES_FLUX: diffusive flux for output, before the wall correction below
+                    IF (STORE_SPECIES_FLUX) CALL STORE_DIFFUSIVE_SPECIES_FLUX_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                        GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,GM%DIF_FXD,GM%DIF_FYD,GM%DIF_FZD, &
+                        GM%DIF_FXSD,GM%DIF_FYSD,GM%DIF_FZSD,IBP1,JBP1,KBP1,N,MERGE(1,0,PREDICTOR))
 
                     CALL SPECIES_DIFF_HEAT_FACE_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                         GM%TMPD,H_SENS_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,GM%WORK5D,GM%WORK6D,GM%WORK7D,IBAR,JBAR,KBAR,N)
@@ -407,6 +416,11 @@ MODULE G_DIVG
                         GM%WALL_U_NORMAL_S, GM%WALL_RDN, GM%WALL_TOPO_AOS, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, &
                         N_TRACKED_SPECIES,N,MERGE(1,0,PREDICTOR),IBP1,JBP1,KBP1,GM%WALL_LB,GM%WALL_UB)
 
+                    IF (STORE_SPECIES_FLUX) CALL STORE_DIFFUSIVE_SPECIES_FLUX_WALL_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>( &
+                        GM%WALL_TOPO_AOS,GM%WALL_RHO_D_DZDN_F,GM%WALL_THIN_NEG_D,GM%DIF_FXD,GM%DIF_FYD,GM%DIF_FZD, &
+                        GM%DIF_FXSD,GM%DIF_FYSD,GM%DIF_FZSD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS, &
+                        N,MERGE(1,0,PREDICTOR),IBP1,JBP1,KBP1,GM%WALL_LB,GM%WALL_UB)
+
                     CALL SPECIES_DIFF_HEAT_DIV_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                         DPD,GM%DEL_RHO_D_DEL_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,GM%WORK5D,GM%WORK6D,GM%WORK7D,GM%RDXD,GM%RDYD,GM%RDZD,IBAR,JBAR,KBAR,N)
                 ENDDO
@@ -414,11 +428,19 @@ MODULE G_DIVG
                 GM%DEL_RHO_D_DEL_ZD = 0._EB
             ENDIF
 
-            ! ---- CPU block: cp / r_h_g ----
-            CALL GET_SPECIFIC_HEAT_GPU<<<GRDD,BLKD,0,GM%STRM>>>(ZZPD,CPD,CP_ZD,R_H_GD,GM%TMPD,N_TRACKED_SPECIES,IBAR,JBAR,KBAR)
+            ! ---- CPU block: cp / r_h_g (divg.f90: not with CONSTANT_SPECIFIC_HEAT_RATIO) ----
+            IF (.NOT.CONSTANT_SPECIFIC_HEAT_RATIO) &
+                CALL GET_SPECIFIC_HEAT_GPU<<<GRDD,BLKD,0,GM%STRM>>>(ZZPD,CPD,CP_ZD,R_H_GD,GM%TMPD,N_TRACKED_SPECIES,IBAR,JBAR,KBAR)
 
             ! ---- CPU block: KP and D_Z_MAX thermal contribution ----
-            CALL KDTDN_GPU_1<<<GRDD,BLKD,0,GM%STRM>>>(GM%MUD,CPOPR,KPD,IBAR,JBAR,KBAR)
+            IF (SIM_MODE==DNS_MODE .OR. SIM_MODE==LES_MODE) THEN
+                CALL KP_DNS_LES_GPU<<<GRDD,BLKD,0,GM%STRM>>>(ZZPD,GM%TMPD,GM%MUD,GM%MU_DNSD,CPD,K_RSQMW_ZD,RSQ_MW_ZD,KPD, &
+                    IBAR,JBAR,KBAR,N_TRACKED_SPECIES,I_MAX_TEMP,MERGE(1,0,SIM_MODE==LES_MODE .AND. .NOT.TENSOR_DIFFUSIVITY), &
+                    MERGE(1,0,CONSTANT_SPECIFIC_HEAT_RATIO),CPOPR,RPR,GM%CELL_INDEXD,GM%CELL_SOLID)
+                CALL KP_EXTERNAL_GHOST_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(KPD,GM%WALL_TOPO_AOS,N_EXTERNAL_WALL_CELLS,IBAR,JBAR)
+            ELSE
+                CALL KDTDN_GPU_1<<<GRDD,BLKD,0,GM%STRM>>>(GM%MUD,CPOPR,KPD,IBAR,JBAR,KBAR)
+            ENDIF
 
             IF (CHECK_VN .AND. .NOT.CONSTANT_SPECIFIC_HEAT_RATIO) THEN
                 CALL D_Z_MAX_THERMAL_GPU<<<GRDD,BLKD,0,GM%STRM>>>(GM%D_Z_MAXD,KPD,CPD,RHOPD,GM%CELL_INDEXD,GM%CELL_SOLID,IBAR,JBAR,KBAR)
@@ -434,24 +456,25 @@ MODULE G_DIVG
             ! ---- CPU block: add del dot k del T ----
             CALL DP_ADD_DELKDELT_GPU<<<GRDD,BLKD,0,GM%STRM>>>(DPD,KDTDXD,KDTDYD,KDTDZD,GM%QD,GM%QRD,GM%RDXD,GM%RDYD,GM%RDZD,IBAR,JBAR,KBAR)
 
-            ! ---- CPU block: ENTHALPY_ADVECTION ----
+            ! ---- CPU block: ENTHALPY_ADVECTION (divg.f90 CONST_GAMMA_IF_1: not with CONSTANT_SPECIFIC_HEAT_RATIO) ----
+            CONST_GAMMA_IF_1: IF (.NOT.CONSTANT_SPECIFIC_HEAT_RATIO) THEN
             U_DOT_DEL_RHO_H_SD => GM%WORK6D
             FX_H_SD            => GM%WORK1D
             FY_H_SD            => GM%WORK2D
             FZ_H_SD            => GM%WORK3D
-            RHO_H_S_PD         => GM%WORK4D
+            RHO_H_S_PD         => GM%WORK_PADD
 
-            CALL ENTHALPY_ADVECTION_GPU_INIT<<<GRDD,BLKD,0,GM%STRM>>>( &
+            CALL ENTHALPY_ADVECTION_GPU_INIT<<<GM%GRDD_3D_PAD,BLKD,0,GM%STRM>>>( &
                 H_SENS_ZD, U_DOT_DEL_RHO_H_SD, FX_H_SD, FY_H_SD, FZ_H_SD, RHO_H_S_PD, &
                 RHOPD, ZZPD, GM%TMPD, N_TRACKED_SPECIES, IBP1, JBP1, KBP1)
 
             CALL GET_SCALAR_FACE_VALUE_KERNEL_XYZ<<<GRDD,BLKD,0,GM%STRM>>>( &
-                UUD,VVD,WWD,RHO_H_S_PD,FX_H_SD,FY_H_SD,FZ_H_SD,IBAR,JBAR,KBAR,TWO_EPSILON_EB)
+                UUD,VVD,WWD,RHO_H_S_PD,FX_H_SD,FY_H_SD,FZ_H_SD,IBAR,JBAR,KBAR,TWENTY_EPSILON_EB,I_FLUX_LIMITER)
 
             CALL GET_SCALAR_FACE_VALUE_KERNEL_BOUNDARY_H<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>( &
                 GM%WALL_TOPO_AOS,GM%CELL_INDEXD,GM%CELL_WALL_INDEX,GM%CELL_SOLID,GM%CELL_EXTERIOR,GM%WALL_RHO_F, &
                 RHO_H_S_PD,UUD,VVD,WWD,FX_H_SD,FY_H_SD,FZ_H_SD,N_EXTERNAL_WALL_CELLS, &
-                N_INTERNAL_WALL_CELLS,TWO_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB)
+                N_INTERNAL_WALL_CELLS,TWENTY_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB,I_FLUX_LIMITER)
 
             CALL ENTHALPY_ADVECTION_BOUNDARY_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(U_DOT_DEL_RHO_H_SD, RHO_H_S_PD, UUD, VVD, WWD, GM%TMPD, &
                 H_SENS_ZD, GM%WALL_TMP_F, GM%WALL_RHO_F, GM%WALL_U_NORMAL, GM%WALL_U_NORMAL_S, GM%WALL_ZZ_F, GM%WALL_RDN, GM%UVW_SAVED, &
@@ -462,31 +485,38 @@ MODULE G_DIVG
                     GM%CELL_INDEXD,GM%CELL_SOLID,GM%CELL_WALL_INDEX,GM%RDXD,GM%RDYD,GM%RDZD,IBAR,JBAR,KBAR,GM%CELL_LB,GM%CELL_UB)
 
             CALL DP_SUB_ENTHALPY_ADV_GPU<<<GRDD,BLKD,0,GM%STRM>>>(DPD,U_DOT_DEL_RHO_H_SD,IBAR,JBAR,KBAR)
+            ENDIF CONST_GAMMA_IF_1
 
-            ! ---- CPU block: RTRM = R_H_G / RHOP; DP = RTRM * DP ----
+            ! ---- CPU block: RTRM = 1/(rho*c_p*T); DP = RTRM * DP ----
+            ! With CONSTANT_SPECIFIC_HEAT_RATIO, as in divg.f90: RTRM = (gamma-1)/gamma / PBAR of the cell's pressure zone
             RTRMD => GM%WORK1D
             RTRM => WORK1
-            CALL DP_MUL_RTRM_GPU<<<GRDD,BLKD,0,GM%STRM>>>(DPD,RTRMD,R_H_GD,RHOPD,IBAR,JBAR,KBAR)
-            ! ---- CPU block: SPECIES_ADVECTION_PART_1 / PART_2 ----
-            IF (N_TRACKED_SPECIES >= 1) THEN
-                RHO_Z_PD         => GM%WORK4D
+            IF (CONSTANT_SPECIFIC_HEAT_RATIO) THEN
+                CALL DP_MUL_RTRM_CONST_GAMMA_GPU<<<GRDD,BLKD,0,GM%STRM>>>(DPD,RTRMD,PBAR_PD,GM%PRESSURE_ZONED,GM1OG, &
+                    IBAR,JBAR,KBAR)
+            ELSE
+                CALL DP_MUL_RTRM_GPU<<<GRDD,BLKD,0,GM%STRM>>>(DPD,RTRMD,R_H_GD,RHOPD,IBAR,JBAR,KBAR)
+            ENDIF
+            ! ---- CPU block: SPECIES_ADVECTION_PART_1 / PART_2 (divg.f90 CONST_GAMMA_IF_2) ----
+            IF (N_TRACKED_SPECIES >= 1 .AND. .NOT.CONSTANT_SPECIFIC_HEAT_RATIO) THEN
+                RHO_Z_PD         => GM%WORK_PADD
                 U_DOT_DEL_RHO_ZD => GM%WORK5D
 
                 ! With FLUX_LIMITER_MW_CORRECTION the face values of all species are needed before the
                 ! correction (divg.f90, SPECIES_ADVECTION_PART_1), so the loop runs in two passes:
                 ! face values of all species, the correction, then the advection terms per species.
                 DO N=1,N_TRACKED_SPECIES
-                    CALL SINGLE_SPECIES_ADVECTION_INIT_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
+                    CALL SINGLE_SPECIES_ADVECTION_INIT_GPU<<<GM%GRDD_3D_PAD,BLKD,0,GM%STRM>>>( &
                         RHOPD,ZZPD,RHO_Z_PD,U_DOT_DEL_RHO_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,IBP1,JBP1,KBP1,N,1)
 
                     CALL DIVG_GET_SCALAR_FACE_VALUE_KERNEL_XYZ<<<GRDD,BLKD,0,GM%STRM>>>( &
                         UUD,VVD,WWD,RHO_Z_PD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D, &
-                        IBAR,JBAR,KBAR,N,TWO_EPSILON_EB)
+                        IBAR,JBAR,KBAR,N,TWENTY_EPSILON_EB,I_FLUX_LIMITER)
 
                     CALL DIVG_GET_SCALAR_FACE_VALUE_KERNEL_BOUNDARY<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>( &
                         GM%WALL_TOPO_AOS,GM%CELL_INDEXD,GM%CELL_WALL_INDEX,GM%CELL_SOLID,GM%CELL_EXTERIOR,GM%WALL_RHO_F, &
                         RHO_Z_PD,UUD,VVD,WWD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,N_EXTERNAL_WALL_CELLS, &
-                        N_INTERNAL_WALL_CELLS,N,TWO_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB)
+                        N_INTERNAL_WALL_CELLS,N,TWENTY_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB,I_FLUX_LIMITER)
                     IF (FLUX_LIMITER_MW_CORRECTION) CYCLE
 
                     CALL SINGLE_SPECIES_ADVECTION_BOUNDARY_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(U_DOT_DEL_RHO_ZD, RHOPD, ZZPD, UUD, VVD, WWD, &
@@ -500,23 +530,23 @@ MODULE G_DIVG
                 ENDDO
 
                 IF (FLUX_LIMITER_MW_CORRECTION) THEN
-                    CALL MW_RHO_RMW_KERNEL<<<GRDD,BLKD,0,GM%STRM>>>(RHOPD,ZZPD,MWR_ZD,GM%RHO_RMWD, &
+                    CALL MW_RHO_RMW_KERNEL<<<GM%GRDD_3D_PAD,BLKD,0,GM%STRM>>>(RHOPD,ZZPD,MWR_ZD,GM%RHO_RMWD, &
                         GM%FX0D,GM%FY0D,GM%FZ0D,N_TRACKED_SPECIES,IBP1,JBP1,KBP1)
 
                     CALL DIVG_GET_SCALAR_FACE_VALUE_KERNEL_XYZ<<<GRDD,BLKD,0,GM%STRM>>>( &
-                        UUD,VVD,WWD,GM%RHO_RMWD,GM%FX0D,GM%FY0D,GM%FZ0D,IBAR,JBAR,KBAR,1,TWO_EPSILON_EB)
+                        UUD,VVD,WWD,GM%RHO_RMWD,GM%FX0D,GM%FY0D,GM%FZ0D,IBAR,JBAR,KBAR,1,TWENTY_EPSILON_EB,I_FLUX_LIMITER)
 
                     ! As on the CPU, only the off-wall faces; wall faces are masked in the advection terms.
                     CALL DIVG_GET_SCALAR_FACE_VALUE_KERNEL_BOUNDARY<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>( &
                         GM%WALL_TOPO_AOS,GM%CELL_INDEXD,GM%CELL_WALL_INDEX,GM%CELL_SOLID,GM%CELL_EXTERIOR,GM%WALL_RHO_F, &
                         GM%RHO_RMWD,UUD,VVD,WWD,GM%FX0D,GM%FY0D,GM%FZ0D,N_EXTERNAL_WALL_CELLS, &
-                        N_INTERNAL_WALL_CELLS,1,TWO_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB)
+                        N_INTERNAL_WALL_CELLS,1,TWENTY_EPSILON_EBD,IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB,I_FLUX_LIMITER)
 
                     CALL MW_FACE_CORRECTION_KERNEL<<<GRDD,BLKD,0,GM%STRM>>>(GM%SWORK1D,GM%SWORK2D,GM%SWORK3D, &
                         GM%FX0D,GM%FY0D,GM%FZ0D,MWR_ZD,N_TRACKED_SPECIES,IBAR,JBAR,KBAR)
 
                     DO N=1,N_TRACKED_SPECIES
-                        CALL SINGLE_SPECIES_ADVECTION_INIT_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
+                        CALL SINGLE_SPECIES_ADVECTION_INIT_GPU<<<GM%GRDD_3D_PAD,BLKD,0,GM%STRM>>>( &
                             RHOPD,ZZPD,RHO_Z_PD,U_DOT_DEL_RHO_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,IBP1,JBP1,KBP1,N,0)
 
                         CALL SINGLE_SPECIES_ADVECTION_BOUNDARY_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(U_DOT_DEL_RHO_ZD, RHOPD, ZZPD, UUD, VVD, WWD, &
@@ -562,9 +592,11 @@ MODULE G_DIVG
                 IF (.NOT.ALLOCATED(GM%DSUM_ZONE_PARTIAL_D)) THEN
                     ALLOCATE(GM%DSUM_ZONE_PARTIAL_D(1:GRDD_SUM,1:N_ZONE),GM%PSUM_ZONE_PARTIAL_D(1:GRDD_SUM,1:N_ZONE))
                 ENDIF
-                GM%DSUM_BLOCK_D(1:N_ZONE) = 0._EB
-                GM%PSUM_BLOCK_D(1:N_ZONE) = 0._EB
-                GM%USUM_BLOCK_D(1:N_ZONE) = 0._EB
+                ! Fill kernels on the mesh stream: array assignments would copy on the legacy default stream and wait for
+                ! the device work of all meshes launched before.
+                CALL GPU_FILL(GM%DSUM_BLOCK_D,N_ZONE,0._EB,GM%STRM)
+                CALL GPU_FILL(GM%PSUM_BLOCK_D,N_ZONE,0._EB,GM%STRM)
+                CALL GPU_FILL(GM%USUM_BLOCK_D,N_ZONE,0._EB,GM%STRM)
 
                 CALL D_SUM_P_SUM_ZONES_GPU<<<GRDD_SUM,BLKD_SUM,0,GM%STRM>>>( &
                     GM%DSUM_ZONE_PARTIAL_D,GM%PSUM_ZONE_PARTIAL_D,DPD,PBAR_PD,RTRMD,GM%DXD,GM%DYD,GM%DZD,IBAR,JBAR,KBAR, &
@@ -579,15 +611,9 @@ MODULE G_DIVG
                     GM%WALL_PRESSURE_ZONE, GM%WALL_TOPO_AOS, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, N_ZONE, &
                     MERGE(1,0,PREDICTOR))
 
-                ALLOCATE(DSUM_ZONE_H(1:N_ZONE),PSUM_ZONE_H(1:N_ZONE),USUM_ZONE_H(1:N_ZONE))
-                CALL GPU_WAIT(GM%STRM)
-                DSUM_ZONE_H = GM%DSUM_BLOCK_D(1:N_ZONE)
-                PSUM_ZONE_H = GM%PSUM_BLOCK_D(1:N_ZONE)
-                USUM_ZONE_H = GM%USUM_BLOCK_D(1:N_ZONE)
-                DSUM(1:N_ZONE) = DSUM(1:N_ZONE) + DSUM_ZONE_H(1:N_ZONE)
-                PSUM(1:N_ZONE) = PSUM(1:N_ZONE) + PSUM_ZONE_H(1:N_ZONE)
-                USUM(1:N_ZONE) = USUM(1:N_ZONE) + USUM_ZONE_H(1:N_ZONE)
-                DEALLOCATE(DSUM_ZONE_H,PSUM_ZONE_H,USUM_ZONE_H)
+                ! The zone sums are read back by DIVERGENCE_PART_1_ZONE_SUMS_GPU after the mesh loop, so that the host does
+                ! not wait here for the device work of this mesh before it launches the next one.
+                GM%ZONE_SUMS_PENDING = .TRUE.
 
             ENDIF
 
@@ -627,6 +653,30 @@ MODULE G_DIVG
             ENDIF
 
         END SUBROUTINE DIVERGENCE_PART_1_GPU
+
+        !> Add the pressure-zone integrals of mesh NM, accumulated on the device by DIVERGENCE_PART_1_GPU, to DSUM, PSUM
+        !> and USUM. Called for the meshes in the order of the DIVERGENCE_PART_1_GPU loop, after it, so the sums are
+        !> formed in the same order as before (bitwise the same).
+
+        SUBROUTINE DIVERGENCE_PART_1_ZONE_SUMS_GPU(NM)
+            INTEGER, INTENT(IN) :: NM
+            REAL(EB), ALLOCATABLE, DIMENSION(:) :: DSUM_ZONE_H, PSUM_ZONE_H, USUM_ZONE_H
+
+            GM => GPU_MESHES(NM)
+            IF (.NOT.GM%ZONE_SUMS_PENDING) RETURN
+            GM%ZONE_SUMS_PENDING = .FALSE.
+
+            ALLOCATE(DSUM_ZONE_H(1:N_ZONE),PSUM_ZONE_H(1:N_ZONE),USUM_ZONE_H(1:N_ZONE))
+            CALL GPU_WAIT(GM%STRM)
+            DSUM_ZONE_H = GM%DSUM_BLOCK_D(1:N_ZONE)
+            PSUM_ZONE_H = GM%PSUM_BLOCK_D(1:N_ZONE)
+            USUM_ZONE_H = GM%USUM_BLOCK_D(1:N_ZONE)
+            DSUM(1:N_ZONE) = DSUM(1:N_ZONE) + DSUM_ZONE_H(1:N_ZONE)
+            PSUM(1:N_ZONE) = PSUM(1:N_ZONE) + PSUM_ZONE_H(1:N_ZONE)
+            USUM(1:N_ZONE) = USUM(1:N_ZONE) + USUM_ZONE_H(1:N_ZONE)
+            DEALLOCATE(DSUM_ZONE_H,PSUM_ZONE_H,USUM_ZONE_H)
+
+        END SUBROUTINE DIVERGENCE_PART_1_ZONE_SUMS_GPU
 
         !--------------------------------------------------------------------------
         ! Divergence part 1 wall-input synchronization
@@ -726,16 +776,21 @@ MODULE G_DIVG
             WALL_U_NORMAL,WALL_U_NORMAL_S,WALL_U_NORMAL_0,WALL_RHO_F,WALL_T_IGN,WALL_TOPO,WALL_SF_INDEX, &
             SF_SPECIES_BC_INDEX,SF_MASS_FLUX_TOTAL,SF_RAMP_VELO_INDEX,SF_RAMP_VELO_TAU, &
             RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP, &
-            UD,VD,WD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,PREDICTOR_FLAG,T_IN,DT_IN,T_BEGIN_IN,RHOA_IN,IBP1,JBP1)
+            UD,VD,WD,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,PREDICTOR_FLAG,T_IN,DT_IN,T_BEGIN_IN,RHOA_IN,IBP1,JBP1, &
+            WALL_SEM,WALL_SEM_VENT,SEM_FLAG)
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
-            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, PREDICTOR_FLAG,IBP1,JBP1
+            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, PREDICTOR_FLAG,IBP1,JBP1,SEM_FLAG
+            REAL(EB), DEVICE :: WALL_SEM(4,0:*)
+            INTEGER, DEVICE :: WALL_SEM_VENT(0:*)
             REAL(EB), VALUE :: T_IN,DT_IN,T_BEGIN_IN,RHOA_IN
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_U_NORMAL,WALL_U_NORMAL_S,WALL_U_NORMAL_0,WALL_RHO_F,WALL_T_IGN
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEX,SF_SPECIES_BC_INDEX,SF_RAMP_VELO_INDEX
             INTEGER, DEVICE, DIMENSION(0:*) :: RAMP_NPOINTS,RAMP_OFFSET
             REAL(EB), DEVICE, DIMENSION(0:*) :: SF_MASS_FLUX_TOTAL,SF_RAMP_VELO_TAU,RAMP_T_MIN,RAMP_SPAN,RAMP_RDT
             REAL(EB), DEVICE, DIMENSION(1:*) :: RAMP_INTERP
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: UD, VD, WD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WD
             INTEGER :: IW, II, JJ, KK, IOR, BTYPE, SF_IDX
             REAL(EB) :: TSI,TIME_RAMP_FACTOR
 
@@ -766,8 +821,16 @@ MODULE G_DIVG
                     TIME_RAMP_FACTOR = EVALUATE_RAMP_DEVICE(TSI,SF_RAMP_VELO_INDEX(SF_IDX),SF_RAMP_VELO_TAU(SF_IDX), &
                         RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
                     WALL_U_NORMAL_S(IW) = TIME_RAMP_FACTOR*WALL_U_NORMAL_0(IW)
-                    IF (ABS(SF_MASS_FLUX_TOTAL(SF_IDX)) >= TWO_EPSILON_EB) THEN
+                    IF (ABS(SF_MASS_FLUX_TOTAL(SF_IDX)) >= TWENTY_EPSILON_EB) THEN
                         WALL_U_NORMAL_S(IW) = WALL_U_NORMAL_S(IW)*RHOA_IN/WALL_RHO_F(IW)
+                    ENDIF
+                    ! divg.f90 VENT_IF: synthetic eddy method, U_NORMAL_S -/+ TIME_RAMP_FACTOR*U_EDDY*PROFILE_FACTOR
+                    IF (SEM_FLAG == 1) THEN
+                        IF (WALL_SEM_VENT(IW) > 0) THEN
+                            IOR = WALL_TOPO(IW)%IOR
+                            WALL_U_NORMAL_S(IW) = WALL_U_NORMAL_S(IW) - &
+                                SIGN(1._EB,REAL(IOR,EB))*TIME_RAMP_FACTOR*WALL_SEM(ABS(IOR),IW)*WALL_SEM(4,IW)
+                        ENDIF
                     ENDIF
                     RETURN
                 ENDIF
@@ -817,7 +880,8 @@ MODULE G_DIVG
             MUD,RHO_D,RSC_IN,D_Z_MAX,RHOP,IBP1,JBP1,KBP1,CHECK_VN_FLAG)
             INTEGER, VALUE :: IBP1, JBP1, KBP1, CHECK_VN_FLAG
             REAL(EB), VALUE :: RSC_IN
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD, RHO_D, D_Z_MAX, RHOP
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD, RHO_D, D_Z_MAX
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOP
             INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
@@ -829,16 +893,134 @@ MODULE G_DIVG
             IF (K < 0 .OR. K > KBP1) RETURN
 
             RHO_D(I,J,K) = MAX(0._EB,MUD(I,J,K))*RSC_IN
-            IF (CHECK_VN_FLAG == 1) D_Z_MAX(I,J,K) = MAX(D_Z_MAX(I,J,K),RHO_D(I,J,K)/(RHOP(I,J,K)+TWO_EPSILON_EB))
+            IF (CHECK_VN_FLAG == 1) D_Z_MAX(I,J,K) = MAX(D_Z_MAX(I,J,K),RHO_D(I,J,K)/(RHOP(I,J,K)+TWENTY_EPSILON_EB))
         END SUBROUTINE SPECIES_RHO_D_VLES_GPU
 
+
+        ! divg.f90, DNS and LES: RHO_D = RHOP*D_Z(TMP) (+ the turbulent part (MU-MU_DNS)/Sc_t in LES) for species N.
+        ATTRIBUTES(GLOBAL) SUBROUTINE SPECIES_RHO_D_DNS_LES_GPU(MUD,MU_DNSD,RHOP,TMPD,D_Z_TABLE,RHO_D,D_Z_MAX,RSC_IN, &
+            SC_FAC,IBP1,JBP1,KBP1,N,I_MAX_TEMP_IN,LES_FLAG,CHECK_VN_FLAG)
+            INTEGER, VALUE :: IBP1,JBP1,KBP1,N,I_MAX_TEMP_IN,LES_FLAG,CHECK_VN_FLAG
+            REAL(EB), VALUE :: RSC_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD,MU_DNSD,RHO_D,D_Z_MAX
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOP,TMPD
+            REAL(EB), DEVICE :: D_Z_TABLE(0:I_MAX_TEMP_IN,1:*),SC_FAC(1:*)
+            INTEGER :: I,J,K,IT
+            REAL(EB) :: T_LOC,D_LOC,FRAC
+
+            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I < 0 .OR. I > IBP1 .OR. J < 0 .OR. J > JBP1 .OR. K < 0 .OR. K > KBP1) RETURN
+
+            T_LOC = TMPD(I,J,K)   ! INTERPOLATE1D_UNIFORM over D_Z(0:I_MAX_TEMP,N)
+            IF (T_LOC <= 0._EB) THEN
+                D_LOC = D_Z_TABLE(0,N)
+            ELSEIF (T_LOC >= REAL(I_MAX_TEMP_IN,EB)) THEN
+                D_LOC = D_Z_TABLE(I_MAX_TEMP_IN,N)
+            ELSE
+                IT = INT(T_LOC)
+                FRAC = T_LOC - REAL(IT,EB)
+                D_LOC = D_Z_TABLE(IT,N) + FRAC*(D_Z_TABLE(IT+1,N)-D_Z_TABLE(IT,N))
+            ENDIF
+            RHO_D(I,J,K) = RHOP(I,J,K)*D_LOC
+            IF (LES_FLAG==1) RHO_D(I,J,K) = RHO_D(I,J,K) + MAX(0._EB,MUD(I,J,K)-MU_DNSD(I,J,K))*RSC_IN*SC_FAC(N)
+            IF (CHECK_VN_FLAG == 1) D_Z_MAX(I,J,K) = MAX(D_Z_MAX(I,J,K),RHO_D(I,J,K)/(RHOP(I,J,K)+TWENTY_EPSILON_EB))
+        END SUBROUTINE SPECIES_RHO_D_DNS_LES_GPU
+
+        ! divg.f90, DNS and LES: the diffusive fluxes of a face sum to zero; the error goes into the species with the
+        ! largest mass fraction at the face.
+        ATTRIBUTES(GLOBAL) SUBROUTINE SPECIES_FLUX_SUM_ZERO_GPU(ZZPD,RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ,IBAR,JBAR,KBAR,NT)
+            INTEGER, VALUE :: IBAR,JBAR,KBAR,NT
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:KBAR+2,1:*) :: ZZPD
+            INTEGER :: I,J,K,N,NMAX
+            REAL(EB) :: ZMAX,S
+
+            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I < 0 .OR. I > IBAR .OR. J < 0 .OR. J > JBAR .OR. K < 0 .OR. K > KBAR) RETURN
+
+            NMAX = 1 ; ZMAX = ZZPD(I,J,K,1)+ZZPD(I+1,J,K,1) ; S = 0._EB
+            DO N=1,NT
+                IF (ZZPD(I,J,K,N)+ZZPD(I+1,J,K,N) > ZMAX) THEN ; ZMAX = ZZPD(I,J,K,N)+ZZPD(I+1,J,K,N) ; NMAX = N ; ENDIF
+                S = S + RHO_D_DZDX(I,J,K,N)
+            ENDDO
+            RHO_D_DZDX(I,J,K,NMAX) = -(S-RHO_D_DZDX(I,J,K,NMAX))
+
+            NMAX = 1 ; ZMAX = ZZPD(I,J,K,1)+ZZPD(I,J+1,K,1) ; S = 0._EB
+            DO N=1,NT
+                IF (ZZPD(I,J,K,N)+ZZPD(I,J+1,K,N) > ZMAX) THEN ; ZMAX = ZZPD(I,J,K,N)+ZZPD(I,J+1,K,N) ; NMAX = N ; ENDIF
+                S = S + RHO_D_DZDY(I,J,K,N)
+            ENDDO
+            RHO_D_DZDY(I,J,K,NMAX) = -(S-RHO_D_DZDY(I,J,K,NMAX))
+
+            NMAX = 1 ; ZMAX = ZZPD(I,J,K,1)+ZZPD(I,J,K+1,1) ; S = 0._EB
+            DO N=1,NT
+                IF (ZZPD(I,J,K,N)+ZZPD(I,J,K+1,N) > ZMAX) THEN ; ZMAX = ZZPD(I,J,K,N)+ZZPD(I,J,K+1,N) ; NMAX = N ; ENDIF
+                S = S + RHO_D_DZDZ(I,J,K,N)
+            ENDDO
+            RHO_D_DZDZ(I,J,K,NMAX) = -(S-RHO_D_DZDZ(I,J,K,NMAX))
+        END SUBROUTINE SPECIES_FLUX_SUM_ZERO_GPU
+
+        ! divg.f90 K_DNS_OR_LES: molecular conductivity of the mixture (+ turbulent part in LES).
+        ATTRIBUTES(GLOBAL) SUBROUTINE KP_DNS_LES_GPU(ZZPD,TMPD,MUD,MU_DNSD,CP,K_RSQMW_Z,RSQ_MW_Z,KP, &
+            IBAR,JBAR,KBAR,NT,I_MAX_TEMP_IN,LES_FLAG,CONST_GAMMA_FLAG,CPOPR_IN,RPR_IN,CELL_INDEXD,CELL_SOLID)
+            INTEGER, VALUE :: IBAR,JBAR,KBAR,NT,I_MAX_TEMP_IN,LES_FLAG,CONST_GAMMA_FLAG
+            REAL(EB), VALUE :: CPOPR_IN,RPR_IN
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:KBAR+2,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: TMPD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: MUD,MU_DNSD,CP,KP
+            REAL(EB), DEVICE :: K_RSQMW_Z(0:I_MAX_TEMP_IN,1:*),RSQ_MW_Z(1:*)
+            INTEGER, DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
+            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID
+            INTEGER :: I,J,K,N,ITMP
+            REAL(EB) :: NUM,DEN
+
+            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I < 0 .OR. I > IBAR+1 .OR. J < 0 .OR. J > JBAR+1 .OR. K < 0 .OR. K > KBAR+1) RETURN
+
+            KP(I,J,K) = 0._EB
+            ! Ghost cells: KP of the external walls is copied from the gas cell (KP_EXTERNAL_GHOST_GPU)
+            IF (I < 1 .OR. I > IBAR .OR. J < 1 .OR. J > JBAR .OR. K < 1 .OR. K > KBAR) RETURN
+            IF (.NOT.CELL_SOLID(CELL_INDEXD(I,J,K))) THEN
+                ITMP = MIN(I_MAX_TEMP_IN,NINT(TMPD(I,J,K)))   ! GET_CONDUCTIVITY
+                NUM = 0._EB ; DEN = 0._EB
+                DO N=1,NT
+                    NUM = NUM + K_RSQMW_Z(ITMP,N)*ZZPD(I,J,K,N)
+                    DEN = DEN + ZZPD(I,J,K,N)*RSQ_MW_Z(N)
+                ENDDO
+                KP(I,J,K) = NUM/DEN
+            ENDIF
+            IF (LES_FLAG==1) THEN
+                IF (CONST_GAMMA_FLAG==0) THEN
+                    KP(I,J,K) = KP(I,J,K) + MAX(0._EB,(MUD(I,J,K)-MU_DNSD(I,J,K)))*CP(I,J,K)*RPR_IN
+                ELSE
+                    KP(I,J,K) = KP(I,J,K) + MAX(0._EB,(MUD(I,J,K)-MU_DNSD(I,J,K)))*CPOPR_IN
+                ENDIF
+            ENDIF
+        END SUBROUTINE KP_DNS_LES_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE KP_EXTERNAL_GHOST_GPU(KP,WALL_TOPO,N_EXTERNAL_WALL_CELLS,IBAR,JBAR)
+            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,IBAR,JBAR
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: KP
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER :: IW
+            IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS) RETURN
+            KP(WALL_TOPO(IW)%II,WALL_TOPO(IW)%JJ,WALL_TOPO(IW)%KK) = KP(WALL_TOPO(IW)%IIG,WALL_TOPO(IW)%JJG,WALL_TOPO(IW)%KKG)
+        END SUBROUTINE KP_EXTERNAL_GHOST_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE SPECIES_DIFFUSIVE_FLUX_GPU( &
             ZZPD,RHO_D,RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ,RDXN,RDYN,RDZN,IBAR,JBAR,KBAR,N)
             INTEGER, VALUE :: IBAR, JBAR, KBAR, N
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN, RDYN, RDZN
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: RHO_D
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: ZZPD, RHO_D_DZDX, RHO_D_DZDY, RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: RHO_D_DZDX, RHO_D_DZDY, RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:KBAR+2,1:*) :: ZZPD
             INTEGER :: I,J,K
             REAL(EB) :: DZDX, DZDY, DZDZ
 
@@ -916,7 +1098,8 @@ MODULE G_DIVG
         ATTRIBUTES(GLOBAL) SUBROUTINE SPECIES_DIFF_HEAT_FACE_GPU( &
             TMPD,H_SENS_ZD,RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ,H_RHO_D_DZDX,H_RHO_D_DZDY,H_RHO_D_DZDZ,IBAR,JBAR,KBAR,N)
             INTEGER, VALUE :: IBAR, JBAR, KBAR, N
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: TMPD, H_RHO_D_DZDX, H_RHO_D_DZDY, H_RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: H_RHO_D_DZDX, H_RHO_D_DZDY, H_RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: TMPD
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: RHO_D_DZDX, RHO_D_DZDY, RHO_D_DZDZ
             REAL(EB), DEVICE, DIMENSION(0:5000,1:*) :: H_SENS_ZD
             INTEGER :: I,J,K,ITMP
@@ -950,6 +1133,70 @@ MODULE G_DIVG
         END SUBROUTINE SPECIES_DIFF_HEAT_FACE_GPU
 
 
+        ! divg.f90, STORE_SPECIES_FLUX: DIF_FX = 0.5*(DIF_FXS - RHO_D_DZDX) in the predictor, DIF_FXS = -RHO_D_DZDX
+        ! in the corrector (species N).
+        ATTRIBUTES(GLOBAL) SUBROUTINE STORE_DIFFUSIVE_SPECIES_FLUX_GPU(RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ, &
+            DIF_FX,DIF_FY,DIF_FZ,DIF_FXS,DIF_FYS,DIF_FZS,IBP1,JBP1,KBP1,N,PREDICTOR_FLAG)
+            INTEGER, VALUE :: IBP1,JBP1,KBP1,N,PREDICTOR_FLAG
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ, &
+                DIF_FX,DIF_FY,DIF_FZ,DIF_FXS,DIF_FYS,DIF_FZS
+            INTEGER :: I,J,K
+            I = (blockIdx%x - 1) * blockDim%x + threadIdx%x - 1
+            J = (blockIdx%y - 1) * blockDim%y + threadIdx%y - 1
+            K = (blockIdx%z - 1) * blockDim%z + threadIdx%z - 1
+            IF (I<0 .OR. I>IBP1 .OR. J<0 .OR. J>JBP1 .OR. K<0 .OR. K>KBP1) RETURN
+            IF (PREDICTOR_FLAG==1) THEN
+                DIF_FX(I,J,K,N) = 0.5_EB*(DIF_FXS(I,J,K,N) - RHO_D_DZDX(I,J,K,N))
+                DIF_FY(I,J,K,N) = 0.5_EB*(DIF_FYS(I,J,K,N) - RHO_D_DZDY(I,J,K,N))
+                DIF_FZ(I,J,K,N) = 0.5_EB*(DIF_FZS(I,J,K,N) - RHO_D_DZDZ(I,J,K,N))
+            ELSE
+                DIF_FXS(I,J,K,N) = -RHO_D_DZDX(I,J,K,N)
+                DIF_FYS(I,J,K,N) = -RHO_D_DZDY(I,J,K,N)
+                DIF_FZS(I,J,K,N) = -RHO_D_DZDZ(I,J,K,N)
+            ENDIF
+        END SUBROUTINE STORE_DIFFUSIVE_SPECIES_FLUX_GPU
+
+        ! divg.f90 WALL_LOOP_2, STORE_SPECIES_FLUX: wall diffusive flux RHO_D_DZDN on solid boundaries.
+        ATTRIBUTES(GLOBAL) SUBROUTINE STORE_DIFFUSIVE_SPECIES_FLUX_WALL_GPU(WALL_TOPO,WALL_RHO_D_DZDN_F,WALL_THIN_NEG, &
+            DIF_FX,DIF_FY,DIF_FZ,DIF_FXS,DIF_FYS,DIF_FZS,N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS, &
+            N,PREDICTOR_FLAG,IBP1,JBP1,KBP1,WALL_LB,WALL_UB)
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N,PREDICTOR_FLAG,IBP1,JBP1,KBP1,WALL_LB,WALL_UB
+            REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_RHO_D_DZDN_F
+            INTEGER, DEVICE :: WALL_THIN_NEG(0:*)
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: DIF_FX,DIF_FY,DIF_FZ,DIF_FXS,DIF_FYS,DIF_FZS
+            INTEGER :: IW,IIG,JJG,KKG
+            REAL(EB) :: R
+            IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS + N_INTERNAL_WALL_CELLS) RETURN
+            IF (WALL_TOPO(IW)%BOUNDARY_TYPE == NULL_BOUNDARY .OR. WALL_TOPO(IW)%BOUNDARY_TYPE == OPEN_BOUNDARY .OR. &
+                WALL_TOPO(IW)%BOUNDARY_TYPE == INTERPOLATED_BOUNDARY) RETURN
+            IF (WALL_THIN_NEG(IW)==1) RETURN
+            IIG = WALL_TOPO(IW)%IIG
+            JJG = WALL_TOPO(IW)%JJG
+            KKG = WALL_TOPO(IW)%KKG
+            R = WALL_RHO_D_DZDN_F(IW,N)
+            IF (PREDICTOR_FLAG==0) THEN
+                SELECT CASE(WALL_TOPO(IW)%IOR)
+                    CASE(-1) ; DIF_FXS(IIG  ,JJG  ,KKG  ,N) =  R
+                    CASE( 1) ; DIF_FXS(IIG-1,JJG  ,KKG  ,N) = -R
+                    CASE(-2) ; DIF_FYS(IIG  ,JJG  ,KKG  ,N) =  R
+                    CASE( 2) ; DIF_FYS(IIG  ,JJG-1,KKG  ,N) = -R
+                    CASE(-3) ; DIF_FZS(IIG  ,JJG  ,KKG  ,N) =  R
+                    CASE( 3) ; DIF_FZS(IIG  ,JJG  ,KKG-1,N) = -R
+                END SELECT
+            ELSE
+                SELECT CASE(WALL_TOPO(IW)%IOR)
+                    CASE(-1) ; DIF_FX(IIG  ,JJG  ,KKG  ,N) = 0.5_EB*(DIF_FXS(IIG  ,JJG  ,KKG  ,N)+R)
+                    CASE( 1) ; DIF_FX(IIG-1,JJG  ,KKG  ,N) = 0.5_EB*(DIF_FXS(IIG-1,JJG  ,KKG  ,N)-R)
+                    CASE(-2) ; DIF_FY(IIG  ,JJG  ,KKG  ,N) = 0.5_EB*(DIF_FYS(IIG  ,JJG  ,KKG  ,N)+R)
+                    CASE( 2) ; DIF_FY(IIG  ,JJG-1,KKG  ,N) = 0.5_EB*(DIF_FYS(IIG  ,JJG-1,KKG  ,N)-R)
+                    CASE(-3) ; DIF_FZ(IIG  ,JJG  ,KKG  ,N) = 0.5_EB*(DIF_FZS(IIG  ,JJG  ,KKG  ,N)+R)
+                    CASE( 3) ; DIF_FZ(IIG  ,JJG  ,KKG-1,N) = 0.5_EB*(DIF_FZS(IIG  ,JJG  ,KKG-1,N)-R)
+                END SELECT
+            ENDIF
+        END SUBROUTINE STORE_DIFFUSIVE_SPECIES_FLUX_WALL_GPU
+
         ATTRIBUTES(GLOBAL) SUBROUTINE SPECIES_DIFF_HEAT_BOUNDARY_GPU(TMPD, H_SENS_ZD, ZZPD, RHO_D_DZDX, RHO_D_DZDY, &
             RHO_D_DZDZ, H_RHO_D_DZDX, H_RHO_D_DZDY, H_RHO_D_DZDZ, WALL_ZZ_F, WALL_RHO_D_F, WALL_RHO_D_DZDN_F, WALL_TMP_F, &
             WALL_U_NORMAL, WALL_U_NORMAL_S, WALL_RDN, WALL_TOPO, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, &
@@ -957,8 +1204,10 @@ MODULE G_DIVG
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N_TRACKED_SPECIES,N,PREDICTOR_FLAG
             INTEGER, VALUE :: IBP1,JBP1,KBP1,WALL_LB,WALL_UB
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: TMPD,H_RHO_D_DZDX,H_RHO_D_DZDY,H_RHO_D_DZDZ
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD,RHO_D_DZDX,RHO_D_DZDY,RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: H_RHO_D_DZDX, H_RHO_D_DZDY, H_RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: TMPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: RHO_D_DZDX, RHO_D_DZDY, RHO_D_DZDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(0:5000,1:*) :: H_SENS_ZD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_F,WALL_RHO_D_F,WALL_RHO_D_DZDN_F
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_TMP_F, WALL_U_NORMAL, WALL_U_NORMAL_S, WALL_RDN
@@ -1106,8 +1355,9 @@ MODULE G_DIVG
         ATTRIBUTES(GLOBAL) SUBROUTINE GET_SPECIFIC_HEAT_GPU(ZZPD,CP,CP_ZD,R_H_G,TMPD,N_TRACKED_SPECIES,IBAR,JBAR,KBAR)
             INTEGER, VALUE :: N_TRACKED_SPECIES, IBAR, JBAR, KBAR
             REAL(EB) , DEVICE , DIMENSION(0:5000,1:*) :: CP_ZD
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: ZZPD
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)    :: CP, TMPD, R_H_G
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:KBAR+2,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CP, R_H_G
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: TMPD
             INTEGER :: I,J,K,ITMP,N
             REAL(EB) :: CP_LOC
 
@@ -1132,7 +1382,8 @@ MODULE G_DIVG
 
         ATTRIBUTES(GLOBAL) SUBROUTINE D_Z_MAX_THERMAL_GPU(D_Z_MAX,KP,CP,RHOP,CELL_INDEXD,CELL_SOLID,IBAR,JBAR,KBAR)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: D_Z_MAX, KP, CP, RHOP
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: D_Z_MAX, KP, CP
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER, DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: CELL_INDEXD
             LOGICAL, DEVICE, DIMENSION(0:*)        :: CELL_SOLID
             INTEGER :: I,J,K,IC
@@ -1173,7 +1424,8 @@ MODULE G_DIVG
         ATTRIBUTES(GLOBAL) SUBROUTINE KDTDN_GPU_2(TMPD,KP,KDTDX,KDTDY,KDTDZ,IBAR,JBAR,KBAR,RDXND,RDYND,RDZND)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
             REAL(EB), DEVICE, DIMENSION(0:*)       :: RDXND, RDYND, RDZND
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: TMPD, KP, KDTDX, KDTDY, KDTDZ
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: KP, KDTDX, KDTDY, KDTDZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: TMPD
             REAL(EB) :: DTDX, DTDY, DTDZ
             INTEGER :: I,J,K
 
@@ -1248,8 +1500,8 @@ MODULE G_DIVG
 
             REAL(EB), DEVICE, DIMENSION(0:5000,1:*)        :: H_SENS_ZD
             REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*)    :: U_DOT_DEL_RHO_H_S, FX_H_S, FY_H_S, FZ_H_S
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*)    :: RHO_H_S_P, RHOPD, TMPD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHO_H_S_P,RHOPD,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
 
             INTEGER :: I, J, K
             INTEGER :: ITMP, N
@@ -1258,19 +1510,22 @@ MODULE G_DIVG
             REAL(EB) :: FRAC
             REAL(EB) :: H0, H1
 
-            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
-            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
-            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
+            ! Padded range -1:IBP1+1 (launched on GRDD_3D_PAD)
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 2
+            J = (BLOCKIDX%Y-1)*BLOCKDIM%Y + THREADIDX%Y - 2
+            K = (BLOCKIDX%Z-1)*BLOCKDIM%Z + THREADIDX%Z - 2
 
-            IF (I < 0 .OR. I > IBP1) RETURN
-            IF (J < 0 .OR. J > JBP1) RETURN
-            IF (K < 0 .OR. K > KBP1) RETURN
+            IF (I < -1 .OR. I > IBP1+1) RETURN
+            IF (J < -1 .OR. J > JBP1+1) RETURN
+            IF (K < -1 .OR. K > KBP1+1) RETURN
 
-            ! 这三个先保留，避免 face 上未覆盖位置读到脏值
-            FX_H_S(I,J,K) = 0._EB
-            FY_H_S(I,J,K) = 0._EB
-            FZ_H_S(I,J,K) = 0._EB
-            U_DOT_DEL_RHO_H_S(I,J,K) = 0._EB
+            ! Face arrays and U_DOT_DEL are zeroed over 0:IBP1 (their bounds); RHO_H_S_P over the padded range
+            IF (I>=0 .AND. I<=IBP1 .AND. J>=0 .AND. J<=JBP1 .AND. K>=0 .AND. K<=KBP1) THEN
+                FX_H_S(I,J,K) = 0._EB
+                FY_H_S(I,J,K) = 0._EB
+                FZ_H_S(I,J,K) = 0._EB
+                U_DOT_DEL_RHO_H_S(I,J,K) = 0._EB
+            ENDIF
 
             TMP_LOC = TMPD(I,J,K)
 
@@ -1300,7 +1555,11 @@ MODULE G_DIVG
             INTEGER, DEVICE, DIMENSION(CELL_LB:CELL_UB,-3:*) :: CELL_WALL_INDEX
             LOGICAL, DEVICE, DIMENSION(0:*)       :: CELL_SOLID
             REAL(EB), DEVICE, DIMENSION(0:*)      :: RDX, RDY, RDZ
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: U_DOT_DEL_RHO_H_S, FX_H_S, FY_H_S, FZ_H_S, RHO_H_S_P, UU, VV, WW
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: U_DOT_DEL_RHO_H_S, FX_H_S, FY_H_S, FZ_H_S
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHO_H_S_P
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
 
             INTEGER :: I,J,K,IC
             REAL(EB) :: DU_P,DU_M,DV_P,DV_M,DW_P,DW_M
@@ -1348,7 +1607,11 @@ MODULE G_DIVG
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,N_TRACKED_SPECIES,PREDICTOR_FLAG
             INTEGER, VALUE :: IBP1,JBP1,WALL_LB,WALL_UB
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U_DOT_DEL_RHO_H_S,RHO_H_S_P,UU,VV,WW,TMPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U_DOT_DEL_RHO_H_S
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHO_H_S_P,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WW
             REAL(EB), DEVICE, DIMENSION(0:5000,1:*)     :: H_SENS_ZD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_F
             REAL(EB), DEVICE, DIMENSION(0:*)       :: WALL_TMP_F, WALL_RHO_F, WALL_U_NORMAL, WALL_U_NORMAL_S, WALL_RDN
@@ -1473,7 +1736,8 @@ MODULE G_DIVG
 
         ATTRIBUTES(GLOBAL) SUBROUTINE DP_MUL_RTRM_GPU(DP,RTRM,R_H_G,RHOP,IBAR,JBAR,KBAR)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, RTRM, R_H_G, RHOP
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, RTRM, R_H_G
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP
             INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
@@ -1488,24 +1752,48 @@ MODULE G_DIVG
             DP(I,J,K)   = RTRM(I,J,K) * DP(I,J,K)
         END SUBROUTINE DP_MUL_RTRM_GPU
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE SINGLE_SPECIES_ADVECTION_INIT_GPU( &
-            RHOPD,ZZPD,RHO_Z_P,U_DOT_DEL_RHO_Z,FX_ZZ,FY_ZZ,FZ_ZZ,IBP1,JBP1,KBP1,N,ZERO_FACES)
-            INTEGER, VALUE :: IBP1, JBP1, KBP1, N, ZERO_FACES
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RHOPD,RHO_Z_P,U_DOT_DEL_RHO_Z
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: FX_ZZ,FY_ZZ,FZ_ZZ
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
-
+        ATTRIBUTES(GLOBAL) SUBROUTINE DP_MUL_RTRM_CONST_GAMMA_GPU(DP,RTRM,PBAR_P,PRESSURE_ZONED,GM1OG_IN,IBAR,JBAR,KBAR)
+            INTEGER, VALUE :: IBAR, JBAR, KBAR
+            REAL(EB), VALUE :: GM1OG_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, RTRM
+            REAL(EB), DEVICE, DIMENSION(0:KBAR+1,0:*)    :: PBAR_P
+            INTEGER, DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*)  :: PRESSURE_ZONED
             INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
             J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
             K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
 
-            IF (I < 0 .OR. I > IBP1) RETURN
-            IF (J < 0 .OR. J > JBP1) RETURN
-            IF (K < 0 .OR. K > KBP1) RETURN
+            IF (I < 1 .OR. I > IBAR) RETURN
+            IF (J < 1 .OR. J > JBAR) RETURN
+            IF (K < 1 .OR. K > KBAR) RETURN
+
+            ! divg.f90: RTRM = GM1OG*R_PBAR(K,IPZ) with R_PBAR = 1/PBAR
+            RTRM(I,J,K) = GM1OG_IN*(1._EB/PBAR_P(K,PRESSURE_ZONED(I,J,K)))
+            DP(I,J,K)   = RTRM(I,J,K) * DP(I,J,K)
+        END SUBROUTINE DP_MUL_RTRM_CONST_GAMMA_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE SINGLE_SPECIES_ADVECTION_INIT_GPU( &
+            RHOPD,ZZPD,RHO_Z_P,U_DOT_DEL_RHO_Z,FX_ZZ,FY_ZZ,FZ_ZZ,IBP1,JBP1,KBP1,N,ZERO_FACES)
+            INTEGER, VALUE :: IBP1, JBP1, KBP1, N, ZERO_FACES
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U_DOT_DEL_RHO_Z
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,RHO_Z_P
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: FX_ZZ,FY_ZZ,FZ_ZZ
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
+
+            INTEGER :: I,J,K
+
+            ! Padded range -1:IBP1+1 (launched on GRDD_3D_PAD)
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 2
+            J = (BLOCKIDX%Y-1)*BLOCKDIM%Y + THREADIDX%Y - 2
+            K = (BLOCKIDX%Z-1)*BLOCKDIM%Z + THREADIDX%Z - 2
+
+            IF (I < -1 .OR. I > IBP1+1) RETURN
+            IF (J < -1 .OR. J > JBP1+1) RETURN
+            IF (K < -1 .OR. K > KBP1+1) RETURN
 
             RHO_Z_P(I,J,K) = RHOPD(I,J,K)*ZZPD(I,J,K,N)
+            IF (I<0 .OR. I>IBP1 .OR. J<0 .OR. J>JBP1 .OR. K<0 .OR. K>KBP1) RETURN
             U_DOT_DEL_RHO_Z(I,J,K) = 0._EB
             IF (ZERO_FACES==0) RETURN
             FX_ZZ(I,J,K,N) = 0._EB
@@ -1522,10 +1810,15 @@ MODULE G_DIVG
 
             INTEGER, VALUE :: IBAR, JBAR, KBAR, N,CELL_LB,CELL_UB
             REAL(EB), VALUE :: R0_LOCAL
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP,U_DOT_DEL_RHO_Z,RHO_Z_P
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, U_DOT_DEL_RHO_Z
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHO_Z_P
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: FX_ZZ,FY_ZZ,FZ_ZZ
             REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:KBAR+1,1:*) :: DEL_RHO_D_DEL_Z
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: UU,VV,WW,RHOPD,TMPD,RSUMD,R_H_GD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: RSUMD, R_H_GD
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOPD,TMPD
             REAL(EB), DEVICE, DIMENSION(0:5000,1:*) :: H_SENS_ZD_IN
             REAL(EB), DEVICE, DIMENSION(*) :: SPECIES_RCON_IN
             INTEGER, DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
@@ -1584,8 +1877,12 @@ MODULE G_DIVG
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,PREDICTOR_FLAG,N
             INTEGER, VALUE :: IBP1,JBP1,KBP1,WALL_LB,WALL_UB
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U_DOT_DEL_RHO_Z,RHOPD,UU,VV,WW
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U_DOT_DEL_RHO_Z
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WW
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(0:*)          :: WALL_RHO_F, WALL_U_NORMAL, WALL_U_NORMAL_S, WALL_RDN
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_F
             REAL(EB), DEVICE, DIMENSION(1:*)          :: UVW_SAVE_D
@@ -1633,7 +1930,8 @@ MODULE G_DIVG
         ATTRIBUTES(GLOBAL) SUBROUTINE STRATIFICATION_GPU(DP,RTRM,WW,RHO_0D,GVEC3,IBAR,JBAR,KBAR)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
             REAL(EB), VALUE :: GVEC3
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, RTRM, WW
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, RTRM
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WW
             REAL(EB), DEVICE, DIMENSION(0:*)       :: RHO_0D
             INTEGER :: I,J,K
 
@@ -1907,7 +2205,7 @@ MODULE G_DIVG
                 ENDDO
 
                 DO IPZ=1,N_ZONE
-                    IF (ABS(PSUM(IPZ)) > TWO_EPSILON_EB) THEN
+                    IF (ABS(PSUM(IPZ)) > TWENTY_EPSILON_EB) THEN
                         D_PBAR_DT_P(IPZ) = (DSUM(IPZ) - USUM(IPZ))/PSUM(IPZ)
                     ELSE
                         D_PBAR_DT_P(IPZ) = 0._EB
@@ -2040,7 +2338,10 @@ MODULE G_DIVG
 
         ATTRIBUTES(GLOBAL) SUBROUTINE DDDT_GPU_PREDICTOR(DIV,DP,DDDT,UD,VD,WD,RDXD,RDYD,RDZD,RD,RRND,IBAR,JBAR,KBAR,RDT_LOCAL)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DIV, DP, DDDT, UD, VD, WD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DIV, DP, DDDT
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WD
             REAL(EB), DEVICE, DIMENSION(0:*)       :: RDXD, RDYD, RDZD, RD, RRND
             REAL(EB), VALUE :: RDT_LOCAL
             INTEGER :: I,J,K
@@ -2077,7 +2378,10 @@ MODULE G_DIVG
         ATTRIBUTES(GLOBAL) SUBROUTINE DDDT_GPU_CORRECTOR(DIV,DP,DDDT,UD,VD,WD,USD,VSD,WSD,RDXD,RDYD,RDZD,RD,RRND,IBAR,JBAR,KBAR,RDT_LOCAL)
             INTEGER, VALUE :: IBAR, JBAR, KBAR
             REAL(EB), DEVICE, VOLATILE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DIV
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, DDDT, UD, VD, WD, USD, VSD, WSD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: DP, DDDT
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: UD,USD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: VD,VSD
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: WD,WSD
             REAL(EB), DEVICE, DIMENSION(0:*)       :: RDXD, RDYD, RDZD, RD, RRND
             REAL(EB), VALUE :: RDT_LOCAL
             INTEGER :: I,J,K

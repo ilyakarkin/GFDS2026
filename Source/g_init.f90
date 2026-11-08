@@ -8,31 +8,117 @@ MODULE G_INIT
     USE DEVICE_VARIABLES, ONLY: N_DEVC
     USE G_POIS, ONLY: INITIALIZE_GPU_POISSON_SOLVER
     USE G_HT1D, ONLY: INITIALIZE_GPU_HT1D,HT1D_GPU_WALL_ACTIVE
-    USE G_ERRO, ONLY: GPU_CREATE_STREAM
+    USE G_ERRO, ONLY: GPU_CREATE_STREAM,GPU_WAIT
     USE CUDAFOR
+
+    ! RAMPs whose value is set by a DEVC, CTRL or the external file rather than by their argument. Each has one
+    ! slot in RAMP_INTERP_D with zero span, so EVALUATE_RAMP_DEVICE returns the slot value; the host evaluates
+    ! the RAMP as EVALUATE_RAMP does and uploads the value once per time step (UPDATE_GPU_HOST_RAMPS).
+    INTEGER, ALLOCATABLE, SAVE :: GPU_HOST_RAMP_SLOT(:)
+    REAL(EB), ALLOCATABLE, SAVE :: GPU_HOST_RAMP_VALUE(:)
 
     CONTAINS
 
+        LOGICAL FUNCTION RAMP_SET_ON_HOST(NR)
+            INTEGER, INTENT(IN) :: NR
+            RAMP_SET_ON_HOST = RAMPS(NR)%DEVC_INDEX>0 .OR. RAMPS(NR)%CTRL_INDEX>0 .OR. &
+                               RAMPS(NR)%DEVC_DEP_INDEX>0 .OR. RAMPS(NR)%CTRL_DEP_INDEX>0 .OR. RAMPS(NR)%EXTERNAL_FILE
+        END FUNCTION RAMP_SET_ON_HOST
+
+        !> Upload the current values of the RAMPs controlled by a DEVC, CTRL or the external file.
+        SUBROUTINE UPDATE_GPU_HOST_RAMPS
+            USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
+            INTEGER :: NR,SLOT
+            REAL(EB) :: VALUE
+
+            IF (.NOT.ALLOCATED(GPU_HOST_RAMP_SLOT)) RETURN
+            IF (.NOT.ALLOCATED(RAMP_INTERP_D)) RETURN
+            DO NR=1,SIZE(GPU_HOST_RAMP_SLOT)
+                SLOT = GPU_HOST_RAMP_SLOT(NR)
+                IF (SLOT<=0) CYCLE
+                VALUE = EVALUATE_RAMP(0._EB,NR)
+                IF (VALUE==GPU_HOST_RAMP_VALUE(NR)) CYCLE
+                RAMP_INTERP_D(SLOT) = VALUE
+                GPU_HOST_RAMP_VALUE(NR) = VALUE
+            ENDDO
+        END SUBROUTINE UPDATE_GPU_HOST_RAMPS
+
         SUBROUTINE CHECK_GPU_WALL_SETUP
-            INTEGER :: NM,IW
+            ! Refuse (SHUTDOWN, the caller then calls STOP_CHECK(1) on all processes) a thermally thick WALL cell that
+            ! has no device HT1D line, with the reason given by GET_HT1D_LINE_SIZE.
+            USE GLOBAL_CONSTANTS, ONLY: PYROLYSIS_PREDICTED
+            USE TYPES, ONLY: MATERIAL,BOUNDARY_ONE_D_TYPE
+            USE COMP_FUNCTIONS, ONLY: SHUTDOWN
+            USE G_HT1D, ONLY: GET_HT1D_LINE_SIZE
+            INTEGER :: NM,IW,N,NMATL,ML_INDEX,NWP
+            LOGICAL :: PYRO,ELIGIBLE
+            CHARACTER(MESSAGE_LENGTH) :: MESSAGE
+            CHARACTER(120) :: REASON,MATL_LIST
             TYPE(WALL_TYPE), POINTER :: WC
             TYPE(SURFACE_TYPE), POINTER :: SF
+            TYPE(BOUNDARY_ONE_D_TYPE), POINTER :: ONE_D
 
             IF (.NOT.WALL_BC_ON) RETURN
-            DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+            MESH_LOOP: DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
                 DO IW=1,MESHES(NM)%N_EXTERNAL_WALL_CELLS+MESHES(NM)%N_INTERNAL_WALL_CELLS
                     WC => MESHES(NM)%WALL(IW)
                     IF (WC%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
                     IF (WC%SURF_INDEX<1 .OR. WC%SURF_INDEX>SIZE(SURFACE)) CYCLE
                     SF => SURFACE(WC%SURF_INDEX)
+                    ! Solid-phase pyrolysis (MATL with reactions) has no GPU implementation: refuse it explicitly.
+                    ! A VARIABLE_THICKNESS wall takes its MATL from the OBST, so the wall's ONE_D is checked too.
+                    NULLIFY(ONE_D)
+                    IF (WC%OD_INDEX>0 .AND. ALLOCATED(MESHES(NM)%BOUNDARY_ONE_D)) THEN
+                        IF (WC%OD_INDEX<=SIZE(MESHES(NM)%BOUNDARY_ONE_D)) ONE_D => MESHES(NM)%BOUNDARY_ONE_D(WC%OD_INDEX)
+                    ENDIF
+                    PYRO = SF%PYROLYSIS_MODEL==PYROLYSIS_PREDICTED
+                    IF (ASSOCIATED(ONE_D)) PYRO = PYRO .OR. ONE_D%PYROLYSIS_MODEL==PYROLYSIS_PREDICTED
+                    IF (PYRO) THEN
+                        NMATL = SF%N_MATL
+                        IF (ASSOCIATED(ONE_D)) NMATL = ONE_D%N_MATL
+                        MATL_LIST = ''
+                        DO N=1,NMATL
+                            IF (ASSOCIATED(ONE_D)) THEN
+                                ML_INDEX = ONE_D%MATL_INDEX(N)
+                            ELSE
+                                ML_INDEX = SF%MATL_INDEX(N)
+                            ENDIF
+                            IF (MATERIAL(ML_INDEX)%N_REACTIONS>0 .AND. LEN_TRIM(MATL_LIST)<80) &
+                                MATL_LIST = TRIM(MATL_LIST)//' '//TRIM(MATERIAL(ML_INDEX)%ID)
+                        ENDDO
+                        ! the message must fit MESSAGE (MESSAGE_LENGTH=200) with its standard ending: long SURF and MATL
+                        ! names are cut (40 characters each, '...' marks a cut)
+                        IF (LEN_TRIM(MATL_LIST)>40) MATL_LIST = MATL_LIST(1:37)//'...'
+                        IF (LEN_TRIM(SF%ID)>40) THEN
+                            REASON = SF%ID(1:37)//'...'
+                        ELSE
+                            REASON = SF%ID
+                        ENDIF
+                        WRITE(MESSAGE,'(5A)') 'ERROR: GPU: solid-phase pyrolysis (SURF ',TRIM(REASON),', MATL with N_REACTIONS>0:', &
+                            TRIM(MATL_LIST),') is not supported; run this case with --c'
+                        CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
+                        EXIT MESH_LOOP
+                    ENDIF
                     IF (SF%THERMAL_BC_INDEX/=THERMALLY_THICK) CYCLE
                     IF (HT1D_GPU_WALL_ACTIVE(NM,IW)) CYCLE
-                    WRITE(LU_ERR,'(A,I0,A,I0,A,A)') 'ERROR: GPU wall setup, mesh ',NM, &
-                        ', wall ',IW,', SURF=',TRIM(SF%ID)
-                    ERROR STOP 'GPU wall model unavailable for this surface; use --c/--gc'
+                    CALL GET_HT1D_LINE_SIZE(NM,IW,ELIGIBLE,NWP,NMATL,REASON)
+                    IF (ELIGIBLE) REASON = 'the state of the back side'
+                    WRITE(MESSAGE,'(5A)') 'ERROR: GPU: thermally thick SURF ',TRIM(SF%ID),' with ',TRIM(REASON), &
+                        ' is not supported; run this case with --c'
+                    CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
+                    EXIT MESH_LOOP
                 ENDDO
-            ENDDO
+            ENDDO MESH_LOOP
         END SUBROUTINE CHECK_GPU_WALL_SETUP
+
+        SUBROUTINE CHECK_GPU_NUMERICS_SETUP
+            USE COMP_FUNCTIONS, ONLY: SHUTDOWN
+            ! The GPU scalar face kernels (G_FUNC FLUX_LIMITED_FACE_VALUE) cover the CENTRAL, GODUNOV, SUPERBEE,
+            ! MINMOD and CHARM limiters of func.f90 GET_SCALAR_FACE_VALUE; MP5 has no GPU implementation.
+            IF (I_FLUX_LIMITER==MP5_LIMITER) THEN
+                CALL SHUTDOWN('ERROR: GPU: FLUX_LIMITER=MP5 is not supported; run this case with --c',PROCESS_0_ONLY=.FALSE.)
+            ENDIF
+        END SUBROUTINE CHECK_GPU_NUMERICS_SETUP
 
         SUBROUTINE CHECK_GPU_RAMP_SETUP
             INTEGER :: IS,N
@@ -42,8 +128,9 @@ MODULE G_INIT
                 CALL CHECK_GPU_TIME_RAMP_SUPPORTED(SURFACE(IS)%RAMP(TIME_TEMP)%INDEX,'SURF RAMP_T')
                 CALL CHECK_GPU_TIME_RAMP_SUPPORTED(SURFACE(IS)%RAMP(TIME_VELO)%INDEX,'SURF RAMP_V')
                 CALL CHECK_GPU_TIME_RAMP_SUPPORTED(SURFACE(IS)%RAMP(TIME_EFLUX)%INDEX,'SURF RAMP_EF')
+                CALL CHECK_GPU_TIME_RAMP_SUPPORTED(SURFACE(IS)%RAMP(TIME_TB)%INDEX,'SURF RAMP_TMP_BACK')
                 DO N=1,N_TRACKED_SPECIES
-                    IF (ABS(SURFACE(IS)%MASS_FLUX(N))>TWO_EPSILON_EB) &
+                    IF (ABS(SURFACE(IS)%MASS_FLUX(N))>TWENTY_EPSILON_EB) &
                         CALL CHECK_GPU_TIME_RAMP_SUPPORTED(SURFACE(IS)%RAMP(N)%INDEX,'SURF RAMP_MF')
                 ENDDO
             ENDDO
@@ -70,14 +157,8 @@ MODULE G_INIT
                 RETURN
             ENDIF
 
-            IF (RAMPS(RAMP_INDEX)%DEVC_INDEX > 0 .OR. RAMPS(RAMP_INDEX)%CTRL_INDEX > 0 .OR. &
-                RAMPS(RAMP_INDEX)%DEVC_DEP_INDEX > 0 .OR. RAMPS(RAMP_INDEX)%CTRL_DEP_INDEX > 0 .OR. &
-                RAMPS(RAMP_INDEX)%EXTERNAL_FILE) THEN
-                WRITE(MESSAGE,'(A,A,A,A)') 'ERROR: GPU wall RAMP only supports time ramps. Unsupported ramp in ', &
-                                          TRIM(CONTEXT),': ',TRIM(RAMPS(RAMP_INDEX)%ID)
-                CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
-                RETURN
-            ENDIF
+            ! RAMPs set by a DEVC, CTRL or the external file are evaluated on the host (UPDATE_GPU_HOST_RAMPS).
+            IF (RAMP_SET_ON_HOST(RAMP_INDEX)) RETURN
 
             IF (.NOT.ALLOCATED(RAMPS(RAMP_INDEX)%INTERPOLATED_DATA)) THEN
                 WRITE(MESSAGE,'(A,A,A,A)') 'ERROR: GPU wall RAMP missing interpolated data in ',TRIM(CONTEXT),': ', &
@@ -157,6 +238,332 @@ MODULE G_INIT
         END SUBROUTINE INITIALIZE_GPU_REMOTE_READ_ONLY_MESHES
 
         !--------------------------------------------------------------------------
+        ! Device geometry after obstructions are created or removed
+        !--------------------------------------------------------------------------
+        !> Upload the solid-cell masks of the remote meshes kept read-only on this rank, after EXCHANGE_GEOMETRY_INFO.
+        SUBROUTINE REFRESH_GPU_REMOTE_READ_ONLY_MESHES
+            INTEGER :: NOM,IC,CELL_LB,CELL_UB
+            LOGICAL, ALLOCATABLE :: CELL_SOLID_H(:)
+            TYPE(GPU_MESH_TYPE), POINTER :: REMOTE_GM
+
+            IF (.NOT.ALLOCATED(GPU_MESHES)) RETURN
+            DO NOM=1,NMESHES
+                IF (PROCESS(NOM)==MY_RANK) CYCLE
+                REMOTE_GM => GPU_MESHES(NOM)
+                IF (.NOT.ALLOCATED(REMOTE_GM%CELL_SOLID)) CYCLE
+                IF (.NOT.ALLOCATED(MESHES(NOM)%CELL)) CYCLE
+                CELL_LB = LBOUND(MESHES(NOM)%CELL,1)
+                CELL_UB = UBOUND(MESHES(NOM)%CELL,1)
+                IF (LBOUND(REMOTE_GM%CELL_SOLID,1)/=CELL_LB .OR. UBOUND(REMOTE_GM%CELL_SOLID,1)/=CELL_UB) THEN
+                    DEALLOCATE(REMOTE_GM%CELL_SOLID)
+                    ALLOCATE(REMOTE_GM%CELL_SOLID(CELL_LB:CELL_UB))
+                ENDIF
+                ALLOCATE(CELL_SOLID_H(CELL_LB:CELL_UB))
+                DO IC=CELL_LB,CELL_UB
+                    CELL_SOLID_H(IC) = MESHES(NOM)%CELL(IC)%SOLID
+                ENDDO
+                REMOTE_GM%CELL_SOLID = CELL_SOLID_H
+                DEALLOCATE(CELL_SOLID_H)
+            ENDDO
+
+        END SUBROUTINE REFRESH_GPU_REMOTE_READ_ONLY_MESHES
+
+        !> Copy the host state changed by the CPU obstruction path (CREATE_OR_REMOVE_OBST, REASSIGN_WALL_CELLS) to the
+        !> device: gas fields, solid-cell masks, and the WALL cells marked in WALL_REASSIGNED. The other WALL cells keep
+        !> their device state. The values written are those of the CPU initialization of a WALL cell (INIT_GPU_VALUES,
+        !> stage 4); U_TAU and Y_PLUS are reset as in SET_DENSITY_AND_MASS_FRACTIONS_AT_WALL.
+        SUBROUTINE GPU_REASSIGN_WALL_CELLS(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW,IC,N,NW,NWE,WLB,WUB
+            INTEGER, ALLOCATABLE :: I_H(:),CWI_H(:,:),CWI_OLD_H(:,:)
+            LOGICAL, ALLOCATABLE :: L_H(:),TOUCHED(:)
+            REAL(EB), ALLOCATABLE :: R_H(:),R2_H(:,:)
+            TYPE(WALL_TOPO_AOS_TYPE), ALLOCATABLE :: TOPO_H(:)
+            TYPE(WALL_TYPE), POINTER :: WC
+            TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
+            TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
+            CHARACTER(MESSAGE_LENGTH) :: MESSAGE
+
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            CALL POINT_GPU_MESHES(NM)
+            CALL GPU_WAIT(GM%STRM)
+
+            ! Gas fields: reset in the cells of the obstruction, and wall ghost values (SET_DENSITY_AND_MASS_FRACTIONS_AT_WALL)
+
+            GM%RHOD  = RHO
+            GM%RHOSD = RHOS
+            GM%TMPD  = TMP
+            GM%RSUMD = RSUM
+            GM%ZZD   = ZZ
+            GM%ZZSD  = ZZS
+            GM%DEL_RHO_D_DEL_ZD = DEL_RHO_D_DEL_Z
+
+            ! Solid-cell masks
+
+            ALLOCATE(L_H(GM%CELL_LB:GM%CELL_UB))
+            DO IC=GM%CELL_LB,GM%CELL_UB
+                L_H(IC) = CELL(IC)%SOLID
+            ENDDO
+            GM%CELL_SOLID = L_H
+            DO IC=GM%CELL_LB,GM%CELL_UB
+                L_H(IC) = CELL(IC)%EXTERIOR
+            ENDDO
+            GM%CELL_EXTERIOR = L_H
+            DEALLOCATE(L_H)
+
+            ! The WALL cells are preallocated for removable obstructions, so CELL%WALL_INDEX should not change. The EDGE side
+            ! tables are built from it at initialization; stop if it did change.
+
+            ALLOCATE(CWI_H(GM%CELL_LB:GM%CELL_UB,-3:3),CWI_OLD_H(GM%CELL_LB:GM%CELL_UB,-3:3))
+            DO IC=GM%CELL_LB,GM%CELL_UB
+                CWI_H(IC,:) = CELL(IC)%WALL_INDEX(:)
+            ENDDO
+            DO N=-3,3
+                CWI_OLD_H(:,N) = GM%CELL_WALL_INDEX(:,N)
+            ENDDO
+            IF (ANY(CWI_H/=CWI_OLD_H)) THEN
+                WRITE(MESSAGE,'(A,I0)') 'ERROR(GPU): CELL%WALL_INDEX changed after an obstruction was created or removed, mesh ',NM
+                CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
+            ENDIF
+            DEALLOCATE(CWI_H,CWI_OLD_H)
+
+            ! WALL cells re-initialized on the host
+
+            NW  = N_EXTERNAL_WALL_CELLS + N_INTERNAL_WALL_CELLS
+            NWE = N_EXTERNAL_WALL_CELLS
+            WLB = GM%WALL_LB
+            WUB = GM%WALL_UB
+            ALLOCATE(TOUCHED(GM%WALL_LB:GM%WALL_UB)) ; TOUCHED = .FALSE.
+            IF (ALLOCATED(MESHES(NM)%WALL_REASSIGNED)) TOUCHED(1:NW) = MESHES(NM)%WALL_REASSIGNED(1:NW)
+            IF (.NOT.ANY(TOUCHED)) THEN
+                DEALLOCATE(TOUCHED)
+                RETURN
+            ENDIF
+
+            ALLOCATE(TOPO_H(GM%WALL_LB:GM%WALL_UB))
+            TOPO_H = WALL_TOPO_AOS
+            DO IW=1,NW
+                IF (.NOT.TOUCHED(IW)) CYCLE
+                WC => WALL(IW) ; BC => BOUNDARY_COORD(WC%BC_INDEX)
+                TOPO_H(IW)%BOUNDARY_TYPE  = WC%BOUNDARY_TYPE
+                TOPO_H(IW)%CUT_FACE_INDEX = WC%CUT_FACE_INDEX
+                TOPO_H(IW)%II  = BC%II  ; TOPO_H(IW)%JJ  = BC%JJ  ; TOPO_H(IW)%KK  = BC%KK
+                TOPO_H(IW)%IIG = BC%IIG ; TOPO_H(IW)%JJG = BC%JJG ; TOPO_H(IW)%KKG = BC%KKG
+                TOPO_H(IW)%IOR = BC%IOR
+            ENDDO
+            WALL_TOPO_AOS = TOPO_H
+            DEALLOCATE(TOPO_H)
+
+            ALLOCATE(I_H(GM%WALL_LB:GM%WALL_UB))
+            I_H = GM%WALL_SF_INDEX
+            DO IW=1,NW ; IF (TOUCHED(IW)) I_H(IW) = WALL(IW)%SURF_INDEX ; ENDDO
+            GM%WALL_SF_INDEX = I_H
+            I_H = GM%WALL_PRESSURE_ZONE
+            DO IW=1,NW ; IF (TOUCHED(IW)) I_H(IW) = BOUNDARY_PROP1(WALL(IW)%B1_INDEX)%PRESSURE_ZONE ; ENDDO
+            GM%WALL_PRESSURE_ZONE = I_H
+            I_H = GM%WALL_PRESSURE_BC_TYPE
+            DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%PRESSURE_BC_TYPE ; ENDDO
+            GM%WALL_PRESSURE_BC_TYPE = I_H
+            DEALLOCATE(I_H)
+
+            CALL GPU_PATCH_WALL_VALUES(NM,1,GM%WALL_HEAT_TRANS_COEF,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,2,GM%WALL_Q_CON_F,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,3,GM%WALL_K_G,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,4,GM%WALL_RHO_G,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,5,GM%WALL_TMP_G,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,6,GM%WALL_TMP_F,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,7,GM%WALL_RHO_F,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,8,GM%WALL_RDN,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,9,GM%WALL_U_NORMAL,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,10,GM%WALL_U_NORMAL_S,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,11,GM%WALL_U_NORMAL_0,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,12,GM%WALL_AREA,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,13,GM%WALL_AREA_ADJUST,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,14,GM%WALL_EMISSIVITY,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,15,GM%WALL_Q_RAD_IN,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,16,GM%WALL_Q_RAD_OUT,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,17,GM%WALL_T_IGN,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,18,GM%WALL_BURN_DURATION,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,19,GM%WALL_Q_IN_SMOOTH,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,20,GM%WALL_U_TAU,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,21,GM%WALL_Y_PLUS,TOUCHED,WLB,WUB)
+            CALL GPU_PATCH_WALL_VALUES(NM,22,GM%WALL_DUNDTD,TOUCHED,WLB,WUB)
+
+            ALLOCATE(R2_H(GM%WALL_LB:GM%WALL_UB,1:MAX_QDOTPP_REF))
+            R2_H = GM%WALL_Q_IN_SMOOTH_INT
+            DO IW=1,NW
+                IF (.NOT.TOUCHED(IW)) CYCLE
+                B1 => BOUNDARY_PROP1(WALL(IW)%B1_INDEX)
+                R2_H(IW,:) = 0._EB
+                IF (ALLOCATED(B1%Q_IN_SMOOTH_INT)) THEN
+                    N = MIN(MAX_QDOTPP_REF,SIZE(B1%Q_IN_SMOOTH_INT))
+                    R2_H(IW,1:N) = B1%Q_IN_SMOOTH_INT(1:N)
+                ENDIF
+            ENDDO
+            GM%WALL_Q_IN_SMOOTH_INT = R2_H
+            R2_H = GM%WALL_QDOTPP_INT
+            DO IW=1,NW
+                IF (.NOT.TOUCHED(IW)) CYCLE
+                B1 => BOUNDARY_PROP1(WALL(IW)%B1_INDEX)
+                R2_H(IW,:) = 0._EB
+                IF (ALLOCATED(B1%QDOTPP_INT)) THEN
+                    N = MIN(MAX_QDOTPP_REF,SIZE(B1%QDOTPP_INT))
+                    R2_H(IW,1:N) = B1%QDOTPP_INT(1:N)
+                ENDIF
+            ENDDO
+            GM%WALL_QDOTPP_INT = R2_H
+            DEALLOCATE(R2_H)
+
+            IF (N_TOTAL_SCALARS>0) THEN
+                ALLOCATE(R2_H(GM%WALL_LB:GM%WALL_UB,1:N_TOTAL_SCALARS))
+                R2_H = GM%WALL_ZZ_F
+                DO IW=1,NW
+                    IF (.NOT.TOUCHED(IW)) CYCLE
+                    B1 => BOUNDARY_PROP1(WALL(IW)%B1_INDEX)
+                    R2_H(IW,:) = 0._EB
+                    R2_H(IW,1) = 1._EB
+                    IF (ALLOCATED(B1%ZZ_F)) THEN
+                        DO N=1,MIN(N_TOTAL_SCALARS,N_TRACKED_SPECIES)
+                            R2_H(IW,N) = B1%ZZ_F(N)
+                        ENDDO
+                    ENDIF
+                ENDDO
+                GM%WALL_ZZ_F = R2_H
+                DEALLOCATE(R2_H)
+            ENDIF
+
+            IF (N_TRACKED_SPECIES>0) THEN
+                CALL GPU_PATCH_WALL_SPECIES(NM,1,GM%WALL_RHO_D_F,TOUCHED,WLB,WUB)
+                CALL GPU_PATCH_WALL_SPECIES(NM,2,GM%WALL_RHO_D_DZDN_F,TOUCHED,WLB,WUB)
+                CALL GPU_PATCH_WALL_SPECIES(NM,3,GM%WALL_M_DOT_G_PP_ADJUST,TOUCHED,WLB,WUB)
+                CALL GPU_PATCH_WALL_SPECIES(NM,4,GM%WALL_M_DOT_G_PP_ACTUAL,TOUCHED,WLB,WUB)
+            ENDIF
+
+            ! EXTERNAL_WALL neighbor data (INIT_WALL_CELL can set NOM and the IIO..KKO range of an exterior wall cell)
+
+            IF (NWE>0 .AND. ANY(TOUCHED(1:NWE))) THEN
+                ALLOCATE(I_H(1:NWE))
+                I_H = GM%EXTERNAL_WALL_NOMD
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%NOM ; ENDDO
+                GM%EXTERNAL_WALL_NOMD = I_H
+                I_H = GM%EXTERNAL_WALL_NICD
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%NIC ; ENDDO
+                GM%EXTERNAL_WALL_NICD = I_H
+                I_H = GM%WALL_IIO
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%IIO_MIN ; ENDDO
+                GM%WALL_IIO = I_H
+                I_H = GM%WALL_JJO
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%JJO_MIN ; ENDDO
+                GM%WALL_JJO = I_H
+                I_H = GM%WALL_KKO
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%KKO_MIN ; ENDDO
+                GM%WALL_KKO = I_H
+                I_H = GM%WALL_IIO_MAX
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%IIO_MAX ; ENDDO
+                GM%WALL_IIO_MAX = I_H
+                I_H = GM%WALL_JJO_MAX
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%JJO_MAX ; ENDDO
+                GM%WALL_JJO_MAX = I_H
+                I_H = GM%WALL_KKO_MAX
+                DO IW=1,NWE ; IF (TOUCHED(IW)) I_H(IW) = EXTERNAL_WALL(IW)%KKO_MAX ; ENDDO
+                GM%WALL_KKO_MAX = I_H
+                DEALLOCATE(I_H)
+                ALLOCATE(R_H(1:NWE))
+                R_H = GM%EXTERNAL_WALL_AREA_RATIOD
+                DO IW=1,NWE ; IF (TOUCHED(IW)) R_H(IW) = EXTERNAL_WALL(IW)%AREA_RATIO ; ENDDO
+                GM%EXTERNAL_WALL_AREA_RATIOD = R_H
+                DEALLOCATE(R_H)
+            ENDIF
+
+            DEALLOCATE(TOUCHED)
+
+        END SUBROUTINE GPU_REASSIGN_WALL_CELLS
+
+        !> Overwrite the reassigned entries of a device WALL array with the host value of the WALL cell (IV selects it)
+        SUBROUTINE GPU_PATCH_WALL_VALUES(NM,IV,A_D,TOUCHED,WLB,WUB)
+            INTEGER, INTENT(IN) :: NM,IV,WLB,WUB
+            REAL(EB), DEVICE :: A_D(WLB:WUB)
+            LOGICAL, INTENT(IN) :: TOUCHED(WLB:WUB)
+            INTEGER :: IW
+            REAL(EB), ALLOCATABLE :: R_H(:)
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
+            TYPE(BOUNDARY_PROP2_TYPE), POINTER :: B2
+
+            M => MESHES(NM)
+            ALLOCATE(R_H(WLB:WUB))
+            R_H = A_D
+            DO IW=MAX(1,WLB),WUB
+                IF (.NOT.TOUCHED(IW)) CYCLE
+                B1 => M%BOUNDARY_PROP1(M%WALL(IW)%B1_INDEX)
+                SELECT CASE(IV)
+                    CASE(1)  ; R_H(IW) = B1%HEAT_TRANS_COEF
+                    CASE(2)  ; R_H(IW) = B1%Q_CON_F
+                    CASE(3)  ; R_H(IW) = B1%K_G
+                    CASE(4)  ; R_H(IW) = B1%RHO_G
+                    CASE(5)  ; R_H(IW) = B1%TMP_G
+                    CASE(6)  ; R_H(IW) = B1%TMP_F
+                    CASE(7)  ; R_H(IW) = B1%RHO_F
+                    CASE(8)  ; R_H(IW) = B1%RDN
+                    CASE(9)  ; R_H(IW) = B1%U_NORMAL
+                    CASE(10) ; R_H(IW) = B1%U_NORMAL_S
+                    CASE(11) ; R_H(IW) = B1%U_NORMAL_0
+                    CASE(12) ; R_H(IW) = B1%AREA
+                    CASE(13) ; R_H(IW) = B1%AREA_ADJUST
+                    CASE(14) ; R_H(IW) = B1%EMISSIVITY
+                    CASE(15) ; R_H(IW) = B1%Q_RAD_IN
+                    CASE(16) ; R_H(IW) = B1%Q_RAD_OUT
+                    CASE(17) ; R_H(IW) = B1%T_IGN
+                    CASE(18) ; R_H(IW) = B1%BURN_DURATION
+                    CASE(19) ; R_H(IW) = B1%Q_IN_SMOOTH
+                    CASE(20,21)
+                        IF (M%WALL(IW)%B2_INDEX>0) THEN
+                            B2 => M%BOUNDARY_PROP2(M%WALL(IW)%B2_INDEX)
+                            IF (IV==20) R_H(IW) = B2%U_TAU
+                            IF (IV==21) R_H(IW) = B2%Y_PLUS
+                        ELSE
+                            IF (IV==20) R_H(IW) = 0._EB
+                            IF (IV==21) R_H(IW) = 1._EB
+                        ENDIF
+                    CASE(22)
+                        R_H(IW) = 0._EB
+                        IF (IW<=M%N_EXTERNAL_WALL_CELLS) R_H(IW) = M%EXTERNAL_WALL(IW)%DUNDT
+                END SELECT
+            ENDDO
+            A_D = R_H
+            DEALLOCATE(R_H)
+        END SUBROUTINE GPU_PATCH_WALL_VALUES
+
+        !> Same for the species arrays of the WALL cells
+        SUBROUTINE GPU_PATCH_WALL_SPECIES(NM,IV,A_D,TOUCHED,WLB,WUB)
+            INTEGER, INTENT(IN) :: NM,IV,WLB,WUB
+            REAL(EB), DEVICE :: A_D(WLB:WUB,1:N_TRACKED_SPECIES)
+            LOGICAL, INTENT(IN) :: TOUCHED(WLB:WUB)
+            INTEGER :: IW
+            REAL(EB), ALLOCATABLE :: R2_H(:,:)
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
+
+            M => MESHES(NM)
+            ALLOCATE(R2_H(WLB:WUB,1:N_TRACKED_SPECIES))
+            R2_H = A_D
+            DO IW=MAX(1,WLB),WUB
+                IF (.NOT.TOUCHED(IW)) CYCLE
+                B1 => M%BOUNDARY_PROP1(M%WALL(IW)%B1_INDEX)
+                R2_H(IW,:) = 0._EB
+                SELECT CASE(IV)
+                    CASE(1) ; IF (ALLOCATED(B1%RHO_D_F))           R2_H(IW,:) = B1%RHO_D_F(1:N_TRACKED_SPECIES)
+                    CASE(2) ; IF (ALLOCATED(B1%RHO_D_DZDN_F))      R2_H(IW,:) = B1%RHO_D_DZDN_F(1:N_TRACKED_SPECIES)
+                    CASE(3) ; IF (ALLOCATED(B1%M_DOT_G_PP_ADJUST)) R2_H(IW,:) = B1%M_DOT_G_PP_ADJUST(1:N_TRACKED_SPECIES)
+                    CASE(4) ; IF (ALLOCATED(B1%M_DOT_G_PP_ACTUAL)) R2_H(IW,:) = B1%M_DOT_G_PP_ACTUAL(1:N_TRACKED_SPECIES)
+                END SELECT
+            ENDDO
+            A_D = R2_H
+            DEALLOCATE(R2_H)
+        END SUBROUTINE GPU_PATCH_WALL_SPECIES
+
+        !--------------------------------------------------------------------------
         ! CUDA launch-shape selection
         !--------------------------------------------------------------------------
         INTEGER FUNCTION INITIAL_GPU_BLOCK_DIM(N)
@@ -226,6 +633,10 @@ MODULE G_INIT
             GPU_GRDD_3D_BP1 = DIM3((NI + GPU_BSX_3D_BP1 - 1)/GPU_BSX_3D_BP1, &
                                    (NJ + GPU_BSY_3D_BP1 - 1)/GPU_BSY_3D_BP1, &
                                    (NK + GPU_BSZ_3D_BP1 - 1)/GPU_BSZ_3D_BP1)
+            ! Same block, covering the padded range -1:IBP1+1 (NI+2 points per direction)
+            GPU_GRDD_3D_PAD = DIM3((NI + 2 + GPU_BSX_3D_BP1 - 1)/GPU_BSX_3D_BP1, &
+                                   (NJ + 2 + GPU_BSY_3D_BP1 - 1)/GPU_BSY_3D_BP1, &
+                                   (NK + 2 + GPU_BSZ_3D_BP1 - 1)/GPU_BSZ_3D_BP1)
 
             NEDGE_ACTIVE = MAX(0,EDGE_COUNT(NM))
             GPU_GRDD_EXTERNAL_WALL_1D = (N_EXTERNAL_WALL_CELLS + N_INTERNAL_WALL_CELLS + GPU_BLKD_1D - 1) / GPU_BLKD_1D
@@ -422,6 +833,9 @@ MODULE G_INIT
         ! Per-mesh GPU state allocation and initial H2D transfer
         !--------------------------------------------------------------------------
         SUBROUTINE INIT_GPU_VALUES(NM)
+            USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
+            USE GLOBAL_CONSTANTS, ONLY: TWO_D,CYLINDRICAL
+            USE PRECISION_PARAMETERS, ONLY: PI
             IMPLICIT NONE
             INTEGER , INTENT(IN) :: NM
             INTEGER :: IW , III ,JJJ ,KKK , ISTAT, N, NR, N_CELL_BLOCKS, N_WALL_BLOCKS
@@ -441,6 +855,8 @@ MODULE G_INIT
                                       SPECIES_RCON_H(:)
             REAL(EB), ALLOCATABLE :: SF_M_DOT_G_PP_ADJUST_FAC_H(:), SF_M_DOT_G_PP_ACTUAL_FAC_H(:)
             REAL(EB), ALLOCATABLE :: SF_TMP_IGN_H(:), SF_TMP_EXT_H(:), SF_H_V_H(:)
+            REAL(EB), ALLOCATABLE :: SF_TMP_GAS_FRONT_H(:), SF_T_IGN_H(:)
+            INTEGER, ALLOCATABLE :: SF_RAMP_TGF_INDEX_H(:),SF_RAMP_H_FIXED_INDEX_H(:)
             REAL(EB), ALLOCATABLE :: SF_HRRPUA_END_VALUE_H(:,:)
             REAL(EB), ALLOCATABLE :: SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL_H(:),SF_MINIMUM_SCALING_HEAT_FLUX_H(:), &
                                       SF_MAXIMUM_SCALING_HEAT_FLUX_H(:),SF_SPYRO_TH_FACTOR_H(:,:)
@@ -534,7 +950,11 @@ MODULE G_INIT
             RAMP_DATA_TOTAL = 0
             IF (RAMP_UB > 0) THEN
                 DO NR=1,RAMP_UB
-                    IF (ALLOCATED(RAMPS(NR)%INTERPOLATED_DATA)) RAMP_DATA_TOTAL = RAMP_DATA_TOTAL + SIZE(RAMPS(NR)%INTERPOLATED_DATA)
+                    IF (RAMP_SET_ON_HOST(NR)) THEN
+                        RAMP_DATA_TOTAL = RAMP_DATA_TOTAL + 1
+                    ELSEIF (ALLOCATED(RAMPS(NR)%INTERPOLATED_DATA)) THEN
+                        RAMP_DATA_TOTAL = RAMP_DATA_TOTAL + SIZE(RAMPS(NR)%INTERPOLATED_DATA)
+                    ENDIF
                 ENDDO
             ENDIF
 
@@ -557,6 +977,9 @@ MODULE G_INIT
             ALLOCATE(GM%WALL_U_NORMAL(GPU_WALL_LB:GPU_WALL_UB))
             ALLOCATE(GM%WALL_U_NORMAL_S(GPU_WALL_LB:GPU_WALL_UB))
             ALLOCATE(GM%WALL_U_NORMAL_0(GPU_WALL_LB:GPU_WALL_UB))
+            ALLOCATE(GM%WALL_SEM(4,GPU_WALL_LB:GPU_WALL_UB),GM%WALL_SEM_VENT(GPU_WALL_LB:GPU_WALL_UB))
+            GM%WALL_SEM = 0._EB
+            GM%WALL_SEM_VENT = 0
             ALLOCATE(GM%WALL_AREA(GPU_WALL_LB:GPU_WALL_UB))
             ALLOCATE(GM%WALL_AREA_ADJUST(GPU_WALL_LB:GPU_WALL_UB))
             ALLOCATE(GM%WALL_DUNDTD(GPU_WALL_LB:GPU_WALL_UB))
@@ -620,6 +1043,10 @@ MODULE G_INIT
             IF (.NOT.ALLOCATED(SF_TMP_IGN)) ALLOCATE(SF_TMP_IGN(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SF_TMP_EXT)) ALLOCATE(SF_TMP_EXT(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SF_H_V)) ALLOCATE(SF_H_V(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SF_TMP_GAS_FRONT)) ALLOCATE(SF_TMP_GAS_FRONT(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SF_T_IGN)) ALLOCATE(SF_T_IGN(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SF_RAMP_TGF_INDEX)) ALLOCATE(SF_RAMP_TGF_INDEX(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SF_RAMP_H_FIXED_INDEX)) ALLOCATE(SF_RAMP_H_FIXED_INDEX(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL)) &
                 ALLOCATE(SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SF_MINIMUM_SCALING_HEAT_FLUX)) ALLOCATE(SF_MINIMUM_SCALING_HEAT_FLUX(GPU_SURF_LB:GPU_SURF_UB))
@@ -664,6 +1091,9 @@ MODULE G_INIT
             IF (.NOT.ALLOCATED(SURF_ROUGHNESS)) ALLOCATE(SURF_ROUGHNESS(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SURF_VEL_T_1)) ALLOCATE(SURF_VEL_T_1(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SURF_VEL_T_2)) ALLOCATE(SURF_VEL_T_2(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SURF_PROFILE_D)) ALLOCATE(SURF_PROFILE_D(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SURF_RAMP_VPZ_D)) ALLOCATE(SURF_RAMP_VPZ_D(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SURF_VEL_D)) ALLOCATE(SURF_VEL_D(GPU_SURF_LB:GPU_SURF_UB))
 
             ALLOCATE(GM%EDGE_I(GPU_EDGE_LB:GPU_EDGE_UB))
             ALLOCATE(GM%EDGE_J(GPU_EDGE_LB:GPU_EDGE_UB))
@@ -685,6 +1115,10 @@ MODULE G_INIT
             ALLOCATE(GM%EDGE_INTERP_2(GPU_EDGE_LB:GPU_EDGE_UB))
             ALLOCATE(GM%EDGE_GHOST_1(GPU_EDGE_LB:GPU_EDGE_UB))
             ALLOCATE(GM%EDGE_GHOST_2(GPU_EDGE_LB:GPU_EDGE_UB))
+            ALLOCATE(GM%EDGE_CORNER_1(GPU_EDGE_LB:GPU_EDGE_UB))
+            ALLOCATE(GM%EDGE_CORNER_2(GPU_EDGE_LB:GPU_EDGE_UB))
+            GM%EDGE_CORNER_1 = 0._EB
+            GM%EDGE_CORNER_2 = 0._EB
             ALLOCATE(GM%EDGE_EXTERNAL(GPU_EDGE_LB:GPU_EDGE_UB))
             ALLOCATE(GM%EDGE_OMEGA(GPU_EDGE_LB:GPU_EDGE_UB,-2:2))
             ALLOCATE(GM%EDGE_TAU(GPU_EDGE_LB:GPU_EDGE_UB,-2:2))
@@ -763,6 +1197,8 @@ MODULE G_INIT
             ALLOCATE(SF_M_DOT_G_PP_ACTUAL_FAC_H(GPU_SURF_LB:GPU_SURF_UB))
             ALLOCATE(SF_TMP_IGN_H(GPU_SURF_LB:GPU_SURF_UB),SF_TMP_EXT_H(GPU_SURF_LB:GPU_SURF_UB), &
                      SF_H_V_H(GPU_SURF_LB:GPU_SURF_UB))
+            ALLOCATE(SF_TMP_GAS_FRONT_H(GPU_SURF_LB:GPU_SURF_UB),SF_T_IGN_H(GPU_SURF_LB:GPU_SURF_UB), &
+                     SF_RAMP_TGF_INDEX_H(GPU_SURF_LB:GPU_SURF_UB),SF_RAMP_H_FIXED_INDEX_H(GPU_SURF_LB:GPU_SURF_UB))
             ALLOCATE(SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL_H(GPU_SURF_LB:GPU_SURF_UB), &
                      SF_MINIMUM_SCALING_HEAT_FLUX_H(GPU_SURF_LB:GPU_SURF_UB), &
                      SF_MAXIMUM_SCALING_HEAT_FLUX_H(GPU_SURF_LB:GPU_SURF_UB), &
@@ -818,6 +1254,10 @@ MODULE G_INIT
                 SF_TMP_IGN_H(IW) = SURFACE(IW)%TMP_IGN
                 SF_TMP_EXT_H(IW) = SURFACE(IW)%TMP_EXT
                 SF_H_V_H(IW) = SURFACE(IW)%H_V
+                SF_TMP_GAS_FRONT_H(IW) = SURFACE(IW)%TMP_GAS_FRONT
+                SF_T_IGN_H(IW) = SURFACE(IW)%T_IGN
+                SF_RAMP_TGF_INDEX_H(IW) = SURFACE(IW)%RAMP(TIME_TGF)%INDEX
+                SF_RAMP_H_FIXED_INDEX_H(IW) = SURFACE(IW)%RAMP_H_FIXED_INDEX
                 SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL_H(IW) = SURFACE(IW)%REFERENCE_HEAT_FLUX_TIME_INTERVAL
                 SF_MINIMUM_SCALING_HEAT_FLUX_H(IW) = SURFACE(IW)%MINIMUM_SCALING_HEAT_FLUX
                 SF_MAXIMUM_SCALING_HEAT_FLUX_H(IW) = SURFACE(IW)%MAXIMUM_SCALING_HEAT_FLUX
@@ -890,6 +1330,11 @@ MODULE G_INIT
             SF_TMP_IGN = SF_TMP_IGN_H
             SF_TMP_EXT = SF_TMP_EXT_H
             SF_H_V = SF_H_V_H
+            SF_TMP_GAS_FRONT = SF_TMP_GAS_FRONT_H
+            SF_T_IGN = SF_T_IGN_H
+            SF_RAMP_TGF_INDEX = SF_RAMP_TGF_INDEX_H
+            SF_RAMP_H_FIXED_INDEX = SF_RAMP_H_FIXED_INDEX_H
+            DEALLOCATE(SF_TMP_GAS_FRONT_H,SF_T_IGN_H,SF_RAMP_TGF_INDEX_H,SF_RAMP_H_FIXED_INDEX_H)
             SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL = SF_REFERENCE_HEAT_FLUX_TIME_INTERVAL_H
             SF_MINIMUM_SCALING_HEAT_FLUX = SF_MINIMUM_SCALING_HEAT_FLUX_H
             SF_MAXIMUM_SCALING_HEAT_FLUX = SF_MAXIMUM_SCALING_HEAT_FLUX_H
@@ -915,6 +1360,20 @@ MODULE G_INIT
             SURF_ROUGHNESS         = SURF_ROUGHNESS_H
             SURF_VEL_T_1           = SURF_VEL_T_1_H
             SURF_VEL_T_2           = SURF_VEL_T_2_H
+            ! Through contiguous host arrays: a device assignment from a strided section of a derived-type component
+            ! (SURFACE(:)%VEL) copies the wrong memory with nvfortran.
+            BLOCK
+                INTEGER :: VPZ_H(GPU_SURF_LB:GPU_SURF_UB),PROF_H(GPU_SURF_LB:GPU_SURF_UB)
+                REAL(EB) :: VEL_H(GPU_SURF_LB:GPU_SURF_UB)
+                DO IW=GPU_SURF_LB,GPU_SURF_UB
+                    VPZ_H(IW)  = SURFACE(IW)%RAMP(VELO_PROF_Z)%INDEX
+                    PROF_H(IW) = SURFACE(IW)%PROFILE
+                    VEL_H(IW)  = SURFACE(IW)%VEL
+                ENDDO
+                SURF_RAMP_VPZ_D = VPZ_H
+                SURF_PROFILE_D  = PROF_H
+                SURF_VEL_D      = VEL_H
+            END BLOCK
 
             DEALLOCATE(SF_TMP_FRONT_H, SF_H_FIXED_H, SF_CONV_LENGTH_H, SF_EXTERNAL_FLUX_H, STAT=ISTAT)
             DEALLOCATE(SF_CONVECTIVE_HEAT_FLUX_H, SF_NET_HEAT_FLUX_H, STAT=ISTAT)
@@ -1023,6 +1482,9 @@ MODULE G_INIT
             WALL_M_DOT_G_PP_ACTUAL_H = 0._EB
             IF (N_TOTAL_SCALARS >= 1) WALL_ZZ_F_H(:,1) = 1._EB
 
+            ! WALL(0) is the dummy wall of a missing wall cell (init.f90: NULL_BOUNDARY, DEFAULT_SURF_INDEX); velo.f90 reads
+            ! its SURFace in VELOCITY_BC, so keep the same surface index here.
+            IF (GPU_WALL_LB<=0) WALL_SF_INDEX_H(0) = WALL(0)%SURF_INDEX
             DO IW = 1, GPU_WALL_UB
                 WALL_SF_INDEX_H(IW) = WALL(IW)%SURF_INDEX
                 WALL_TOPO_AOS_H(IW)%BOUNDARY_TYPE = WALL(IW)%BOUNDARY_TYPE
@@ -1205,8 +1667,21 @@ MODULE G_INIT
             RAMP_RDT_H = 0._EB
             RAMP_INTERP_H = 1._EB
             RAMP_OFFSET = 1
+            IF (ALLOCATED(GPU_HOST_RAMP_SLOT)) DEALLOCATE(GPU_HOST_RAMP_SLOT,GPU_HOST_RAMP_VALUE)
+            ALLOCATE(GPU_HOST_RAMP_SLOT(MAX(1,RAMP_UB)),GPU_HOST_RAMP_VALUE(MAX(1,RAMP_UB)))
+            GPU_HOST_RAMP_SLOT = 0
+            GPU_HOST_RAMP_VALUE = 0._EB
             IF (RAMP_UB > 0) THEN
                 DO NR=1,RAMP_UB
+                    IF (RAMP_SET_ON_HOST(NR)) THEN
+                        ! Zero span: EVALUATE_RAMP_DEVICE always reads RAMP_INTERP_D(RAMP_OFFSET_D(NR)).
+                        RAMP_OFFSET_H(NR) = RAMP_OFFSET
+                        GPU_HOST_RAMP_SLOT(NR) = RAMP_OFFSET
+                        GPU_HOST_RAMP_VALUE(NR) = EVALUATE_RAMP(0._EB,NR)
+                        RAMP_INTERP_H(RAMP_OFFSET) = GPU_HOST_RAMP_VALUE(NR)
+                        RAMP_OFFSET = RAMP_OFFSET + 1
+                        CYCLE
+                    ENDIF
                     IF (.NOT.ALLOCATED(RAMPS(NR)%INTERPOLATED_DATA)) CYCLE
                     RAMP_NPOINTS_H(NR) = UBOUND(RAMPS(NR)%INTERPOLATED_DATA,1)
                     RAMP_OFFSET_H(NR) = RAMP_OFFSET
@@ -1401,11 +1876,41 @@ MODULE G_INIT
             !--------------------------------------------------------------------
             ! Stage 6: persistent field and table device arrays
             !--------------------------------------------------------------------
-            ALLOCATE(GM%ZZD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
-            ALLOCATE(GM%ZZSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
+            ALLOCATE(GM%ZZD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,N_TOTAL_SCALARS)) ; GM%ZZD = 0._EB
+            ALLOCATE(GM%ZZSD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,N_TOTAL_SCALARS)) ; GM%ZZSD = 0._EB
             ALLOCATE(GM%FXD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
             ALLOCATE(GM%FYD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
             ALLOCATE(GM%FZD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
+            IF (STORE_SPECIES_FLUX) THEN
+                ALLOCATE(GM%ADV_FXD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%ADV_FXD = 0._EB
+                ALLOCATE(GM%ADV_FYD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%ADV_FYD = 0._EB
+                ALLOCATE(GM%ADV_FZD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%ADV_FZD = 0._EB
+                ALLOCATE(GM%DIF_FXD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FXD = 0._EB
+                ALLOCATE(GM%DIF_FYD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FYD = 0._EB
+                ALLOCATE(GM%DIF_FZD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FZD = 0._EB
+                ALLOCATE(GM%DIF_FXSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FXSD = 0._EB
+                ALLOCATE(GM%DIF_FYSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FYSD = 0._EB
+                ALLOCATE(GM%DIF_FZSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FZSD = 0._EB
+                BLOCK
+                    INTEGER, ALLOCATABLE :: THIN_NEG_H(:)
+                    INTEGER :: IW_T
+                    ALLOCATE(THIN_NEG_H(0:MAX(0,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS)))
+                    THIN_NEG_H = 0
+                    DO IW_T=1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
+                        IF (WALL(IW_T)%BC_INDEX<=0) CYCLE
+                        IF (WALL(IW_T)%THIN .AND. BOUNDARY_COORD(WALL(IW_T)%BC_INDEX)%IOR<0) THIN_NEG_H(IW_T) = 1
+                    ENDDO
+                    ALLOCATE(GM%WALL_THIN_NEG_D(0:UBOUND(THIN_NEG_H,1)))
+                    GM%WALL_THIN_NEG_D = THIN_NEG_H
+                    DEALLOCATE(THIN_NEG_H)
+                END BLOCK
+            ENDIF
+            ! FDS 6.11.1 (92299c9b7a): the face values are initialized (RHOA*ZZ0) and enter INTERPOLATED_BC
+            DO N=1,N_TOTAL_SCALARS
+                GM%FXD(:,:,:,N) = MESHES(NM)%FX(:,:,:,N)
+                GM%FYD(:,:,:,N) = MESHES(NM)%FY(:,:,:,N)
+                GM%FZD(:,:,:,N) = MESHES(NM)%FZ(:,:,:,N)
+            ENDDO
             ALLOCATE(GM%SWORK1D(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
             ALLOCATE(GM%SWORK2D(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
             ALLOCATE(GM%SWORK3D(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
@@ -1414,18 +1919,18 @@ MODULE G_INIT
                 ALLOCATE(GM%FX0D(0:IBP1,0:JBP1,0:KBP1,1:1))
                 ALLOCATE(GM%FY0D(0:IBP1,0:JBP1,0:KBP1,1:1))
                 ALLOCATE(GM%FZ0D(0:IBP1,0:JBP1,0:KBP1,1:1))
-                ALLOCATE(GM%RHO_RMWD(0:IBP1,0:JBP1,0:KBP1))
+                ALLOCATE(GM%RHO_RMWD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1)) ; GM%RHO_RMWD = 0._EB
             ENDIF
             ALLOCATE(GM%DEL_RHO_D_DEL_ZD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS))
             ALLOCATE(GM%M_DOT_PPPD(0:IBP1,0:JBP1,0:KBP1,N_TRACKED_SPECIES))
 
-            ALLOCATE(GM%UD(0:IBP1,0:JBP1,0:KBP1))
-            ALLOCATE(GM%VD(0:IBP1,0:JBP1,0:KBP1))
-            ALLOCATE(GM%WD(0:IBP1,0:JBP1,0:KBP1))
+            ALLOCATE(GM%UD(-1:IBP1,0:JBP1,0:KBP1)) ; GM%UD = 0._EB
+            ALLOCATE(GM%VD(0:IBP1,-1:JBP1,0:KBP1)) ; GM%VD = 0._EB
+            ALLOCATE(GM%WD(0:IBP1,0:JBP1,-1:KBP1)) ; GM%WD = 0._EB
 
-            ALLOCATE(GM%USD(0:IBP1,0:JBP1,0:KBP1))
-            ALLOCATE(GM%VSD(0:IBP1,0:JBP1,0:KBP1))
-            ALLOCATE(GM%WSD(0:IBP1,0:JBP1,0:KBP1))
+            ALLOCATE(GM%USD(-1:IBP1,0:JBP1,0:KBP1)) ; GM%USD = 0._EB
+            ALLOCATE(GM%VSD(0:IBP1,-1:JBP1,0:KBP1)) ; GM%VSD = 0._EB
+            ALLOCATE(GM%WSD(0:IBP1,0:JBP1,-1:KBP1)) ; GM%WSD = 0._EB
             ALLOCATE(GM%DS_D(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%D_D(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%FVXD(0:IBP1,0:JBP1,0:KBP1))
@@ -1439,15 +1944,21 @@ MODULE G_INIT
             ALLOCATE(GM%HD(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%HSD(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%PRHSD(IBP1,JBP1,KBP1))
-            ALLOCATE(GM%BXSD(LBOUND(BXS,1):UBOUND(BXS,1),LBOUND(BXS,2):UBOUND(BXS,2)))
-            ALLOCATE(GM%BXFD(LBOUND(BXF,1):UBOUND(BXF,1),LBOUND(BXF,2):UBOUND(BXF,2)))
-            ALLOCATE(GM%BYSD(LBOUND(BYS,1):UBOUND(BYS,1),LBOUND(BYS,2):UBOUND(BYS,2)))
-            ALLOCATE(GM%BYFD(LBOUND(BYF,1):UBOUND(BYF,1),LBOUND(BYF,2):UBOUND(BYF,2)))
-            ALLOCATE(GM%BZSD(LBOUND(BZS,1):UBOUND(BZS,1),LBOUND(BZS,2):UBOUND(BZS,2)))
-            ALLOCATE(GM%BZFD(LBOUND(BZF,1):UBOUND(BZF,1),LBOUND(BZF,2):UBOUND(BZF,2)))
+            ! With FREEZE_VELOCITY=T FDS does not initialise the Poisson solver (init.f90), so SAVE1 and the
+            ! boundary arrays BXS..BZF do not exist and the pressure is never solved.
+            IF (ALLOCATED(MESHES(NM)%BXS)) THEN
+                ALLOCATE(GM%BXSD(LBOUND(BXS,1):UBOUND(BXS,1),LBOUND(BXS,2):UBOUND(BXS,2)))
+                ALLOCATE(GM%BXFD(LBOUND(BXF,1):UBOUND(BXF,1),LBOUND(BXF,2):UBOUND(BXF,2)))
+                ALLOCATE(GM%BYSD(LBOUND(BYS,1):UBOUND(BYS,1),LBOUND(BYS,2):UBOUND(BYS,2)))
+                ALLOCATE(GM%BYFD(LBOUND(BYF,1):UBOUND(BYF,1),LBOUND(BYF,2):UBOUND(BYF,2)))
+                ALLOCATE(GM%BZSD(LBOUND(BZS,1):UBOUND(BZS,1),LBOUND(BZS,2):UBOUND(BZS,2)))
+                ALLOCATE(GM%BZFD(LBOUND(BZF,1):UBOUND(BZF,1),LBOUND(BZF,2):UBOUND(BZF,2)))
+            ELSE
+                ALLOCATE(GM%BXSD(1,1),GM%BXFD(1,1),GM%BYSD(1,1),GM%BYFD(1,1),GM%BZSD(1,1),GM%BZFD(1,1))
+            ENDIF
 
-            ALLOCATE(GM%RHOD(0:IBP1,0:JBP1,0:KBP1))
-            ALLOCATE(GM%RHOSD(0:IBP1,0:JBP1,0:KBP1))
+            ALLOCATE(GM%RHOD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1)) ; GM%RHOD = RHOA
+            ALLOCATE(GM%RHOSD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1)) ; GM%RHOSD = RHOA
             ALLOCATE(GM%RSUMD(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%QD(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%QRD(0:IBP1,0:JBP1,0:KBP1))
@@ -1459,7 +1970,7 @@ MODULE G_INIT
             ALLOCATE(GM%MU_DNSD(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%KRESD(0:IBP1,0:JBP1,0:KBP1))
 
-            ALLOCATE(GM%TMPD(0:IBP1,0:JBP1,0:KBP1))
+            ALLOCATE(GM%TMPD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1)) ; GM%TMPD = TMPA
 
             IF (.NOT.ALLOCATED(MU_RSQMW_ZD)) ALLOCATE(MU_RSQMW_ZD(0:I_MAX_TEMP,N_TOTAL_SCALARS))
             IF (.NOT.ALLOCATED(K_RSQMW_ZD)) ALLOCATE(K_RSQMW_ZD(0:I_MAX_TEMP,N_TOTAL_SCALARS))
@@ -1490,6 +2001,10 @@ MODULE G_INIT
             ALLOCATE(GM%WORK10D(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%WORK11D(0:IBP1,0:JBP1,0:KBP1))
             ALLOCATE(GM%WORK12D(0:IBP1,0:JBP1,0:KBP1))
+            ALLOCATE(GM%WORK_PADD(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1)) ; GM%WORK_PADD = 0._EB
+            ALLOCATE(GM%WORK_UD(-1:IBP1,0:JBP1,0:KBP1)) ; GM%WORK_UD = 0._EB
+            ALLOCATE(GM%WORK_VD(0:IBP1,-1:JBP1,0:KBP1)) ; GM%WORK_VD = 0._EB
+            ALLOCATE(GM%WORK_WD(0:IBP1,0:JBP1,-1:KBP1)) ; GM%WORK_WD = 0._EB
 
             ALLOCATE(GM%PBAR_SD(0:KBP1,0:N_ZONE))
             ALLOCATE(GM%PBARD(0:KBP1,0:N_ZONE))
@@ -1562,6 +2077,17 @@ MODULE G_INIT
             DO N=LBOUND(D_Z,2),UBOUND(D_Z,2)
                 D_Z_TABLED(:,N) = D_Z(:,N)
             ENDDO
+            IF (.NOT.ALLOCATED(SPECIES_SC_FAC_D)) THEN
+                BLOCK
+                    REAL(EB) :: SC_FAC(N_TRACKED_SPECIES)
+                    DO N=1,N_TRACKED_SPECIES
+                        SC_FAC(N) = 1._EB
+                        IF (SPECIES_MIXTURE(N)%SC_T_USER>TWENTY_EPSILON_EB) SC_FAC(N) = SC/SPECIES_MIXTURE(N)%SC_T_USER
+                    ENDDO
+                    ALLOCATE(SPECIES_SC_FAC_D(N_TRACKED_SPECIES))
+                    SPECIES_SC_FAC_D = SC_FAC
+                END BLOCK
+            ENDIF
             DO N=LBOUND(MU_RSQMW_Z,2),UBOUND(MU_RSQMW_Z,2)
                 MU_RSQMW_ZD(:,N) = MU_RSQMW_Z(:,N)
             ENDDO
@@ -1591,6 +2117,15 @@ MODULE G_INIT
             ALLOCATE(GM%DUMP%DEVC_PARTIAL_D(N_CELL_BLOCKS),GM%DUMP%DEVC_RESULT_D(MAX(1,N_DEVC)), &
                      GM%DUMP%DEVC_RESULT_H(MAX(1,N_DEVC)))
             ALLOCATE(GM%DUMP%SMOKE_PACK_D(IBP1*JBP1*KBP1),GM%DUMP%SMOKE_PACK_H(IBP1*JBP1*KBP1))
+            BLOCK
+                REAL(EB) :: JFAC_H(0:JBP1)
+                ALLOCATE(GM%DUMP%RC_D(0:IBP1),GM%DUMP%JFAC_D(0:JBP1))
+                GM%DUMP%RC_D = RC(0:IBP1)
+                JFAC_H = 1._EB
+                IF (TWO_D)       JFAC_H = JFAC_H/DY(0:JBP1)
+                IF (CYLINDRICAL) JFAC_H = JFAC_H*2._EB*PI
+                GM%DUMP%JFAC_D = JFAC_H
+            END BLOCK
 
             K3DTD = K3DT
             LES_FILTER_WIDTHD = LES_FILTER_WIDTH
@@ -1603,10 +2138,11 @@ MODULE G_INIT
             DXD = DX ; DYD = DY ; DZD = DZ
             HXD = HX ; HYD = HY ; HZD = HZ
 
-            TWO_EPSILON_EBD = TWO_EPSILON_EB
+            TWENTY_EPSILON_EBD = TWENTY_EPSILON_EB
             VON_KARMAN_CONSTANTD = VON_KARMAN_CONSTANT
             Y_WERNER_WENGLED     = Y_WERNER_WENGLE
 
+            IF (ALLOCATED(MESHES(NM)%BXS)) THEN
             DO N=LBOUND(BXS,2),UBOUND(BXS,2)
                 BXSD(:,N) = BXS(:,N)
                 BXFD(:,N) = BXF(:,N)
@@ -1619,6 +2155,7 @@ MODULE G_INIT
                 BZSD(:,N) = BZS(:,N)
                 BZFD(:,N) = BZF(:,N)
             ENDDO
+            ENDIF
 
             IF (N_EDGE_AXIS1 > 0) EDGE_AXIS1_LIST(1:N_EDGE_AXIS1) = EDGE_AXIS1_LIST_H(1:N_EDGE_AXIS1)
             IF (N_EDGE_AXIS2 > 0) EDGE_AXIS2_LIST(1:N_EDGE_AXIS2) = EDGE_AXIS2_LIST_H(1:N_EDGE_AXIS2)
@@ -1800,7 +2337,7 @@ MODULE G_INIT
             FVZ_BD = FVZ_B
             PRHSD = 0._EB
 
-            CALL INITIALIZE_GPU_POISSON_SOLVER(NM,DX(1),DY(1),DZ(1),LBC,MBC,NBC,SAVE1)
+            IF (ALLOCATED(MESHES(NM)%SAVE1)) CALL INITIALIZE_GPU_POISSON_SOLVER(NM,DX(1),DY(1),DZ(1),LBC,MBC,NBC,SAVE1)
             GM => GPU_MESHES(NM)
             GM%INITIALIZED = .TRUE.
 

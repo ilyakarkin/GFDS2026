@@ -239,7 +239,7 @@ SELECT_TURB: SELECT CASE (TURB_MODEL)
                   + B_IJ(1,1)*B_IJ(3,3) - B_IJ(1,3)**2 &
                   + B_IJ(2,2)*B_IJ(3,3) - B_IJ(2,3)**2    ! Vreman, Eq. (8)
 
-               IF (ABS(AA)>TWO_EPSILON_EB .AND. BB>TWO_EPSILON_EB) THEN
+               IF (ABS(AA)>TWENTY_EPSILON_EB .AND. BB>TWENTY_EPSILON_EB) THEN
                   NU_EDDY = C_VREMAN*SQRT(BB/AA)  ! Vreman, Eq. (5)
                ELSE
                   NU_EDDY=0._EB
@@ -842,8 +842,8 @@ ENDDO
 
 IF (OPEN_WIND_BOUNDARY) CALL COMPUTE_WIND_COMPONENTS(T,NM)
 
-IF (ANY(ABS(FVEC)>TWO_EPSILON_EB) .OR. CTRL_DIRECT_FORCE) CALL DIRECT_FORCE        ! Direct force
-IF (ANY(ABS(OVEC)>TWO_EPSILON_EB))                        CALL CORIOLIS_FORCE      ! Coriolis force
+IF (ANY(ABS(FVEC)>TWENTY_EPSILON_EB) .OR. CTRL_DIRECT_FORCE) CALL DIRECT_FORCE        ! Direct force
+IF (ANY(ABS(OVEC)>TWENTY_EPSILON_EB))                        CALL CORIOLIS_FORCE      ! Coriolis force
 IF (PATCH_VELOCITY)                                       CALL PATCH_VELOCITY_FLUX ! Specified patch velocity
 IF (PERIODIC_TEST==7)                                     CALL MMS_VELOCITY_FLUX   ! Source term in manufactured solution
 IF (PERIODIC_TEST==21 .OR. PERIODIC_TEST==22 .OR. PERIODIC_TEST==23) CALL ROTATED_CUBE_VELOCITY_FLUX(NM,T)
@@ -889,7 +889,7 @@ ELSE
    COS_THETA = 1._EB
 ENDIF
 
-IF (ABS(FVEC(1))>TWO_EPSILON_EB) THEN
+IF (ABS(FVEC(1))>TWENTY_EPSILON_EB) THEN
    IF (I_RAMP_FVX_T>0) THEN
       TIME_RAMP_FACTOR = EVALUATE_RAMP(T,I_RAMP_FVX_T)
    ELSEIF (I_RAMP_PGF_T>0) THEN
@@ -910,7 +910,7 @@ IF (ABS(FVEC(1))>TWO_EPSILON_EB) THEN
    !$OMP END PARALLEL DO
 ENDIF
 
-IF (ABS(FVEC(2))>TWO_EPSILON_EB) THEN
+IF (ABS(FVEC(2))>TWENTY_EPSILON_EB) THEN
    IF (I_RAMP_FVY_T>0) THEN
       TIME_RAMP_FACTOR = EVALUATE_RAMP(T,I_RAMP_FVY_T)
    ELSEIF (I_RAMP_PGF_T>0) THEN
@@ -931,7 +931,7 @@ IF (ABS(FVEC(2))>TWO_EPSILON_EB) THEN
    !$OMP END PARALLEL DO
 ENDIF
 
-IF (ABS(FVEC(3))>TWO_EPSILON_EB) THEN
+IF (ABS(FVEC(3))>TWENTY_EPSILON_EB) THEN
    IF (I_RAMP_FVZ_T>0) THEN
       TIME_RAMP_FACTOR = EVALUATE_RAMP(T,I_RAMP_FVZ_T)
    ELSEIF (I_RAMP_PGF_T>0) THEN
@@ -1265,7 +1265,7 @@ GZ  = EVALUATE_RAMP(T,I_RAMP_GZ)*GVEC(3)
 
 ! Compute r-direction flux term FVX
 
-IF (ABS(XS)<=TWO_EPSILON_EB) THEN
+IF (ABS(XS)<=TWENTY_EPSILON_EB) THEN
    I0 = 1
 ELSE
    I0 = 0
@@ -1677,7 +1677,7 @@ T_USED(4)=T_USED(4)+CURRENT_TIME()-T_NOW
 
 CALL CHECK_STABILITY(DT,DT_NEW,T,NM)
 
-IF (DT_NEW(NM)<DT_INITIAL*LIMITING_DT_RATIO .AND. (T+DT_NEW(NM)<(T_END-TWO_EPSILON_EB))) STOP_STATUS = INSTABILITY_STOP
+IF (DT_NEW(NM)<DT_INITIAL*LIMITING_DT_RATIO .AND. (T+DT_NEW(NM)<(T_END-TWENTY_EPSILON_EB))) STOP_STATUS = INSTABILITY_STOP
 
 
 END SUBROUTINE VELOCITY_PREDICTOR
@@ -1815,18 +1815,21 @@ LOGICAL, INTENT(IN) :: APPLY_TO_ESTIMATED_VARIABLES
 REAL(EB) :: MUA,TSI,WGT,T_NOW,RAMP_T,OMW,MU_WALL,RHO_WALL,SLIP_COEF,VEL_T, &
             UUP(2),UUM(2),DXX(2),MU_DUIDXJ(-2:2),DUIDXJ(-2:2),PROFILE_FACTOR,VEL_GAS,VEL_GHOST, &
             MU_DUIDXJ_USE(2),DUIDXJ_USE(2),VEL_EDDY,U_TAU,Y_PLUS,U_NORM,U_WIND_LOC,V_WIND_LOC,W_WIND_LOC,&
-            DRAG_FACTOR,HT_SCALE_FACTOR,VEG_HT
-INTEGER :: NOM(2),IIO(2),JJO(2),KKO(2),IE,II,JJ,KK,IEC,IOR,IWM,IWP,ICMM,ICMP,ICPM,ICPP,ICD,ICDO,IVL,I_SGN, &
+            DRAG_FACTOR,HT_SCALE_FACTOR,VEG_HT,UN_OTHER
+INTEGER :: NOM(2),IIO(2),JJO(2),KKO(2),IE,IIOO,JJOO,KKOO,II,JJ,KK,IEC,IOR,IW,IWM,IWP,ICMM,ICMP,ICPM,ICPP,ICD,ICDO,IVL,I_SGN, &
            VELOCITY_BC_INDEX,IIGM,JJGM,KKGM,IIGP,JJGP,KKGP,SURF_INDEXM,SURF_INDEXP,ITMP,ICD_SGN,ICDO_SGN, &
-           BOUNDARY_TYPE_M,BOUNDARY_TYPE_P,IS,IS2,IWPI,IWMI,VENT_INDEX
+           BOUNDARY_TYPE_M,BOUNDARY_TYPE_P,IS,IS2,IWPI,IWMI,VENT_INDEX,N_INT_CELLS
 LOGICAL :: ALTERED_GRADIENT(-2:2),SYNTHETIC_EDDY_METHOD,HVAC_TANGENTIAL,INTERPOLATED_EDGE,&
            UPWIND_BOUNDARY,INFLOW_BOUNDARY
 REAL(EB), POINTER, DIMENSION(:,:,:) :: UU,VV,WW,RHOP,VEL_OTHER
 REAL(EB), POINTER, DIMENSION(:,:,:,:) :: ZZP
 TYPE (OMESH_TYPE), POINTER :: OM
 TYPE (VENTS_TYPE), POINTER :: VT
-TYPE (WALL_TYPE), POINTER :: WCM,WCP,WCX
+TYPE (WALL_TYPE), POINTER :: WC,WCM,WCP,WCX
+TYPE (EXTERNAL_WALL_TYPE), POINTER :: EWC
+REAL(EB), POINTER, DIMENSION(:,:,:) :: OM_UU,OM_VV,OM_WW
 TYPE (BOUNDARY_PROP1_TYPE), POINTER :: WCM_B1,WCP_B1,WCX_B1
+TYPE (BOUNDARY_COORD_TYPE), POINTER :: BC
 TYPE (EDGE_TYPE), POINTER :: ED
 TYPE(SURFACE_TYPE), POINTER :: SF
 
@@ -1856,6 +1859,50 @@ ELSE
    ZZP => ZZ
 ENDIF
 
+! FDS 6.11.1 (3825fb9dd2, 6385fa6513)
+! Transfer from neighboring mesh the normal component of velocity that is one grid cell beyond external boundary
+
+WALL_LOOP: DO IW=1,N_EXTERNAL_WALL_CELLS
+   WC =>WALL(IW)
+   EWC=>EXTERNAL_WALL(IW)
+   IF (EWC%NOM==0) CYCLE WALL_LOOP
+   IF (APPLY_TO_ESTIMATED_VARIABLES) THEN
+      OM_UU => OMESH(EWC%NOM)%US
+      OM_VV => OMESH(EWC%NOM)%VS
+      OM_WW => OMESH(EWC%NOM)%WS
+   ELSE
+      OM_UU => OMESH(EWC%NOM)%U
+      OM_VV => OMESH(EWC%NOM)%V
+      OM_WW => OMESH(EWC%NOM)%W
+   ENDIF
+   BC => BOUNDARY_COORD(WC%BC_INDEX)
+   UN_OTHER = 0._EB
+   DO KKOO=EWC%KKO_MIN,EWC%KKO_MAX
+      DO JJOO=EWC%JJO_MIN,EWC%JJO_MAX
+         DO IIOO=EWC%IIO_MIN,EWC%IIO_MAX
+            SELECT CASE(BC%IOR)
+               CASE(-1) ; UN_OTHER = UN_OTHER + OM_UU(IIOO  ,JJOO  ,KKOO  )
+               CASE( 1) ; UN_OTHER = UN_OTHER + OM_UU(IIOO-1,JJOO  ,KKOO  )
+               CASE(-2) ; UN_OTHER = UN_OTHER + OM_VV(IIOO  ,JJOO  ,KKOO  )
+               CASE( 2) ; UN_OTHER = UN_OTHER + OM_VV(IIOO  ,JJOO-1,KKOO  )
+               CASE(-3) ; UN_OTHER = UN_OTHER + OM_WW(IIOO  ,JJOO  ,KKOO  )
+               CASE( 3) ; UN_OTHER = UN_OTHER + OM_WW(IIOO  ,JJOO  ,KKOO-1)
+            END SELECT
+         ENDDO
+      ENDDO
+   ENDDO
+   N_INT_CELLS = (EWC%IIO_MAX-EWC%IIO_MIN+1) * (EWC%JJO_MAX-EWC%JJO_MIN+1) * (EWC%KKO_MAX-EWC%KKO_MIN+1)
+   UN_OTHER = UN_OTHER/REAL(N_INT_CELLS,EB)
+   SELECT CASE(BC%IOR)
+      CASE(-1) ; UU(BC%II  ,BC%JJ,BC%KK) = UN_OTHER
+      CASE( 1) ; UU(BC%II-1,BC%JJ,BC%KK) = UN_OTHER
+      CASE(-2) ; VV(BC%II,BC%JJ  ,BC%KK) = UN_OTHER
+      CASE( 2) ; VV(BC%II,BC%JJ-1,BC%KK) = UN_OTHER
+      CASE(-3) ; WW(BC%II,BC%JJ,BC%KK  ) = UN_OTHER
+      CASE( 3) ; WW(BC%II,BC%JJ,BC%KK-1) = UN_OTHER
+   END SELECT
+ENDDO WALL_LOOP
+
 DRAG_UVWMAX = 0._EB
 
 ! Loop over all cell edges and determine the appropriate velocity BCs
@@ -1866,6 +1913,9 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
 
    ED%OMEGA    = -1.E6_EB
    ED%TAU      = -1.E6_EB
+   ED%U_AVG    = -1.E6_EB
+   ED%V_AVG    = -1.E6_EB
+   ED%W_AVG    = -1.E6_EB
    INTERPOLATED_EDGE = .FALSE.
 
    ! Throw out edges that are completely surrounded by blockages or the exterior of the domain
@@ -2296,7 +2346,7 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
                ELSE
                   TSI=T-SF%T_IGN
                ENDIF
-               IF (SF%PROFILE/=0 .AND. SF%VEL>TWO_EPSILON_EB) &
+               IF (SF%PROFILE/=0 .AND. SF%VEL>TWENTY_EPSILON_EB) &
                   PROFILE_FACTOR = ABS(0.5_EB*(WCM_B1%U_NORMAL_0+WCP_B1%U_NORMAL_0)/SF%VEL)
                IF (SF%RAMP(VELO_PROF_Z)%INDEX>0) PROFILE_FACTOR = EVALUATE_RAMP(ZC(KK),SF%RAMP(VELO_PROF_Z)%INDEX)
                RAMP_T = EVALUATE_RAMP(TSI,SF%RAMP(TIME_VELO)%INDEX,TAU=SF%RAMP(TIME_VELO)%TAU)
@@ -2325,23 +2375,26 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
 
                CASE (WALL_MODEL_BC) BOUNDARY_CONDITION
 
-                  ITMP = MIN(I_MAX_TEMP,NINT(0.5_EB*(TMP(IIGM,JJGM,KKGM)+TMP(IIGP,JJGP,KKGP))))
-                  MU_WALL = MU_RSQMW_Z(ITMP,1)/RSQ_MW_Z(1)
-                  RHO_WALL = 0.5_EB*( RHOP(IIGM,JJGM,KKGM) + RHOP(IIGP,JJGP,KKGP) )
-
-                  CALL WALL_MODEL(SLIP_COEF,U_TAU,Y_PLUS,MU_WALL/RHO_WALL,SF%ROUGHNESS,0.5_EB*DXX(ICD),VEL_GAS-VEL_T)
-
                   ! SLIP_COEF = -1, no slip,   VEL_GHOST = 2*VEL_T - VEL_GAS
                   ! SLIP_COEF =  0, half slip, VEL_GHOST = VEL_T
                   ! SLIP_COEF =  1, free slip, VEL_GHOST = VEL_GAS
 
-                  IF ((IWM==0.OR.IWP==0) .AND. .NOT.ED%EXTERNAL) SLIP_COEF = 0._EB  ! Corner
-                  VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
-                  DUIDXJ(ICD_SGN) = I_SGN*(VEL_GAS-VEL_GHOST)/DXX(ICD)
-                  MU_DUIDXJ(ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,DUIDXJ(ICD_SGN))
+                  ! FDS 4218ee295b (+15cca3a6a8): at a convex OBST corner use no-slip with molecular MUA
+                  ! instead of half-slip with wall-model stress; WALL_MODEL is not called there.
+                  IF ((IWM==0.OR.IWP==0) .AND. .NOT.ED%EXTERNAL) THEN  ! Special case for a corner
+                     VEL_GHOST = 2._EB*VEL_T - VEL_GAS
+                     DUIDXJ(ICD_SGN) = I_SGN*(VEL_GAS-VEL_GHOST)/DXX(ICD)
+                     MU_DUIDXJ(ICD_SGN) = MUA*DUIDXJ(ICD_SGN)
+                  ELSE
+                     ITMP = MIN(I_MAX_TEMP,NINT(0.5_EB*(TMP(IIGM,JJGM,KKGM)+TMP(IIGP,JJGP,KKGP))))
+                     MU_WALL = MU_RSQMW_Z(ITMP,1)/RSQ_MW_Z(1)
+                     RHO_WALL = 0.5_EB*( RHOP(IIGM,JJGM,KKGM) + RHOP(IIGP,JJGP,KKGP) )
+                     CALL WALL_MODEL(SLIP_COEF,U_TAU,Y_PLUS,MU_WALL/RHO_WALL,SF%ROUGHNESS,0.5_EB*DXX(ICD),VEL_GAS-VEL_T)
+                     VEL_GHOST = VEL_T + SLIP_COEF*(VEL_GAS-VEL_T)
+                     DUIDXJ(ICD_SGN) = I_SGN*(VEL_GAS-VEL_GHOST)/DXX(ICD)
+                     MU_DUIDXJ(ICD_SGN) = RHO_WALL*U_TAU**2 * SIGN(1._EB,DUIDXJ(ICD_SGN))
+                  ENDIF
                   ALTERED_GRADIENT(ICD_SGN) = .TRUE.
-                  ! After stress and velocity gradient have been computed, reset VEL_GHOST to NO_SLIP for visualizaiton
-                  ! VEL_GHOST = 2._EB*VEL_T - VEL_GAS
 
                CASE (BOUNDARY_FUEL_MODEL_BC) BOUNDARY_CONDITION
 
@@ -2436,6 +2489,44 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
                   ENDIF
             END SELECT
 
+            ! FDS 6.11.1 (35b423dac8)
+            ! At the exterior edge of Mesh NM, which abuts Mesh NOM, assign the appropriate velocity component to the
+            ! ghost cell. For example, MESHES(NM)%VV(IBP1,JJ,KBP1) is stored in MESHES(NM)%OMESH(NOM)%V(IIO+1,JJO,KKO) if Mesh
+            ! NOM is above Mesh NM (IOR=-3), or it is stored in MESHES(NM)%OMESH(NOM)%V(IIO,JJO,KKO+1) if Mesh NOM is to
+            ! the right of NM (IOR=-1). The value of each is the same and it is transfered to Mesh NM with a one-step time lag.
+
+            IF (CORRECTOR) THEN
+               SELECT CASE(IEC)
+                  CASE(1)
+                     IF (JJ==0    .AND. KK==0    .AND. ABS(IOR)==2) UU(II,JJ  ,KK  ) = OM%U(IIO(ICD),JJO(ICD)  ,KKO(ICD)-1)
+                     IF (JJ==0    .AND. KK==0    .AND. ABS(IOR)==3) UU(II,JJ  ,KK  ) = OM%U(IIO(ICD),JJO(ICD)-1,KKO(ICD)  )
+                     IF (JJ==0    .AND. KK==KBAR .AND. ABS(IOR)==2) UU(II,JJ  ,KK+1) = OM%U(IIO(ICD),JJO(ICD)  ,KKO(ICD)+1)
+                     IF (JJ==0    .AND. KK==KBAR .AND. ABS(IOR)==3) UU(II,JJ  ,KK+1) = OM%U(IIO(ICD),JJO(ICD)-1,KKO(ICD)  )
+                     IF (JJ==JBAR .AND. KK==0    .AND. ABS(IOR)==2) UU(II,JJ+1,KK  ) = OM%U(IIO(ICD),JJO(ICD)  ,KKO(ICD)-1)
+                     IF (JJ==JBAR .AND. KK==0    .AND. ABS(IOR)==3) UU(II,JJ+1,KK  ) = OM%U(IIO(ICD),JJO(ICD)+1,KKO(ICD)  )
+                     IF (JJ==JBAR .AND. KK==KBAR .AND. ABS(IOR)==2) UU(II,JJ+1,KK+1) = OM%U(IIO(ICD),JJO(ICD)  ,KKO(ICD)+1)
+                     IF (JJ==JBAR .AND. KK==KBAR .AND. ABS(IOR)==3) UU(II,JJ+1,KK+1) = OM%U(IIO(ICD),JJO(ICD)+1,KKO(ICD)  )
+                  CASE(2)
+                     IF (II==0    .AND. KK==0    .AND. ABS(IOR)==1) VV(II  ,JJ,KK  ) = OM%V(IIO(ICD)  ,JJO(ICD),KKO(ICD)-1)
+                     IF (II==0    .AND. KK==0    .AND. ABS(IOR)==3) VV(II  ,JJ,KK  ) = OM%V(IIO(ICD)-1,JJO(ICD),KKO(ICD)  )
+                     IF (II==0    .AND. KK==KBAR .AND. ABS(IOR)==1) VV(II  ,JJ,KK+1) = OM%V(IIO(ICD)  ,JJO(ICD),KKO(ICD)+1)
+                     IF (II==0    .AND. KK==KBAR .AND. ABS(IOR)==3) VV(II  ,JJ,KK+1) = OM%V(IIO(ICD)-1,JJO(ICD),KKO(ICD)  )
+                     IF (II==IBAR .AND. KK==0    .AND. ABS(IOR)==1) VV(II+1,JJ,KK  ) = OM%V(IIO(ICD)  ,JJO(ICD),KKO(ICD)-1)
+                     IF (II==IBAR .AND. KK==0    .AND. ABS(IOR)==3) VV(II+1,JJ,KK  ) = OM%V(IIO(ICD)+1,JJO(ICD),KKO(ICD)  )
+                     IF (II==IBAR .AND. KK==KBAR .AND. ABS(IOR)==1) VV(II+1,JJ,KK+1) = OM%V(IIO(ICD)  ,JJO(ICD),KKO(ICD)+1)
+                     IF (II==IBAR .AND. KK==KBAR .AND. ABS(IOR)==3) VV(II+1,JJ,KK+1) = OM%V(IIO(ICD)+1,JJO(ICD),KKO(ICD)  )
+                  CASE(3)
+                     IF (II==0    .AND. JJ==0    .AND. ABS(IOR)==1) WW(II  ,JJ  ,KK) = OM%W(IIO(ICD)  ,JJO(ICD)-1,KKO(ICD))
+                     IF (II==0    .AND. JJ==0    .AND. ABS(IOR)==2) WW(II  ,JJ  ,KK) = OM%W(IIO(ICD)-1,JJO(ICD)  ,KKO(ICD))
+                     IF (II==0    .AND. JJ==JBAR .AND. ABS(IOR)==1) WW(II  ,JJ+1,KK) = OM%W(IIO(ICD)  ,JJO(ICD)+1,KKO(ICD))
+                     IF (II==0    .AND. JJ==JBAR .AND. ABS(IOR)==2) WW(II  ,JJ+1,KK) = OM%W(IIO(ICD)-1,JJO(ICD)  ,KKO(ICD))
+                     IF (II==IBAR .AND. JJ==0    .AND. ABS(IOR)==1) WW(II+1,JJ  ,KK) = OM%W(IIO(ICD)  ,JJO(ICD)-1,KKO(ICD))
+                     IF (II==IBAR .AND. JJ==0    .AND. ABS(IOR)==2) WW(II+1,JJ  ,KK) = OM%W(IIO(ICD)+1,JJO(ICD)  ,KKO(ICD))
+                     IF (II==IBAR .AND. JJ==JBAR .AND. ABS(IOR)==1) WW(II+1,JJ+1,KK) = OM%W(IIO(ICD)  ,JJO(ICD)+1,KKO(ICD))
+                     IF (II==IBAR .AND. JJ==JBAR .AND. ABS(IOR)==2) WW(II+1,JJ+1,KK) = OM%W(IIO(ICD)+1,JJO(ICD)  ,KKO(ICD))
+               END SELECT
+            ENDIF
+
          ENDIF INTERPOLATION_IF
 
          ! Set ghost cell values at edge of computational domain
@@ -2446,7 +2537,7 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
                IF (JJ==JBAR .AND. IOR==-2) WW(II,JJ+1,KK) = VEL_GHOST
                IF (KK==0    .AND. IOR== 3) VV(II,JJ,KK)   = VEL_GHOST
                IF (KK==KBAR .AND. IOR==-3) VV(II,JJ,KK+1) = VEL_GHOST
-               IF (CORRECTOR) THEN
+               IF (CORRECTOR .AND. .NOT.INTERPOLATED_EDGE) THEN
                  IF (ICD==1) THEN
                     ED%W_AVG = 0.5_EB*(VEL_GHOST+VEL_GAS)
                  ELSE ! ICD=2
@@ -2458,7 +2549,7 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
                IF (II==IBAR .AND. IOR==-1) WW(II+1,JJ,KK) = VEL_GHOST
                IF (KK==0    .AND. IOR== 3) UU(II,JJ,KK)   = VEL_GHOST
                IF (KK==KBAR .AND. IOR==-3) UU(II,JJ,KK+1) = VEL_GHOST
-               IF (CORRECTOR) THEN
+               IF (CORRECTOR .AND. .NOT.INTERPOLATED_EDGE) THEN
                  IF (ICD==1) THEN
                     ED%U_AVG = 0.5_EB*(VEL_GHOST+VEL_GAS)
                  ELSE ! ICD=2
@@ -2470,7 +2561,7 @@ EDGE_LOOP: DO IE=1,EDGE_COUNT(NM)
                IF (II==IBAR .AND. IOR==-1) VV(II+1,JJ,KK) = VEL_GHOST
                IF (JJ==0    .AND. IOR== 2) UU(II,JJ,KK)   = VEL_GHOST
                IF (JJ==JBAR .AND. IOR==-2) UU(II,JJ+1,KK) = VEL_GHOST
-               IF (CORRECTOR) THEN
+               IF (CORRECTOR .AND. .NOT.INTERPOLATED_EDGE) THEN
                  IF (ICD==1) THEN
                     ED%V_AVG = 0.5_EB*(VEL_GHOST+VEL_GAS)
                  ELSE ! ICD=2

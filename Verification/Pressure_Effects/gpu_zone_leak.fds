@@ -1,0 +1,28 @@
+&HEAD CHID='gpu_zone_leak', TITLE='GPU check: fire in a sealed room that leaks to the outside and to a second room' /
+
+&MESH IJK=20,10,10, XB=0.0,4.0,0.0,2.0,0.0,2.0 /
+&MESH IJK=20,10,10, XB=4.0,8.0,0.0,2.0,0.0,2.0 /
+
+&TIME T_END=10. /
+&DUMP DT_DEVC=0.25, DT_HRR=0.25 /
+
+&REAC FUEL='PROPANE', SOOT_YIELD=0.01 /
+
+&SURF ID='leaky partition', LEAK_PATH=1,2 /
+&SURF ID='leaky exterior', LEAK_PATH=1,0 /
+&OBST XB=3.8,4.2,0.0,2.0,0.0,2.0, SURF_ID='leaky partition' /
+&VENT MB='YMIN', SURF_ID='leaky exterior' /
+&ZONE ID='room 1', XYZ=2.0,1.0,1.0, LEAK_AREA(0)=0.002, LEAK_AREA(2)=0.005 /
+&ZONE ID='room 2', XYZ=6.0,1.0,1.0 /
+
+&SURF ID='burner', HRRPUA=200., TAU_Q=-2. /
+&VENT XB=1.5,2.0,0.75,1.25,0.0,0.0, SURF_ID='burner' /
+&SURF ID='supply', VOLUME_FLOW=-0.05 /
+&VENT XB=7.0,7.4,0.8,1.2,2.0,2.0, SURF_ID='supply' /
+
+&DEVC ID='p1', QUANTITY='PRESSURE', XYZ=1.0,1.0,1.0 /
+&DEVC ID='p2', QUANTITY='PRESSURE', XYZ=6.0,1.0,1.0 /
+&DEVC ID='T1', QUANTITY='TEMPERATURE', XYZ=2.0,1.0,1.8 /
+&DEVC ID='T2', QUANTITY='TEMPERATURE', XYZ=6.0,1.0,1.8 /
+
+&TAIL /

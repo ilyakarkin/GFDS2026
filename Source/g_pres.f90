@@ -3,7 +3,7 @@
 ! Purpose: GPU pressure assembly, baroclinic correction, and velocity-error evaluation.
 !------------------------------------------------------------------------------
 MODULE G_PRES
-    USE G_ERRO, ONLY: GPU_WAIT
+    USE G_ERRO, ONLY: GPU_WAIT,GPU_CAPTURING,GPU_FILL,GPU_COPY
     USE G_MESH_POINTERS
     USE G_CONS
     USE G_POIS
@@ -263,6 +263,7 @@ MODULE G_PRES
             REAL(EB) :: TSI,TIME_RAMP_FACTOR
             REAL(EB), DEVICE, POINTER, CONTIGUOUS :: DX_OTHERD(:),DY_OTHERD(:),DZ_OTHERD(:)
 
+            IF (SOLID_PHASE_ONLY .OR. FREEZE_VELOCITY) RETURN   ! pres.f90 6.11.1: no pressure solution
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
             BLKD = GM%BLKD_3D_BP1
@@ -315,7 +316,7 @@ MODULE G_PRES
             ENDIF
 
             IF (PRESSURE_ITERATIONS==1) THEN
-                GM%WALL_WORK1D = 0._EB
+                CALL GPU_FILL(GM%WALL_WORK1D,SIZE(GM%WALL_WORK1D),0._EB,GM%STRM)
                 IF (GPU_DEBUG_H2D_D2H) WALL_WORK1 = 0._EB
             ENDIF
 
@@ -325,7 +326,7 @@ MODULE G_PRES
                     IF (WALL(IW)%BOUNDARY_TYPE/=OPEN_BOUNDARY) CYCLE
                     VENT_INDEX = WALL(IW)%VENT_INDEX
                     IF (VENT_INDEX<=0) CYCLE
-                    IF (ABS(BOUNDARY_PROP1(WALL(IW)%B1_INDEX)%T_IGN-T_BEGIN)<=TWO_EPSILON_EB .AND. &
+                    IF (ABS(BOUNDARY_PROP1(WALL(IW)%B1_INDEX)%T_IGN-T_BEGIN)<=TWENTY_EPSILON_EB .AND. &
                         VENTS(VENT_INDEX)%PRESSURE_RAMP_INDEX>=1) THEN
                         TSI = T
                     ELSE
@@ -337,7 +338,7 @@ MODULE G_PRES
                 GM%WALL_P_EXTERNALD = GM%WALL_P_EXTERNAL_H
             ENDIF
 
-            GM%PRHSD = 0._EB
+            CALL GPU_FILL(GM%PRHSD,SIZE(GM%PRHSD),0._EB,GM%STRM)
             IF (PREDICTOR) THEN
                 IF (GPU_DEBUG_H2D_D2H) THEN
                     GM%UD   = U
@@ -372,7 +373,7 @@ MODULE G_PRES
                 RHOPD => GM%RHOSD
             ENDIF
 
-            IF (OPEN_WIND_BOUNDARY) THEN
+            IF (OPEN_WIND_BOUNDARY .AND. .NOT.GPU_CAPTURING) THEN   ! a graph replays the iterations of one time step
                 GM%U_WINDD = U_WIND
                 GM%V_WINDD = V_WIND
                 GM%W_WINDD = W_WIND
@@ -428,6 +429,7 @@ MODULE G_PRES
             REAL(EB) :: DX0,DY0,DZ0
             INTEGER :: N
 
+            IF (SOLID_PHASE_ONLY .OR. FREEZE_VELOCITY) RETURN   ! pres.f90 6.11.1: no pressure solution
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
             IF (PREDICTOR) THEN
@@ -467,6 +469,68 @@ MODULE G_PRES
             ENDIF
         END SUBROUTINE PRESSURE_SOLVER_FFT_INSTEAD
 
+        !> Hand the pressure equation of mesh NM to a host solver (GLMAT, UGLMAT, ULMAT, or the tunnel
+        !> preconditioner with the host FFT): RHS and boundary values computed on the device go to the host.
+        SUBROUTINE PRESSURE_HOST_SOLVE_D2H(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: N
+
+            IF (FREEZE_VELOCITY .OR. SOLID_PHASE_ONLY) RETURN  ! the host solvers return as well
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            CALL GPU_WAIT(GM%STRM)
+            CALL COPY_PRESSURE_RHS_GPU(NM,.FALSE.)
+            DO N=LBOUND(BXS,2),UBOUND(BXS,2)
+                BXS(:,N) = GM%BXSD(:,N)
+                BXF(:,N) = GM%BXFD(:,N)
+            ENDDO
+            DO N=LBOUND(BYS,2),UBOUND(BYS,2)
+                BYS(:,N) = GM%BYSD(:,N)
+                BYF(:,N) = GM%BYFD(:,N)
+            ENDDO
+            DO N=LBOUND(BZS,2),UBOUND(BZS,2)
+                BZS(:,N) = GM%BZSD(:,N)
+                BZF(:,N) = GM%BZFD(:,N)
+            ENDDO
+        END SUBROUTINE PRESSURE_HOST_SOLVE_D2H
+
+        !> Return the host pressure solution H (predictor) or HS (corrector) of mesh NM, ghost cells included,
+        !> to the device.
+        SUBROUTINE PRESSURE_HOST_SOLVE_H2D(NM)
+            INTEGER, INTENT(IN) :: NM
+            IF (FREEZE_VELOCITY .OR. SOLID_PHASE_ONLY) RETURN
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            IF (PREDICTOR) THEN
+                GM%HD = H
+            ELSE
+                GM%HSD = HS
+            ENDIF
+        END SUBROUTINE PRESSURE_HOST_SOLVE_H2D
+
+        !> Fields read by PRESSURE_SOLVER_CHECK_RESIDUALS_U (the residual of the unstructured solvers, which
+        !> leaves out solid cells and faces of solid walls) besides H/HS, which is already on the host.
+        SUBROUTINE PRESSURE_RESIDUAL_U_D2H(NM)
+            INTEGER, INTENT(IN) :: NM
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            IF (.NOT.ITERATE_BAROCLINIC_TERM .AND. .NOT.CHECK_POISSON) RETURN
+            CALL GPU_WAIT(GM%STRM)
+            FVX = GM%FVXD
+            FVY = GM%FVYD
+            FVZ = GM%FVZD
+            FVX_B = GM%FVX_BD
+            FVY_B = GM%FVY_BD
+            FVZ_B = GM%FVZ_BD
+            DDDT = GM%DDDTD
+            KRES = GM%KRESD
+            IF (PREDICTOR) THEN
+                RHO = GM%RHOD
+            ELSE
+                RHOS = GM%RHOSD
+            ENDIF
+        END SUBROUTINE PRESSURE_RESIDUAL_U_D2H
+
         SUBROUTINE PRESSURE_SOLVER_GPU_DISPATCH(NM,HPD,PRHSD,BXSD,BXFD,BYSD,BYFD,BZSD,BZFD,DX0,DY0,DZ0,LBC,MBC,NBC)
             INTEGER, INTENT(IN) :: NM
             REAL(EB), DEVICE, INTENT(INOUT), DIMENSION(0:IBP1,0:JBP1,0:KBP1) :: HPD
@@ -493,6 +557,7 @@ MODULE G_PRES
             REAL(EB),DEVICE,POINTER,DIMENSION(:,:,:)::HPD,RHOPD,PD
             INTEGER :: NBLK
 
+            IF (SOLID_PHASE_ONLY .OR. FREEZE_VELOCITY) RETURN   ! pres.f90 6.11.1: no pressure solution
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
             IF (.NOT.ITERATE_BAROCLINIC_TERM) RETURN
@@ -557,18 +622,77 @@ MODULE G_PRES
                 GM%RESIDUAL_BLOCKMAX_D, GM%RESIDUAL_BLOCKI_D, GM%RESIDUAL_BLOCKJ_D, GM%RESIDUAL_BLOCKK_D, &
                 GM%WORK8D,IBAR,JBAR,KBAR)
 
-            IF (.NOT.ALLOCATED(GM%FINAL_BLOCK_RESULT_D)) ALLOCATE(GM%FINAL_BLOCK_RESULT_D(4))
-
+            ! The result stays on the device; PRESSURE_REDUCE_COLLECT_GPU reads back all meshes after the mesh loop.
+            CALL MESH_REDUCE_ENSURE(NMESHES)
             CALL FINAL_BLOCKMAX_REDUCE_KERNEL<<<1,BS_1D,0,GM%STRM>>>( &
-                GM%FINAL_BLOCK_RESULT_D, &
-                GM%RESIDUAL_BLOCKMAX_D,GM%RESIDUAL_BLOCKI_D,GM%RESIDUAL_BLOCKJ_D,GM%RESIDUAL_BLOCKK_D,NBLK)
+                MESH_REDUCE_D, &
+                GM%RESIDUAL_BLOCKMAX_D,GM%RESIDUAL_BLOCKI_D,GM%RESIDUAL_BLOCKJ_D,GM%RESIDUAL_BLOCKK_D,NBLK, &
+                MESH_REDUCE_OFFSET(MR_RESIDUAL,NM))
+            MESH_REDUCE_PENDING(MR_RESIDUAL,NM) = .TRUE.
 
-            CALL GPU_WAIT(GM%STRM)
-            GM%FINAL_BLOCK_RESULT_H = GM%FINAL_BLOCK_RESULT_D
-            PRESSURE_ERROR_MAX(NM) = GM%FINAL_BLOCK_RESULT_H(1)
-            PRESSURE_ERROR_MAX_LOC(1:3,NM) = NINT(GM%FINAL_BLOCK_RESULT_H(2:4))
+            ! pres.f90 PRESSURE_SOLVER_CHECK_RESIDUALS: PRESSURE POISSON RESIDUAL output keeps the latest residual field.
+            ! This check is captured in a CUDA graph by PRESSURE_ITERATION_SCHEME_GPU, where a copy to the host is not
+            ! possible (it would make the legacy stream wait for the capturing mesh streams): the field is kept on the device
+            ! by a kernel on the mesh stream and read back after the iterations (PRESSURE_RESIDUAL_FIELD_D2H).
+            IF (STORE_PRESSURE_POISSON_RESIDUAL .AND. ALLOCATED(GM%PP_RESIDUAL_D)) THEN
+                CALL GPU_COPY(GM%PP_RESIDUAL_D,GM%WORK8D,SIZE(GM%WORK8D),GM%STRM)
+                GM%PP_RESIDUAL_NEW = .TRUE.
+            ENDIF
 
         END SUBROUTINE PRESSURE_SOLVER_CHECK_RESIDUALS_GPU
+
+        !> Device field of PRESSURE POISSON RESIDUAL for mesh NM (see PRESSURE_SOLVER_CHECK_RESIDUALS_GPU). Called before
+        !> the pressure iterations, so that no allocation falls into a graph capture.
+        SUBROUTINE PRESSURE_RESIDUAL_FIELD_ALLOCATE(NM)
+            INTEGER, INTENT(IN) :: NM
+
+            IF (.NOT.STORE_PRESSURE_POISSON_RESIDUAL) RETURN
+            IF (.NOT.ALLOCATED(GPU_MESHES(NM)%WORK8D)) RETURN
+            IF (ALLOCATED(GPU_MESHES(NM)%PP_RESIDUAL_D)) RETURN
+            ALLOCATE(GPU_MESHES(NM)%PP_RESIDUAL_D(LBOUND(GPU_MESHES(NM)%WORK8D,1):UBOUND(GPU_MESHES(NM)%WORK8D,1), &
+                                                  LBOUND(GPU_MESHES(NM)%WORK8D,2):UBOUND(GPU_MESHES(NM)%WORK8D,2), &
+                                                  LBOUND(GPU_MESHES(NM)%WORK8D,3):UBOUND(GPU_MESHES(NM)%WORK8D,3)))
+            ALLOCATE(GPU_MESHES(NM)%PP_RESIDUAL_H(LBOUND(GPU_MESHES(NM)%WORK8D,1):UBOUND(GPU_MESHES(NM)%WORK8D,1), &
+                                                  LBOUND(GPU_MESHES(NM)%WORK8D,2):UBOUND(GPU_MESHES(NM)%WORK8D,2), &
+                                                  LBOUND(GPU_MESHES(NM)%WORK8D,3):UBOUND(GPU_MESHES(NM)%WORK8D,3)))
+            GPU_MESHES(NM)%PP_RESIDUAL_NEW = .FALSE.
+        END SUBROUTINE PRESSURE_RESIDUAL_FIELD_ALLOCATE
+
+        !> After the pressure iterations, outside any graph capture and once the mesh streams are joined: the residual
+        !> field of the last check of mesh NM into PP_RESIDUAL, as pres.f90 leaves it after each pressure solve.
+        SUBROUTINE PRESSURE_RESIDUAL_FIELD_D2H(NM)
+            INTEGER, INTENT(IN) :: NM
+
+            IF (.NOT.GPU_MESHES(NM)%PP_RESIDUAL_NEW) RETURN
+            GPU_MESHES(NM)%PP_RESIDUAL_NEW = .FALSE.
+            CALL POINT_TO_MESH(NM)
+            GM => GPU_MESHES(NM)
+            GM%PP_RESIDUAL_H = GM%PP_RESIDUAL_D
+            PP_RESIDUAL(1:IBAR,1:JBAR,1:KBAR) = GM%PP_RESIDUAL_H(1:IBAR,1:JBAR,1:KBAR)
+        END SUBROUTINE PRESSURE_RESIDUAL_FIELD_D2H
+
+        !> After the mesh loop of PRESSURE_SOLVER_CHECK_RESIDUALS_GPU (MR_RESIDUAL) or COMPUTE_VELOCITY_ERROR_GPU
+        !> (MR_VELOCITY_ERROR): one device wait and one read-back for all meshes instead of one per mesh.
+        SUBROUTINE PRESSURE_REDUCE_COLLECT_GPU(MR_KIND)
+            INTEGER, INTENT(IN) :: MR_KIND
+            INTEGER :: NM,I0
+
+            IF (.NOT.MESH_REDUCE_FETCH(MR_KIND)) RETURN
+            DO NM=1,NMESHES
+                IF (.NOT.MESH_REDUCE_PENDING(MR_KIND,NM)) CYCLE
+                MESH_REDUCE_PENDING(MR_KIND,NM) = .FALSE.
+                I0 = MESH_REDUCE_OFFSET(MR_KIND,NM)
+                SELECT CASE(MR_KIND)
+                    CASE(MR_RESIDUAL)
+                        PRESSURE_ERROR_MAX(NM) = MESH_REDUCE_H(I0+1)
+                        PRESSURE_ERROR_MAX_LOC(1:3,NM) = NINT(MESH_REDUCE_H(I0+2:I0+4))
+                    CASE(MR_VELOCITY_ERROR)
+                        VELOCITY_ERROR_MAX(NM) = MESH_REDUCE_H(I0+1)
+                        VELOCITY_ERROR_MAX_LOC(1:3,NM) = NINT(MESH_REDUCE_H(I0+2:I0+4))
+                END SELECT
+            ENDDO
+
+        END SUBROUTINE PRESSURE_REDUCE_COLLECT_GPU
 
         SUBROUTINE COMPUTE_VELOCITY_ERROR_GPU(DT,NM)
 
@@ -579,13 +703,14 @@ MODULE G_PRES
             REAL(EB) :: ITERATIVE_FACTOR,TNOW
             REAL(EB), ALLOCATABLE, DIMENSION(:) :: WALL_WORK1_GPU,WALL_VEL_ERR_H_TMP,WALL_U_NORMAL_H_TMP, &
                                                     WALL_U_NORMAL_S_H_TMP,WALL_RDN_H_TMP
-            REAL(EB), DEVICE, ALLOCATABLE, DIMENSION(:) :: WALL_VEL_ERRD
+            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: WALL_VEL_ERRD(:)
             REAL(EB), DEVICE, POINTER, CONTIGUOUS :: OM_VELD(:,:,:),OM_VEL_SD(:,:,:),OM_FLUXD(:,:,:),OM_HPD(:,:,:)
             REAL(EB), DEVICE, POINTER, CONTIGUOUS :: RDN_OTHERD(:)
             REAL(EB), DEVICE, POINTER, CONTIGUOUS :: HPD(:,:,:)
             TYPE(OMESH_TYPE), POINTER :: OM
             TYPE(GPU_OMESH_TYPE), POINTER :: GOM_LOCAL
 
+            IF (SOLID_PHASE_ONLY .OR. FREEZE_VELOCITY) RETURN   ! pres.f90 6.11.1: no pressure solution
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
             IF (SOLID_PHASE_ONLY) RETURN
@@ -654,9 +779,11 @@ MODULE G_PRES
                 ENDDO
             ENDIF
 
-            ALLOCATE(WALL_VEL_ERRD(LBOUND(WALL,1):UBOUND(WALL,1)))
-            GM%WALL_WORK1D = 0._EB
-            WALL_VEL_ERRD = 0._EB
+            ! Kept on the mesh for the wall output VELOCITY ERROR (B1%VEL_ERR_NEW).
+            IF (.NOT.ALLOCATED(GM%WALL_VEL_ERR_NEW_D)) ALLOCATE(GM%WALL_VEL_ERR_NEW_D(LBOUND(WALL,1):UBOUND(WALL,1)))
+            WALL_VEL_ERRD => GM%WALL_VEL_ERR_NEW_D
+            CALL GPU_FILL(GM%WALL_WORK1D,SIZE(GM%WALL_WORK1D),0._EB,GM%STRM)
+            CALL GPU_FILL(WALL_VEL_ERRD,SIZE(WALL_VEL_ERRD),0._EB,GM%STRM)
 
             IF (PREDICTOR) THEN
                 HPD => GM%HD
@@ -678,31 +805,16 @@ MODULE G_PRES
                 ELSE
                     OM_HPD => GOM_LOCAL%HS_D
                 ENDIF
-                DO AXIS=1,3
-                    SELECT CASE(AXIS)
-                        CASE(1)
-                            OM_VELD => GOM_LOCAL%U_D
-                            OM_VEL_SD => GOM_LOCAL%US_D
-                            OM_FLUXD => GOM_LOCAL%FVX_D
-                            RDN_OTHERD => GPU_MESHES(NOM)%RDXND
-                        CASE(2)
-                            OM_VELD => GOM_LOCAL%V_D
-                            OM_VEL_SD => GOM_LOCAL%VS_D
-                            OM_FLUXD => GOM_LOCAL%FVY_D
-                            RDN_OTHERD => GPU_MESHES(NOM)%RDYND
-                        CASE(3)
-                            OM_VELD => GOM_LOCAL%W_D
-                            OM_VEL_SD => GOM_LOCAL%WS_D
-                            OM_FLUXD => GOM_LOCAL%FVZ_D
-                            RDN_OTHERD => GPU_MESHES(NOM)%RDZND
-                    END SELECT
-                    CALL COMPUTE_VELOCITY_ERROR_INTERPOLATED_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(GM%WALL_WORK1D,WALL_VEL_ERRD, &
-                        GM%WALL_TOPO_AOS,GM%WALL_RDN,OM_VELD,OM_VEL_SD,OM_FLUXD,OM_HPD,RDN_OTHERD,GM%EXTERNAL_WALL_NOMD,GM%WALL_IIO, &
-                        GM%WALL_JJO,GM%WALL_KKO,GM%WALL_IIO_MAX,GM%WALL_JJO_MAX,GM%WALL_KKO_MAX,GM%EXTERNAL_WALL_AREA_RATIOD,DT, &
-                        ITERATIVE_FACTOR,N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY,MERGE(1,0,PREDICTOR),NOM,AXIS, &
-                        SIZE(OM_VELD,1),SIZE(OM_VELD,2),LBOUND(OM_VELD,1),LBOUND(OM_VELD,2),LBOUND(OM_VELD,3), &
-                        LBOUND(RDN_OTHERD,1),GM%WALL_LB)
-                ENDDO
+                ! One launch for the three axes (each wall cell has one IOR); the OMESH buffers share their bounds.
+                CALL COMPUTE_VELOCITY_ERROR_INTERPOLATED_XYZ_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(GM%WALL_WORK1D,WALL_VEL_ERRD, &
+                    GM%WALL_TOPO_AOS,GM%WALL_RDN,GOM_LOCAL%U_D,GOM_LOCAL%US_D,GOM_LOCAL%FVX_D,GOM_LOCAL%V_D,GOM_LOCAL%VS_D, &
+                    GOM_LOCAL%FVY_D,GOM_LOCAL%W_D,GOM_LOCAL%WS_D,GOM_LOCAL%FVZ_D,OM_HPD, &
+                    GPU_MESHES(NOM)%RDXND,GPU_MESHES(NOM)%RDYND,GPU_MESHES(NOM)%RDZND,GM%EXTERNAL_WALL_NOMD,GM%WALL_IIO, &
+                    GM%WALL_JJO,GM%WALL_KKO,GM%WALL_IIO_MAX,GM%WALL_JJO_MAX,GM%WALL_KKO_MAX,GM%EXTERNAL_WALL_AREA_RATIOD,DT, &
+                    ITERATIVE_FACTOR,N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY,MERGE(1,0,PREDICTOR),NOM, &
+                    SIZE(GOM_LOCAL%U_D,1),SIZE(GOM_LOCAL%U_D,2),LBOUND(GOM_LOCAL%U_D,1),LBOUND(GOM_LOCAL%U_D,2), &
+                    LBOUND(GOM_LOCAL%U_D,3),LBOUND(GPU_MESHES(NOM)%RDXND,1),LBOUND(GPU_MESHES(NOM)%RDYND,1), &
+                    LBOUND(GPU_MESHES(NOM)%RDZND,1),GM%WALL_LB)
             ENDDO
 
             IF (GPU_DEBUG_H2D_D2H) THEN
@@ -745,18 +857,15 @@ MODULE G_PRES
                 GM%VERR_BLOCKK_D, WALL_VEL_ERRD, GM%WALL_TOPO_AOS, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, &
                 INTERPOLATED_BOUNDARY,GM%EXTERNAL_WALL_AREA_RATIOD)
 
-            IF (.NOT.ALLOCATED(GM%FINAL_BLOCK_RESULT_D)) ALLOCATE(GM%FINAL_BLOCK_RESULT_D(4))
-
+            ! The result stays on the device; PRESSURE_REDUCE_COLLECT_GPU reads back all meshes after the mesh loop.
+            CALL MESH_REDUCE_ENSURE(NMESHES)
             CALL FINAL_BLOCKMAX_REDUCE_KERNEL<<<1,256,0,GM%STRM>>>( &
-                GM%FINAL_BLOCK_RESULT_D, &
-                GM%VERR_BLOCKMAX_D,GM%VERR_BLOCKI_D,GM%VERR_BLOCKJ_D,GM%VERR_BLOCKK_D,NBLK)
+                MESH_REDUCE_D, &
+                GM%VERR_BLOCKMAX_D,GM%VERR_BLOCKI_D,GM%VERR_BLOCKJ_D,GM%VERR_BLOCKK_D,NBLK, &
+                MESH_REDUCE_OFFSET(MR_VELOCITY_ERROR,NM))
+            MESH_REDUCE_PENDING(MR_VELOCITY_ERROR,NM) = .TRUE.
 
-            CALL GPU_WAIT(GM%STRM)
-            GM%FINAL_BLOCK_RESULT_H = GM%FINAL_BLOCK_RESULT_D
-            VELOCITY_ERROR_MAX(NM) = GM%FINAL_BLOCK_RESULT_H(1)
-            VELOCITY_ERROR_MAX_LOC(1:3,NM) = NINT(GM%FINAL_BLOCK_RESULT_H(2:4))
-
-            DEALLOCATE(WALL_VEL_ERRD)
+            NULLIFY(WALL_VEL_ERRD)
 
             T_USED(5)=T_USED(5)+CURRENT_TIME()-TNOW
 
@@ -777,7 +886,10 @@ MODULE G_PRES
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_WORK1D,WALL_VEL_ERRD,WALL_U_NORMAL,WALL_U_NORMAL_S,WALL_RDN
             INTEGER, DEVICE, DIMENSION(1:*) :: EXTERNAL_WALL_NOM
             REAL(EB), DEVICE, DIMENSION(1:*) :: EXTERNAL_WALL_AREA_RATIO
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: U,V,W,US,VS,WS,FVX,FVY,FVZ,HP
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: FVX, FVY, FVZ, HP
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: U,US
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: V,VS
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: W,WS
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN,RDYN,RDZN
             INTEGER :: IW,II,JJ,KK,IOR,BTYPE
             REAL(EB) :: UN_NEW,UN_NEW_OTHER,VELOCITY_ERROR,DHFCT,SGN_IOR
@@ -856,6 +968,121 @@ MODULE G_PRES
             WALL_WORK1D(IW) = -SGN_IOR*ITERATIVE_FACTOR*VELOCITY_ERROR/(WALL_RDN(IW)*DT)
 
         END SUBROUTINE COMPUTE_VELOCITY_ERROR_LOCAL_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE COMPUTE_VELOCITY_ERROR_INTERPOLATED_XYZ_GPU(WALL_WORK1D,WALL_VEL_ERRD,WALL_TOPO,WALL_RDN, &
+            OM_U,OM_US,OM_FVX,OM_V,OM_VS,OM_FVY,OM_W,OM_WS,OM_FVZ,OM_HP,RDXN_OTHER,RDYN_OTHER,RDZN_OTHER, &
+            EXTERNAL_WALL_NOM,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX, &
+            WALL_KKO_MAX,EXTERNAL_WALL_AREA_RATIO,DT,ITERATIVE_FACTOR,N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY_VALUE, &
+            PREDICTOR_FLAG,NOM_FILTER,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDXN_LB,RDYN_LB,RDZN_LB,WALL_LB)
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(*)
+
+            INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY_VALUE,PREDICTOR_FLAG,NOM_FILTER
+            INTEGER, VALUE :: OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDXN_LB,RDYN_LB,RDZN_LB,WALL_LB
+            REAL(EB), VALUE :: DT,ITERATIVE_FACTOR
+            REAL(EB), DEVICE, DIMENSION(*) :: WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN
+            REAL(EB), DEVICE, DIMENSION(*) :: OM_U,OM_US,OM_FVX,OM_V,OM_VS,OM_FVY,OM_W,OM_WS,OM_FVZ,OM_HP
+            REAL(EB), DEVICE, DIMENSION(*) :: RDXN_OTHER,RDYN_OTHER,RDZN_OTHER
+            INTEGER, DEVICE, DIMENSION(*) :: EXTERNAL_WALL_NOM,WALL_IIO,WALL_JJO,WALL_KKO
+            INTEGER, DEVICE, DIMENSION(*) :: WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX
+            REAL(EB), DEVICE, DIMENSION(*) :: EXTERNAL_WALL_AREA_RATIO
+            INTEGER :: IW,IW_WALL,IOR
+
+            IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS) RETURN
+            IW_WALL = IW - WALL_LB + 1
+            IF (WALL_TOPO(IW_WALL)%BOUNDARY_TYPE /= INTERPOLATED_BOUNDARY_VALUE) RETURN
+            IF (WALL_TOPO(IW_WALL)%CUT_FACE_INDEX > 0) RETURN
+            IF (EXTERNAL_WALL_NOM(IW) /= NOM_FILTER) RETURN
+            IF (EXTERNAL_WALL_AREA_RATIO(IW) < 0.9_EB) RETURN
+
+            IOR = WALL_TOPO(IW_WALL)%IOR
+            SELECT CASE(ABS(IOR))
+                CASE(1)
+                    CALL VELOCITY_ERROR_INTERPOLATED_CELL(IW,IW_WALL,IOR,1,WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN, &
+                        OM_U,OM_US,OM_FVX,OM_HP,RDXN_OTHER,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX, &
+                        DT,ITERATIVE_FACTOR,PREDICTOR_FLAG,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDXN_LB)
+                CASE(2)
+                    CALL VELOCITY_ERROR_INTERPOLATED_CELL(IW,IW_WALL,IOR,2,WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN, &
+                        OM_V,OM_VS,OM_FVY,OM_HP,RDYN_OTHER,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX, &
+                        DT,ITERATIVE_FACTOR,PREDICTOR_FLAG,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDYN_LB)
+                CASE(3)
+                    CALL VELOCITY_ERROR_INTERPOLATED_CELL(IW,IW_WALL,IOR,3,WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN, &
+                        OM_W,OM_WS,OM_FVZ,OM_HP,RDZN_OTHER,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX, &
+                        DT,ITERATIVE_FACTOR,PREDICTOR_FLAG,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDZN_LB)
+            END SELECT
+
+        END SUBROUTINE COMPUTE_VELOCITY_ERROR_INTERPOLATED_XYZ_GPU
+
+        !> Velocity error of one interpolated wall cell IW whose |IOR| is AXIS (body of COMPUTE_VELOCITY_ERROR_INTERPOLATED_GPU).
+        ATTRIBUTES(DEVICE) SUBROUTINE VELOCITY_ERROR_INTERPOLATED_CELL(IW,IW_WALL,IOR,AXIS,WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN, &
+            OM_VEL,OM_VEL_S,OM_FLUX,OM_HP,RDN_OTHER,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX, &
+            DT,ITERATIVE_FACTOR,PREDICTOR_FLAG,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDN_LB)
+            INTEGER, VALUE :: IW,IW_WALL,IOR,AXIS,PREDICTOR_FLAG,OM_NI,OM_NJ,OM_LB_I,OM_LB_J,OM_LB_K,RDN_LB
+            REAL(EB), VALUE :: DT,ITERATIVE_FACTOR
+            REAL(EB), DEVICE, DIMENSION(*) :: WALL_WORK1D,WALL_VEL_ERRD,WALL_RDN
+            REAL(EB), DEVICE, DIMENSION(*) :: OM_VEL,OM_VEL_S,OM_FLUX,OM_HP,RDN_OTHER
+            INTEGER, DEVICE, DIMENSION(*) :: WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX,WALL_KKO_MAX
+            INTEGER :: IIO,JJO,KKO,IIO1,IIO2,JJO1,JJO2,KKO1,KKO2,N_INT_CELLS
+            INTEGER :: IDX_C,IDX_V,STRIDE,RDN_COORD,RDN_INDEX
+            REAL(EB) :: UN_NEW,UN_NEW_OTHER,VELOCITY_ERROR,DU_DT,SGN_IOR
+
+            SGN_IOR = SIGN(1._EB,REAL(IOR,EB))
+            SELECT CASE(AXIS)
+                CASE(1)
+                    STRIDE = 1
+                CASE(2)
+                    STRIDE = OM_NI
+                CASE(3)
+                    STRIDE = OM_NI*OM_NJ
+            END SELECT
+
+            IIO1 = WALL_IIO(IW)
+            JJO1 = WALL_JJO(IW)
+            KKO1 = WALL_KKO(IW)
+            IIO2 = WALL_IIO_MAX(IW)
+            JJO2 = WALL_JJO_MAX(IW)
+            KKO2 = WALL_KKO_MAX(IW)
+            N_INT_CELLS = (IIO2-IIO1+1)*(JJO2-JJO1+1)*(KKO2-KKO1+1)
+            IF (N_INT_CELLS <= 0) RETURN
+
+            UN_NEW_OTHER = 0._EB
+            DO KKO=KKO1,KKO2
+                DO JJO=JJO1,JJO2
+                    DO IIO=IIO1,IIO2
+                        IDX_C = 1 + (IIO-OM_LB_I) + OM_NI*((JJO-OM_LB_J) + OM_NJ*(KKO-OM_LB_K))
+                        SELECT CASE(AXIS)
+                            CASE(1)
+                                RDN_COORD = IIO
+                            CASE(2)
+                                RDN_COORD = JJO
+                            CASE(3)
+                                RDN_COORD = KKO
+                        END SELECT
+                        IF (IOR > 0) THEN
+                            IDX_V = IDX_C
+                            RDN_INDEX = RDN_COORD - RDN_LB + 1
+                            DU_DT = -OM_FLUX(IDX_V) - RDN_OTHER(RDN_INDEX)*(OM_HP(IDX_C+STRIDE)-OM_HP(IDX_C))
+                        ELSE
+                            IDX_V = IDX_C - STRIDE
+                            RDN_INDEX = RDN_COORD - 1 - RDN_LB + 1
+                            DU_DT = -OM_FLUX(IDX_V) - RDN_OTHER(RDN_INDEX)*(OM_HP(IDX_C)-OM_HP(IDX_C-STRIDE))
+                        ENDIF
+                        IF (PREDICTOR_FLAG == 1) THEN
+                            UN_NEW_OTHER = UN_NEW_OTHER + OM_VEL(IDX_V) + DT*DU_DT
+                        ELSE
+                            UN_NEW_OTHER = UN_NEW_OTHER + 0.5_EB*(OM_VEL(IDX_V)+OM_VEL_S(IDX_V)+DT*DU_DT)
+                        ENDIF
+                    ENDDO
+                ENDDO
+            ENDDO
+            UN_NEW_OTHER = UN_NEW_OTHER/REAL(N_INT_CELLS,EB)
+
+            UN_NEW = WALL_VEL_ERRD(IW_WALL)
+            VELOCITY_ERROR = UN_NEW - UN_NEW_OTHER
+            WALL_VEL_ERRD(IW_WALL) = VELOCITY_ERROR
+            WALL_WORK1D(IW_WALL) = -SGN_IOR*ITERATIVE_FACTOR*VELOCITY_ERROR/(WALL_RDN(IW_WALL)*DT)
+
+        END SUBROUTINE VELOCITY_ERROR_INTERPOLATED_CELL
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMPUTE_VELOCITY_ERROR_INTERPOLATED_GPU(WALL_WORK1D,WALL_VEL_ERRD,WALL_TOPO,WALL_RDN, &
             OM_VEL,OM_VEL_S,OM_FLUX,OM_HP,RDN_OTHER,EXTERNAL_WALL_NOM,WALL_IIO,WALL_JJO,WALL_KKO,WALL_IIO_MAX,WALL_JJO_MAX, &
@@ -1108,7 +1335,10 @@ MODULE G_PRES
                                                                RDXN,RDYN,RDZN,IBAR,JBAR,KBAR,RFODT,PREDICTOR_FLAG)
             INTEGER, VALUE :: IBAR, JBAR, KBAR, PREDICTOR_FLAG
             REAL(EB), VALUE :: RFODT
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX,FVY,FVZ,U,V,W,US,VS,WS,HP
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVX, FVY, FVZ, HP
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+1,0:JBAR+1,0:*) :: U,US
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,-1:JBAR+1,0:*) :: V,VS
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,-1:*) :: W,WS
             INTEGER, DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: CELL_INDEXD
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID,CELL_EXTERIOR
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN,RDYN,RDZN
@@ -1178,7 +1408,10 @@ MODULE G_PRES
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_INTERNAL_WALL_CELLS,PRES_FLAG_LOCAL,PREDICTOR_FLAG,IBP1,JBP1
             REAL(EB), VALUE :: RFODT
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: FVX,FVY,FVZ,U,V,W,US,VS,WS,HP
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: FVX, FVY, FVZ, HP
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: U,US
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: V,VS
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: W,WS
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_U_NORMAL,WALL_U_NORMAL_S,RDXN,RDYN,RDZN
             INTEGER , DEVICE, DIMENSION(1:*) :: EXTERNAL_WALL_NOM
             INTEGER :: IW,II,JJ,KK,IOR,BTYPE,NOM
@@ -1277,7 +1510,8 @@ MODULE G_PRES
 
         ATTRIBUTES(GLOBAL) SUBROUTINE REMOVE_FB_TO_FA(IBP1,JBP1,KBP1,FVXD,FVYD,FVZD,FVX_BD,FVY_BD,FVZ_BD, PD , RHOPD , KRESD , RRHOD ,HPD )
             INTEGER , VALUE :: IBP1,JBP1,KBP1
-            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: FVXD,FVYD,FVZD,FVX_BD,FVY_BD,FVZ_BD , PD , RHOPD , KRESD , RRHOD , HPD
+            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: FVXD, FVYD, FVZD, FVX_BD, FVY_BD, FVZ_BD, PD, KRESD, RRHOD, HPD
+            REAL(EB) , DEVICE , DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD
 
             INTEGER :: I,J,K
 
@@ -1298,7 +1532,8 @@ MODULE G_PRES
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMPUTE_PD_RRHOD(IBP1,JBP1,KBP1,FVXD,FVYD,FVZD,FVX_BD,FVY_BD,FVZ_BD, PD , RHOPD , KRESD , RRHOD ,HPD )
             INTEGER , VALUE :: IBP1,JBP1,KBP1
-            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: FVXD,FVYD,FVZD,FVX_BD,FVY_BD,FVZ_BD , PD , RHOPD , KRESD , RRHOD , HPD
+            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: FVXD, FVYD, FVZD, FVX_BD, FVY_BD, FVZ_BD, PD, KRESD, RRHOD, HPD
+            REAL(EB) , DEVICE , DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD
 
             INTEGER :: I,J,K
 
@@ -1318,7 +1553,8 @@ MODULE G_PRES
             RDXND,RDYND,RDZND,IBAR,JBAR,KBAR,TWO_D_LOCAL)
             INTEGER , VALUE :: IBAR,JBAR,KBAR
             LOGICAL, VALUE :: TWO_D_LOCAL
-            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: PD,RHOPD,RRHOD
+            REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: PD, RRHOD
+            REAL(EB) , DEVICE , DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOPD
             REAL(EB) , DEVICE , DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: FVXD,FVYD,FVZD,FVX_BD,FVY_BD,FVZ_BD
             REAL(EB) , DEVICE , DIMENSION(0:*) :: RDXND,RDYND,RDZND
             INTEGER :: I,J,K
@@ -1358,7 +1594,10 @@ MODULE G_PRES
             REAL(EB), DEVICE, DIMENSION(0:*) :: U_WIND,V_WIND,W_WIND,RDXN,RDYN,RDZN
             REAL(EB), DEVICE, DIMENSION(1:MERGE(JBP1,1,JBAR>1),1:*) :: BXS_D,BXF_D
             REAL(EB), DEVICE, DIMENSION(1:IBP1,1:*) :: BYS_D,BYF_D,BZS_D,BZF_D
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: FVX,FVY,FVZ,UU,VV,WW,HP,KRES
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: FVX, FVY, FVZ, HP, KRES
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UU
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VV
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WW
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_DUNDT,WALL_WORK1,WALL_P_EXTERNAL,WALL_RHO_F,HX,HY,HZ,DX,DY,DZ
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_PRESSURE_BC_TYPE
             INTEGER, DEVICE, DIMENSION(1:*) :: WALL_IIO,WALL_JJO,WALL_KKO
@@ -1543,7 +1782,8 @@ MODULE G_PRES
 
         ATTRIBUTES(GLOBAL) SUBROUTINE P_CALCULATE_KERNEL(P,RHOP,HP,KRES, IBP1,JBP1,KBP1)
             INTEGER , VALUE :: IBP1,JBP1,KBP1
-            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: P,RHOP,HP,KRES
+            REAL(EB) , DEVICE , DIMENSION(0:IBP1,0:JBP1,0:*) :: P, HP, KRES
+            REAL(EB) , DEVICE , DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOP
 
             INTEGER :: I,J,K
 

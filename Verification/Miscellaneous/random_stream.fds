@@ -1,0 +1,23 @@
+&HEAD CHID='random_stream', TITLE='Initial velocity noise, INIT particles and DEVC RANDOM NUMBER come from one random sequence' /
+
+The intrinsic RANDOM_NUMBER is compiler dependent. FDS 6.11.1 (Intel Fortran release) and GFDS use the same
+generator (FDS_RANDOM in prec.f90), so the initial noise (INITIAL_NOISE), the positions of the INIT particles and
+the RANDOM NUMBER device must come out the same as in the FDS 6.11.1 release, draw by draw. Reference values at
+t=0 from FDS 6.11.1: see the comments next to each DEVC.
+
+&TIME T_END=0.01, DT=0.005 /
+&DUMP DT_DEVC=0.005, DT_PART=0.005 /
+&MESH IJK=4,4,4, XB=0,1,0,1,0,1 /
+&RADI RADIATION=.FALSE. /
+
+&PART ID='tracer', MASSLESS=.TRUE. /
+&INIT PART_ID='tracer', XB=0,1,0,1,0,1, N_PARTICLES=20 /
+
+&DEVC ID='U111', QUANTITY='CELL U', XYZ=0.125,0.125,0.125 /   FDS 6.11.1 at t=0: 3.6593974E-04
+&DEVC ID='V211', QUANTITY='CELL V', XYZ=0.375,0.125,0.125 /   FDS 6.11.1 at t=0: -1.0017898E-02
+&DEVC ID='W311', QUANTITY='CELL W', XYZ=0.625,0.125,0.125 /   FDS 6.11.1 at t=0: 3.9012545E-03
+&DEVC ID='W222', QUANTITY='CELL W', XYZ=0.375,0.375,0.375 /   FDS 6.11.1 at t=0: 5.0314710E-04
+&DEVC ID='U343', QUANTITY='CELL U', XYZ=0.625,0.875,0.625 /   FDS 6.11.1 at t=0: -5.6821236E-03
+&DEVC ID='RN',   QUANTITY='RANDOM NUMBER', XYZ=0.5,0.5,0.5 /   FDS 6.11.1 at t=0: 3.5513368E-01 (then 6.5596282E-01, 2.4393313E-01)
+
+&TAIL /

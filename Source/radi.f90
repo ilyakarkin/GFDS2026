@@ -374,11 +374,11 @@ NSB = NUMBER_SPECTRAL_BANDS
 ! PHYSICAL PARAMETERS
 ! MINIMUM MEAN RADIUS (M)
 RMMIN = 0.5_EB*1.E-6*MIE_MINIMUM_DIAMETER
-IF (RMMIN < TWO_EPSILON_EB) RMMIN = 0.5E-6_EB
+IF (RMMIN < TWENTY_EPSILON_EB) RMMIN = 0.5E-6_EB
 
 ! MAXIMUM MEAN RADIUS (M)
 RMMAX = 0.5_EB*1.E-6*MIE_MAXIMUM_DIAMETER
-IF (RMMAX < TWO_EPSILON_EB) THEN
+IF (RMMAX < TWENTY_EPSILON_EB) THEN
    IF (PRESENT(PARTICLE_CLASS)) THEN
       RMMAX = 0.5_EB*LPC%DIAMETER
    ELSE
@@ -765,7 +765,7 @@ LAMBDALOOP: DO NLAMBDA = 1, NLMBDMIE
 
 !     CALCULATE SINGLE DROP PHASE FUNCTION
 
-      IF (ABS(QS)>TWO_EPSILON_EB) THEN
+      IF (ABS(QS)>TWENTY_EPSILON_EB) THEN
          DO I = 1,NMIEANG2
             PHSFUN(I) = 2._EB*(ABS(S1(I))**2 + ABS(S2(I))**2 )
          ENDDO
@@ -779,7 +779,7 @@ LAMBDALOOP: DO NLAMBDA = 1, NLMBDMIE
       PFOR = 0._EB
       DO J = 1,NMIEANG
          DO I = J,NMIEANG
-            IF (ABS(MUD0(I,J)-MUDPI(I,J))<=TWO_EPSILON_EB) THEN
+            IF (ABS(MUD0(I,J)-MUDPI(I,J))<=TWENTY_EPSILON_EB) THEN
                CALL INTERPOLATE1D(XMU2,PHSFUN,MUD0(I,J),FTMP)
                PFOR(I,J) = PI*FTMP
             ELSE
@@ -2758,6 +2758,19 @@ PUBLIC INIT_RADIATION,COMPUTE_RADIATION,BLACKBODY_FRACTION
 
 REAL(EB) :: TYY_FAC
 
+! Order of the cells in the 3-D Cartesian sweep of RADIATION_FVM without cut cells (CC_IBM always uses SLICE):
+! SLICE  - diagonal planes I+J+K=const, an OpenMP parallel loop over each plane (as in FDS). A fork and join per plane,
+!          about 1.4 million per solve of 32 meshes and 104 angles; with nvfortran the barriers dominate, and on a busy
+!          machine 12 threads are slower than one;
+! SERIAL - rows along I in plain array order on one thread: cache friendly and no barriers, about 1.9 times faster than
+!          SLICE on one thread (default, also with many OpenMP threads: they are still used by the other loops);
+! ROWS   - diagonals of rows J+K=const, the rows of each diagonal shared among the OpenMP threads.
+! Every cell gets the same upwind values and the same formula in all three orders, so the intensities agree to round-off
+! (SERIAL and ROWS are bitwise identical). Environment variable GFDS_RADI_CPU_SWEEP=SLICE|SERIAL|ROWS overrides.
+INTEGER, PARAMETER :: CPU_SWEEP_SLICE=0,CPU_SWEEP_SERIAL=1,CPU_SWEEP_ROWS=2
+INTEGER :: CPU_SWEEP_MODE=-1
+INTEGER, PARAMETER :: CPU_SWEEP_MIN_PARALLEL_ROWS=4  !< ROWS: shorter diagonals of rows are swept on one thread
+
 CONTAINS
 
 
@@ -3219,7 +3232,7 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
 
       ! Set the Mean Beam Length to 10 cm unless the user desires otherwise
 
-      IF (PATH_LENGTH < 0._EB) PATH_LENGTH = 0.1_EB
+      IF (PATH_LENGTH < -TWENTY_EPSILON_EB) PATH_LENGTH = 0.1_EB
       ALLOCATE(SEGMENT_LENGTH_M(1))
       ALLOCATE(TOTAL_PRESSURE_ATM(1))
       ALLOCATE(TEMP_GAS(1))
@@ -3248,7 +3261,7 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
          T_LOOP_Z: DO K = 0,N_KAPPA_T
             TEMP_GAS(1) = RTMPMIN + K*(RTMPMAX-RTMPMIN)/N_KAPPA_T
             ! AMEAN will not be calculated close to RADTMP, where it cannot be solved
-            IF (ABS(TEMP_GAS(1)-RADTMP)<=0.4_EB*(RTMPMAX-RTMPMIN)/N_KAPPA_T .AND. PATH_LENGTH > 0.0_EB) THEN
+            IF (ABS(TEMP_GAS(1)-RADTMP)<=0.4_EB*(RTMPMAX-RTMPMIN)/N_KAPPA_T .AND. PATH_LENGTH > TWENTY_EPSILON_EB) THEN
                RCT_SKIP = K
                CYCLE T_LOOP_Z
             ENDIF
@@ -3308,10 +3321,10 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB
                   END SELECT
                   CALL SUB_RADCAL(AMEAN,AP0,RADIANCE,TRANSMISSIVITY)
-                  IF (NSB==1 .AND. PATH_LENGTH > 0.0_EB) THEN
-                     RADCAL_SPECIES2KAPPA(NS,J+1,K,1) = MIN(AMEAN,AP0)
-                  ELSE
-                     RADCAL_SPECIES2KAPPA(NS,J+1,K,IBND) = AMEAN/BBF
+                  IF (PATH_LENGTH > TWENTY_EPSILON_EB) THEN
+                     RADCAL_SPECIES2KAPPA(NS,J+1,K,IBND) = MIN(AMEAN,AP0)/BBF
+                  ELSE ! zero path length
+                     RADCAL_SPECIES2KAPPA(NS,J+1,K,IBND) = AP0/BBF
                   ENDIF
                END DO RADCAL_SPECIES_LOOP
             ENDDO X_LOOP_Z
@@ -3486,7 +3499,7 @@ INTEGER  :: N,NN,IIG,JJG,KKG,I,J,K,IW,ICF,II,JJ,KK,IOR,IC,IWUP,IWDOWN, &
             KSTART, KEND, KSTEP, NSTART, NEND, NSTEP, &
             I_UIID, N_UPDATES, IBND, NOM, ARRAY_INDEX,NRA, &
             IMIN, JMIN, KMIN, IMAX, JMAX, KMAX, N_SLICE, M_IJK, IJK, LL
-INTEGER  :: IADD,IFACE,INDCF
+INTEGER  :: IADD,IFACE,INDCF,IROW,ROW_FIRST,ROW_LAST
 INTEGER, ALLOCATABLE :: IJK_SLICE(:,:)
 REAL(EB) :: XID,YJD,ZKD,KAPPA_PART_SINGLE,DLF,DLA(3),TSI,TMP_EXTERIOR,TEMP_ORIENTATION(3)
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
@@ -3516,6 +3529,8 @@ REAL(EB), ALLOCATABLE, DIMENSION(:) :: Z_ARRAY
 ALLOCATE(Z_ARRAY(N_TRACKED_SPECIES))
 
 ALLOCATE( IJK_SLICE(3, IBAR*KBAR) )
+
+IF (CPU_SWEEP_MODE<0) CALL SET_CPU_SWEEP_MODE
 
 KFST4_GAS  => WORK1
 IL         => WORK2
@@ -3576,21 +3591,23 @@ IF (UPDATE_INTENSITY) THEN
       WC => WALL(IW)
       IF (WC%B1_INDEX==0 .OR. WC%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
       B1 => BOUNDARY_PROP1(WC%B1_INDEX)
-      B1%Q_RAD_IN = 0._EB
-      SF  => SURFACE(WALL(IW)%SURF_INDEX)
+      SF => SURFACE(WALL(IW)%SURF_INDEX)
+      IF (SF%TMP_GAS_FRONT<=0._EB) B1%Q_RAD_IN = 0._EB
    ENDDO
    DO IP=1,NLP
       LP => LAGRANGIAN_PARTICLE(IP)
       IF (LP%B1_INDEX==0) CYCLE
+      LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
       B1 => BOUNDARY_PROP1(LP%B1_INDEX)
-      B1%Q_RAD_IN = 0._EB
+      SF => SURFACE(LPC%SURF_INDEX)
+      IF (SF%TMP_GAS_FRONT<=0._EB) B1%Q_RAD_IN = 0._EB
    ENDDO
    DO ICF=INTERNAL_CFACE_CELLS_LB+1,INTERNAL_CFACE_CELLS_LB+N_INTERNAL_CFACE_CELLS
       CFA => CFACE(ICF)
       IF (CFA%B1_INDEX==0) CYCLE
       B1 => BOUNDARY_PROP1(CFA%B1_INDEX)
-      B1%Q_RAD_IN = 0._EB
       SF  => SURFACE(CFA%SURF_INDEX)
+      IF (SF%TMP_GAS_FRONT<=0._EB) B1%Q_RAD_IN = 0._EB
    ENDDO
 ENDIF
 
@@ -3613,7 +3630,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
       Z_ARRAY(1:N_TRACKED_SPECIES) = SPECIES_MIXTURE(1:N_TRACKED_SPECIES)%ZZ0     ! Mass frac of the tracked species in ambient
       R_MIXTURE = RSUM0                                                           ! Specific gas constant of ambient
       MOL_RAT = GET_VOLUME_FRACTION(H2O_INDEX,Z_ARRAY,R_MIXTURE)/&
-         (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE)+TWO_EPSILON_EB) ! Molar ratio
+         (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE)+TWENTY_EPSILON_EB) ! Molar ratio
       BBFA = A_WSGG(TMPA,MOL_RAT,IBND)
    ELSE
       BBFA = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),TMPA)
@@ -3631,7 +3648,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          Z_ARRAY(1:N_TRACKED_SPECIES) = SPECIES_MIXTURE(1:N_TRACKED_SPECIES)%ZZ0     ! Mass frac of the tracked species in ambient
          R_MIXTURE = RSUM0                                                           ! Specific gas constant of ambient
          MOL_RAT = GET_VOLUME_FRACTION(H2O_INDEX,Z_ARRAY,R_MIXTURE)/&
-            (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE)+TWO_EPSILON_EB) ! Molar ratio
+            (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE)+TWENTY_EPSILON_EB) ! Molar ratio
          BBF = A_WSGG(RADTMP,MOL_RAT,IBND)
       ELSE
          BBF = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),RADTMP)
@@ -3646,7 +3663,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                DO J=1,JBAR
                   DO I=1,IBAR
                      IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
-                     IF (ABS(AVG_DROP_AREA(I,J,K,ARRAY_INDEX))<TWO_EPSILON_EB) CYCLE
+                     IF (ABS(AVG_DROP_AREA(I,J,K,ARRAY_INDEX))<TWENTY_EPSILON_EB) CYCLE
                      NCSDROP = AVG_DROP_AREA(I,J,K,ARRAY_INDEX)
                      CALL INTERPOLATE1D(LPC%R50,LPC%WQABS(:,IBND),AVG_DROP_RAD(I,J,K,ARRAY_INDEX),QVAL)
                      KAPPA_PART(I,J,K) = KAPPA_PART(I,J,K) + NCSDROP*QVAL
@@ -3741,7 +3758,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                R_MIXTURE = RSUM(I,J,K)                                                       ! Specific gas constant of the mixture
                X_H2O = GET_VOLUME_FRACTION(H2O_INDEX,Z_ARRAY,R_MIXTURE)
                X_CO2 = GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE)
-               MOL_RAT = X_H2O/(X_CO2 + TWO_EPSILON_EB)                                      ! Molar ratio
+               MOL_RAT = X_H2O/(X_CO2 + TWENTY_EPSILON_EB)                                      ! Molar ratio
                TOTAL_P = PBAR(K,PRESSURE_ZONE(I,J,K)) + RHO(I,J,K)*(H(I,J,K)-KRES(I,J,K))    ! Total pressure
                PARTIAL_P = TOTAL_P*(X_H2O + X_CO2)/P_STP                                     ! Partial press of the CO2-H2O mixture
                BBF = A_WSGG(TMP(I,J,K),MOL_RAT,IBND)                                         ! Temp coefficient for the jth gas
@@ -3876,7 +3893,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                   IF (CC_IBM) THEN
                      IF (CCVAR(I,J,K,CC_CGSC)==CC_SOLID) CYCLE
                   ENDIF
-                  IF (ZZ(I,J,K,N) < TWO_EPSILON_EB) CYCLE
+                  IF (ZZ(I,J,K,N) < TWENTY_EPSILON_EB) CYCLE
                   NCSDROP = 1.5_EB*ZZ(I,J,K,N)*RHO(I,J,K)/ &
                             (SPECIES(SPECIES_MIXTURE(N)%SINGLE_SPEC_INDEX)%DENSITY_LIQUID*SPECIES_MIXTURE(N)%MEAN_DIAMETER)
                   CALL INTERPOLATE1D(SPECIES_MIXTURE(N)%R50,SPECIES_MIXTURE(N)%WQABS(:,IBND),&
@@ -3923,7 +3940,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                Z_ARRAY(1:N_TRACKED_SPECIES) = ZZ(BC%IIG,BC%JJG,BC%KKG,1:N_TRACKED_SPECIES)
                R_MIXTURE = RSUM(BC%IIG,BC%JJG,BC%KKG)
                MOL_RAT = GET_VOLUME_FRACTION(H2O_INDEX,Z_ARRAY,R_MIXTURE)/&
-                  (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE) + TWO_EPSILON_EB)
+                  (GET_VOLUME_FRACTION(CO2_INDEX,Z_ARRAY,R_MIXTURE) + TWENTY_EPSILON_EB)
                BBF = A_WSGG(B1%TMP_F,MOL_RAT,IBND) ! Temperature coefficient for the jth gray gas in the boundary
             ENDIF                                     ! (use information of the cell adjacent to the boundary)
             SF  => SURFACE(WC%SURF_INDEX)
@@ -4169,6 +4186,38 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                      IF (SOLID_PARTICLES) IL_UP(I,J,K) = MAX(0._EB,AIU_SUM/A_SUM)
                   ENDDO I2LOOP
                ENDDO K2LOOP
+
+            ELSEIF (.NOT.CC_IBM .AND. CPU_SWEEP_MODE==CPU_SWEEP_SERIAL) THEN GEOMETRY2  ! 3D cartesian, rows in array order
+
+               DO K=KSTART,KEND,KSTEP
+                  DO J=JSTART,JEND,JSTEP
+                     CALL SWEEP_ROW(J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
+                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
+                  ENDDO
+               ENDDO
+
+            ELSEIF (.NOT.CC_IBM .AND. CPU_SWEEP_MODE==CPU_SWEEP_ROWS) THEN GEOMETRY2  ! 3D cartesian, diagonals of rows
+
+               ! Row (J,K) needs rows (J-JSTEP,K) and (J,K-KSTEP) only, so the rows with the same number of steps
+               ! from the corner (JSTART,KSTART) are independent.
+
+               ROW_DIAGONAL_LOOP: DO N_SLICE=0,JBAR+KBAR-2
+                  ROW_FIRST = MAX(0,N_SLICE-JBAR+1)  ! steps in K of the first and last row of the diagonal
+                  ROW_LAST  = MIN(KBAR-1,N_SLICE)
+                  IF (ROW_LAST-ROW_FIRST+1<CPU_SWEEP_MIN_PARALLEL_ROWS) THEN
+                     DO IROW=ROW_FIRST,ROW_LAST
+                        CALL SWEEP_ROW(JSTART+JSTEP*(N_SLICE-IROW),KSTART+KSTEP*IROW,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
+                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
+                     ENDDO
+                  ELSE
+                     !$OMP PARALLEL DO SCHEDULE(STATIC)
+                     DO IROW=ROW_FIRST,ROW_LAST
+                        CALL SWEEP_ROW(JSTART+JSTEP*(N_SLICE-IROW),KSTART+KSTEP*IROW,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
+                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
+                     ENDDO
+                     !$OMP END PARALLEL DO
+                  ENDIF
+               ENDDO ROW_DIAGONAL_LOOP
 
             ELSE GEOMETRY2  ! Sweep in 3D cartesian geometry
 
@@ -4416,7 +4465,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                         TEMP_ORIENTATION(3) = EVALUATE_RAMP(T,IN%ORIENTATION_RAMP_INDEX(3))
                         TEMP_ORIENTATION = TEMP_ORIENTATION / &
                                            (SQRT(TEMP_ORIENTATION(1)**2+TEMP_ORIENTATION(2)**2+TEMP_ORIENTATION(3)**2) &
-                                           +TWO_EPSILON_EB)
+                                           +TWENTY_EPSILON_EB)
                      ENDIF
                   ENDIF
                   COS_DLO = -DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
@@ -4458,7 +4507,8 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          IF (WC%BOUNDARY_TYPE/=SOLID_BOUNDARY) CYCLE
          B1 => BOUNDARY_PROP1(WC%B1_INDEX)
          SF => SURFACE(WC%SURF_INDEX)
-         IF (SF%EXTERNAL_FLUX > TWO_EPSILON_EB) THEN
+         IF (SF%TMP_GAS_FRONT>0._EB) CYCLE
+         IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
             IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
                TSI = T
             ELSE
@@ -4476,7 +4526,8 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          IF (CFACE(ICF)%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
          B1 => BOUNDARY_PROP1(CFA%B1_INDEX)
          SF => SURFACE(CFA%SURF_INDEX)
-         IF (SF%EXTERNAL_FLUX > TWO_EPSILON_EB) THEN
+         IF (SF%TMP_GAS_FRONT>0._EB) CYCLE
+         IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
             IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
                TSI = T
             ELSE
@@ -4543,8 +4594,9 @@ IF (SOLID_PARTICLES .AND. UPDATE_INTENSITY) THEN
       LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
       IF (LPC%SOLID_PARTICLE .OR. LPC%MASSLESS_TARGET) THEN
          SF => SURFACE(LPC%SURF_INDEX)
+         IF (SF%TMP_GAS_FRONT>0._EB) CYCLE PARTICLE_LOOP
          B1 => BOUNDARY_PROP1(LP%B1_INDEX)
-         IF (SF%EXTERNAL_FLUX > TWO_EPSILON_EB) THEN
+         IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
             IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
                TSI = T
             ELSE
@@ -4595,11 +4647,86 @@ IF (N_RADF>0 .AND. T>=RADF_CLOCK(RADF_COUNTER(NM))) THEN
 
 ENDIF
 
-! UPDATE_ALL_ANGLES is a one-time only logical. If needed again, it will be reset again.
-
-UPDATE_ALL_ANGLES = .FALSE.
-
 END SUBROUTINE RADIATION_FVM
+
+
+!> \brief Sweep one row (J,K) of a 3-D Cartesian mesh without cut cells along I for angle N (see CPU_SWEEP_MODE).
+!> The same arithmetic as SLICE_LOOP of RADIATION_FVM, so that all sweep orders give identical intensities.
+
+SUBROUTINE SWEEP_ROW(J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
+
+INTEGER, INTENT(IN) :: J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP
+REAL(EB), INTENT(IN) :: RSA_RAT
+REAL(EB), POINTER, INTENT(IN), DIMENSION(:,:,:) :: IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD  ! no copies
+INTEGER :: I,IC
+REAL(EB) :: AY1,AX,VC1,AZ1,ILXU,ILYU,ILZU,VC,AY,AZ,AXU,AYU,AZU,AXD,AYD,AZD,AFD,AILFU,A_SUM,AIU_SUM,RAP
+
+AY1 = DZ(K) * ABS(DLY(N))
+AX  = DY(J) * DZ(K) * ABS(DLX(N))
+VC1 = DY(J) * DZ(K)
+AZ1 = DY(J) * ABS(DLZ(N))
+
+ROW_LOOP: DO I=ISTART,IEND,ISTEP
+   ILXU  = IL(I-ISTEP,J,K)
+   ILYU  = IL(I,J-JSTEP,K)
+   ILZU  = IL(I,J,K-KSTEP)
+   IC = CELL_INDEX(I,J,K)
+   IF (IC/=0) THEN
+      IF (CELL(IC)%SOLID) CYCLE ROW_LOOP
+      IF (CELL_ILW(IC,1)>-1.E6_EB) ILXU = CELL_ILW(IC,1)
+      IF (CELL_ILW(IC,2)>-1.E6_EB) ILYU = CELL_ILW(IC,2)
+      IF (CELL_ILW(IC,3)>-1.E6_EB) ILZU = CELL_ILW(IC,3)
+   ENDIF
+   VC  = DX(I) * VC1
+   AY  = DX(I) * AY1
+   AZ  = DX(I) * AZ1
+
+   AXU = AX; AXD = AX
+   AYU = AY; AYD = AY
+   AZU = AZ; AZD = AZ
+
+   AILFU = 0._EB; AFD = 0._EB
+
+   A_SUM = AXD + AYD + AZD + AFD
+   AIU_SUM = AXU*ILXU + AYU*ILYU + AZU*ILZU + AILFU
+   IF (SOLID_PARTICLES) IL_UP(I,J,K) = MAX(0._EB,AIU_SUM/A_SUM)
+   RAP = 1._EB/(A_SUM + EXTCOE(I,J,K)*VC*RSA(N))
+   IL(I,J,K) = MAX(0._EB, RAP * (AIU_SUM + VC*RSA(N)*RFPI* &
+                   ( KFST4_GAS(I,J,K) + KFST4_PART(I,J,K) + RSA_RAT*&
+                   (SCAEFF(I,J,K)+SCAEFF_G(I,J,K))*UIIOLD(I,J,K) ) ) )
+ENDDO ROW_LOOP
+
+END SUBROUTINE SWEEP_ROW
+
+
+!> \brief Choose the order of the cells in the 3-D Cartesian sweep of RADIATION_FVM (see CPU_SWEEP_MODE).
+
+SUBROUTINE SET_CPU_SWEEP_MODE
+
+!$ USE OMP_LIB, ONLY: OMP_GET_MAX_THREADS
+CHARACTER(16) :: TEXT
+INTEGER :: ISTAT,N_THREADS
+
+CPU_SWEEP_MODE = CPU_SWEEP_SERIAL
+CALL GET_ENVIRONMENT_VARIABLE('GFDS_RADI_CPU_SWEEP',TEXT,STATUS=ISTAT)
+IF (ISTAT==0) THEN
+   SELECT CASE(TRIM(TEXT))
+      CASE('SLICE','slice')   ; CPU_SWEEP_MODE = CPU_SWEEP_SLICE
+      CASE('SERIAL','serial') ; CPU_SWEEP_MODE = CPU_SWEEP_SERIAL
+      CASE('ROWS','rows')     ; CPU_SWEEP_MODE = CPU_SWEEP_ROWS
+   END SELECT
+ENDIF
+N_THREADS = 1
+!$ N_THREADS = OMP_GET_MAX_THREADS()
+SELECT CASE(CPU_SWEEP_MODE)
+   CASE(CPU_SWEEP_SLICE) ; TEXT = 'SLICE'
+   CASE(CPU_SWEEP_ROWS)  ; TEXT = 'ROWS'
+   CASE DEFAULT          ; TEXT = 'SERIAL'
+END SELECT
+IF (CC_IBM) TEXT = 'SLICE (cut cells)'
+IF (MY_RANK==0 .AND. VERBOSE) WRITE(LU_ERR,'(A,A,A,I0,A)') ' Radiation CPU sweep: ',TRIM(TEXT),' (OpenMP threads: ',N_THREADS,')'
+
+END SUBROUTINE SET_CPU_SWEEP_MODE
 
 
 !> \brief Add user-specified HRRPUV to the heat release rate term, Q
@@ -4736,7 +4863,7 @@ REAL(EB) :: SUM_KAPPA
 
 ! If no CO2 or H2O, return zero
 
-IF ((X_H2O<=TWO_EPSILON_EB) .AND. (X_CO2<=TWO_EPSILON_EB)) THEN
+IF ((X_H2O<=TWENTY_EPSILON_EB) .AND. (X_CO2<=TWENTY_EPSILON_EB)) THEN
    KAPPA_WSGG = 0._EB
    RETURN
 ENDIF

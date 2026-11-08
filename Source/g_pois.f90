@@ -8,6 +8,8 @@ MODULE G_POIS
     USE PRECISION_PARAMETERS, ONLY: EB
     USE CUDAFOR
     USE MESH_POINTERS, ONLY: IBAR, JBAR, KBAR, IBP1, JBP1, KBP1
+    USE MESH_VARIABLES, ONLY: MESHES
+    USE GLOBAL_CONSTANTS, ONLY: TWO_D, CYLINDRICAL
     USE G_MESH_POINTERS
     USE G_ERRO, ONLY: GPU_WAIT
     IMPLICIT NONE
@@ -77,15 +79,47 @@ MODULE G_POIS
       !----------------------------------------------------------------------------
       SUBROUTINE CHECK_GPU_POISSON_SETUP(NM)
         USE MESH_VARIABLES, ONLY: MESHES
+        USE COMP_FUNCTIONS, ONLY: SHUTDOWN
         INTEGER, INTENT(IN) :: NM
+        CHARACTER(120) :: REASON
 
-        IF (MIN(MESHES(NM)%LBC,MESHES(NM)%MBC,MESHES(NM)%NBC)<0 .OR. &
-            MAX(MESHES(NM)%LBC,MESHES(NM)%MBC,MESHES(NM)%NBC)>4) &
-            ERROR STOP 'GPU Fishpak supports pressure boundary codes 0:4'
-        IF (ALLOCATED(GPU_MESHES(NM)%POIS%STRETCH)) RETURN
-        IF (MESHES(NM)%LBC==0 .AND. MESHES(NM)%IBAR>MAX_FISHPAK_LINE) &
-            ERROR STOP 'GPU Fishpak periodic x line exceeds MAX_FISHPAK_LINE'
+        IF (.NOT.ALLOCATED(GPU_MESHES(NM)%POIS)) RETURN  ! no Poisson solver (FREEZE_VELOCITY, see INIT_GPU_VALUES)
+        ! The device solver reproduces H3CZSS and, in 2D Cartesian (JBAR=1), H2CZSS with a uniform grid.
+        ! Cylindrical (H2CYSS) and stretched 2D grids are not ported: refuse instead of solving the wrong system.
+        REASON = GPU_POISSON_UNSUPPORTED(NM)
+        IF (LEN_TRIM(REASON)==0) RETURN
+        CALL SHUTDOWN('ERROR: GPU: '//TRIM(REASON)//' is not supported; run this case with --c',PROCESS_0_ONLY=.FALSE.)
       END SUBROUTINE CHECK_GPU_POISSON_SETUP
+
+      !> Reason why the device Poisson solver cannot solve mesh NM, blank if it can
+      FUNCTION GPU_POISSON_UNSUPPORTED(NM) RESULT(REASON)
+        USE MESH_VARIABLES, ONLY: MESHES
+        INTEGER, INTENT(IN) :: NM
+        CHARACTER(120) :: REASON
+        INTEGER :: IPS,BC1
+        CHARACTER(12) :: TXT
+        REASON = ''
+        IPS = MESHES(NM)%IPS
+        IF (CYLINDRICAL) THEN
+           REASON = 'CYLINDRICAL geometry in the pressure solver'
+        ELSEIF (TWO_D .AND. IPS/=0) THEN
+           REASON = 'a stretched (TRN*) grid in 2D in the pressure solver'
+        ELSEIF (MIN(MESHES(NM)%LBC,MESHES(NM)%MBC,MESHES(NM)%NBC)<0 .OR. &
+                MAX(MESHES(NM)%LBC,MESHES(NM)%MBC,MESHES(NM)%NBC)>4) THEN
+           REASON = 'a pressure boundary code outside 0:4 in the pressure solver'
+        ELSEIF (IPS>=1 .AND. IPS<=6) THEN
+           ! INITIALIZE_STRETCHED_POISSON solves tridiagonal lines along the first axis of ORDER; a periodic line is not ported
+           SELECT CASE(IPS)
+              CASE(1,4,5); BC1 = MESHES(NM)%LBC
+              CASE(2);     BC1 = MESHES(NM)%MBC
+              CASE DEFAULT; BC1 = MESHES(NM)%NBC
+           END SELECT
+           IF (BC1==0) REASON = 'a PERIODIC boundary along a stretched (TRN*) direction in the pressure solver'
+        ELSEIF (MESHES(NM)%LBC==0 .AND. MESHES(NM)%IBAR>MAX_FISHPAK_LINE) THEN
+           WRITE(TXT,'(I0)') MAX_FISHPAK_LINE
+           REASON = 'a PERIODIC x line longer than '//TRIM(TXT)//' cells in the pressure solver'
+        ENDIF
+      END FUNCTION GPU_POISSON_UNSUPPORTED
 
       SUBROUTINE INITIALIZE_GPU_POISSON_SOLVER(NM,DX,DY,DZ,LBC,MBC,NBC,SAVE_F)
         USE MESH_VARIABLES, ONLY: MESHES
@@ -96,6 +130,8 @@ MODULE G_POIS
 
         GM => GPU_MESHES(NM)
         IF (.NOT.ALLOCATED(GM%POIS)) ALLOCATE(GM%POIS)
+        ! Unsupported layouts are refused by CHECK_GPU_POISSON_SETUP; do not read their SAVE1 here.
+        IF (LEN_TRIM(GPU_POISSON_UNSUPPORTED(NM))>0) RETURN
         IF (MESHES(NM)%IPS>=1 .AND. MESHES(NM)%IPS<=6) THEN
            ALLOCATE(GM%POIS%STRETCH)
            CALL INITIALIZE_STRETCHED_POISSON(GM%POIS%STRETCH,[IBAR,JBAR,KBAR],MESHES(NM)%IPS, &
@@ -178,7 +214,7 @@ MODULE G_POIS
         TYPE(DIM3) :: BLK, GRD, RBLK, RGRD, XBLK, XGRD
         INTEGER :: N_LINES,X_LINES_PER_BLOCK
         LOGICAL :: SINGULAR_POISSON
-        INTEGER :: BC_CLASS
+        INTEGER :: BC_CLASS,MBC_RHS
 
         GM => GPU_MESHES(NM)
         BC_CLASS = PRESSURE_BC_CLASS(LBC,MBC,NBC)
@@ -187,9 +223,12 @@ MODULE G_POIS
 
         BLK = DIM3(8,4,4)
         GRD = DIM3((IBAR+7)/8, (JBAR+3)/4, (KBAR+3)/4)
+        ! H2CZSS (2D) has no y boundary terms in the right-hand side.
+        MBC_RHS = MBC
+        IF (TWO_D) MBC_RHS = -1
         CALL FISHPAK_APPLY_BC_KERNEL<<<GRD,BLK,0,GM%STRM>>>(PRHS, GM%POIS%RHS_D, BXS, BXF, BYS, BYF, BZS, BZF, &
                                                    GM%POIS%AX_D, GM%POIS%CX_D, IBAR, JBAR, KBAR, IBP1, JBP1, KBP1, &
-                                                   DX, DY, DZ, LBC, MBC, NBC)
+                                                   DX, DY, DZ, LBC, MBC_RHS, NBC)
 
         SINGULAR_POISSON = (BC_CLASS == PRESSURE_BC_CLASS_PURE_NEUMANN .OR. PRESSURE_BC_IS_SINGULAR(LBC,MBC,NBC))
         IF (SINGULAR_POISSON) THEN
@@ -300,6 +339,8 @@ MODULE G_POIS
         REAL(EB), ALLOCATABLE :: AX_H(:), CX_H(:), FCTRD_H(:,:,:)
         REAL(EB), ALLOCATABLE :: UY_H(:,:), UZ_H(:,:), LAMY_H(:), LAMZ_H(:)
         INTEGER :: I, J, K, IS_TOP, IA, IB, IC, ICFY, ICFZ, IFCTRD, LDIMFC, OFF
+        LOGICAL :: SAVE_2D
+        INTEGER :: M_F, N_F, JF, KF
 
         CALL ENSURE_FISHPAK_SETUP(NM,DX,DY,DZ,LBC,MBC,NBC)
         IF (GM%POIS%FISHPAK_SAVE1_READY .AND. ALLOCATED(GM%POIS%FCTRD_D)) RETURN
@@ -309,15 +350,28 @@ MODULE G_POIS
         ALLOCATE(UY_H(JBAR,JBAR), UZ_H(KBAR,KBAR))
         ALLOCATE(LAMY_H(JBAR), LAMZ_H(KBAR))
 
-        IS_TOP = 12 + 4*IBAR
+        ! init.f90 factors the operator with H3CZIS in 3D and with H2CZIS in 2D Cartesian (x-z, or x-y for IPS=7).
+        ! Both hand their coefficients to FSH00S at SAVE(IS) (IS=12+4*IBAR for H3CZIS, 9+4*IBAR for H2CZIS); FSH00S
+        ! stores A, C and the tridiagonal factors FCTRD(LDIMFC,M,N). In 2D FSH00S's M is the second 2D direction
+        ! and N=1, so FCTRD(I,K) of the x-z problem sits where FCTRD(I,1,K) would be in 3D.
+        SAVE_2D = (TWO_D .AND. .NOT.CYLINDRICAL) .OR. MESHES(NM)%IPS==7
+        IF (SAVE_2D) THEN
+           IS_TOP = 9 + 4*IBAR
+           M_F = KBAR; N_F = 1
+           IF (MESHES(NM)%IPS==7) M_F = JBAR
+        ELSE
+           IS_TOP = 12 + 4*IBAR
+           M_F = JBAR; N_F = KBAR
+        ENDIF
         IA = 12
         IB = IA + IBAR
         IC = IB + IBAR
         ICFY = IC + IBAR
-        ICFZ = ICFY + 4*JBAR
-        IFCTRD = ICFZ + 4*KBAR
+        ICFZ = ICFY + 4*M_F
+        IFCTRD = ICFZ + 4*N_F
+        ! S3CFIS/S2CFIS: LDIMFC=L, or L+1 if LDIMF (=ITRN) > L and L is even
         LDIMFC = IBAR
-        IF (IBP1 > IBAR .AND. MOD(IBAR,2) == 0) LDIMFC = IBAR + 1
+        IF (MESHES(NM)%ITRN > IBAR .AND. MOD(IBAR,2) == 0) LDIMFC = IBAR + 1
 
         DO I = 1, IBAR
            AX_H(I) = SAVE_F(IS_TOP + IA + (I-1) + 3)
@@ -326,8 +380,13 @@ MODULE G_POIS
 
         DO K = 1, KBAR
            DO J = 1, JBAR
+              IF (SAVE_2D) THEN
+                 JF = MERGE(J,K,MESHES(NM)%IPS==7); KF = 1
+              ELSE
+                 JF = J; KF = K
+              ENDIF
               DO I = 1, IBAR
-                 OFF = (I-1) + (K-1)*LDIMFC + (J-1)*LDIMFC*KBAR
+                 OFF = (I-1) + (KF-1)*LDIMFC + (JF-1)*LDIMFC*N_F
                  FCTRD_H(I,J,K) = SAVE_F(IS_TOP + IFCTRD + OFF + 3)
               ENDDO
            ENDDO

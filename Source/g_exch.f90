@@ -10,6 +10,18 @@ MODULE G_EXCH
     USE G_ERRO, ONLY: GPU_WAIT,GPU_WAIT_ALL,GPU_MPI_IRECV,GPU_MPI_ISEND,GPU_MPI_WAITALL
     USE CUDAFOR
     INTEGER, PARAMETER :: HT1D_EXCHANGE_THREADS = 128
+
+    ! Single process: the copy kernels of one exchange (CODE, predictor/corrector) never change -- same arrays, same
+    ! bounds -- so they are captured once into a CUDA graph (one branch per source mesh stream) and replayed with one
+    ! launch instead of one launch per field and mesh pair. GFDS_EXCHANGE_GRAPH=0 switches this off.
+    INTEGER, PARAMETER :: N_EXCH_GRAPHS = 12
+    TYPE(cudaGraphExec), SAVE :: EXCH_GRAPH(N_EXCH_GRAPHS)
+    LOGICAL, SAVE :: EXCH_GRAPH_READY(N_EXCH_GRAPHS) = .FALSE.
+    INTEGER, SAVE :: EXCH_GRAPH_MODE = -1   ! -1 not decided, 0 off, 1 on
+    INTEGER(KIND=CUDA_STREAM_KIND), SAVE :: EXCH_CAPTURE_STRM = 0
+    TYPE(cudaEvent), SAVE :: EXCH_EV0
+    TYPE(cudaEvent), ALLOCATABLE, SAVE :: EXCH_EV(:)
+
     CONTAINS
 
         !--------------------------------------------------------------------------
@@ -28,7 +40,7 @@ MODULE G_EXCH
 
             IF (N_MPI_PROCESSES>1) THEN
                 CALL GPU_MESH_EXCHANGE_MPI(CODE)
-            ELSE
+            ELSEIF (.NOT.EXCHANGE_GRAPH_LAUNCH(CODE)) THEN
                 DO NSRC=LOWER_MESH_INDEX,UPPER_MESH_INDEX
                     CALL COPY_GPU_EXCHANGE_SOURCE(CODE,NSRC)
                 ENDDO
@@ -291,10 +303,14 @@ MODULE G_EXCH
             RHOS,D_FIELD,MU,KRES,Q,ZZS,IIO,JJO,KKO,IOR,SEND_PKG,NIC,NI,NJ,NK,N_SCALARS)
             IMPLICIT NONE
 
+            ! NI,NJ,NK = IBP1+1,JBP1+1,KBP1+1. RHOS and ZZS are padded (-1:IBP1+1,...) for the second ghost layer.
             INTEGER, VALUE :: NIC,NI,NJ,NK,N_SCALARS
             INTEGER, DEVICE, DIMENSION(*) :: IIO,JJO,KKO,IOR
-            REAL(EB), DEVICE, DIMENSION(*) :: RHOS,D_FIELD,MU,KRES,Q,ZZS,SEND_PKG
-            INTEGER :: LL,II1,II2,JJ1,JJ2,KK1,KK2,IDX1,IDX2,NN,NQT,PKG_BASE,FIELD_SIZE
+            REAL(EB), DEVICE, DIMENSION(0:NI-1,0:NJ-1,0:*) :: D_FIELD,MU,KRES,Q
+            REAL(EB), DEVICE, DIMENSION(-1:NI,-1:NJ,-1:*) :: RHOS
+            REAL(EB), DEVICE, DIMENSION(-1:NI,-1:NJ,-1:NK,1:*) :: ZZS
+            REAL(EB), DEVICE, DIMENSION(*) :: SEND_PKG
+            INTEGER :: LL,II1,II2,JJ1,JJ2,KK1,KK2,NN,NQT,PKG_BASE
 
             LL = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
             IF (LL>NIC) RETURN
@@ -311,21 +327,18 @@ MODULE G_EXCH
                 CASE( 3); KK2 = KK1 - 1
             END SELECT
 
-            IDX1 = 1 + II1 + NI*(JJ1 + NJ*KK1)
-            IDX2 = 1 + II2 + NI*(JJ2 + NJ*KK2)
             NQT = 6 + 2*N_SCALARS
             PKG_BASE = NQT*(LL-1)
-            FIELD_SIZE = NI*NJ*NK
 
-            SEND_PKG(PKG_BASE+1) = RHOS(IDX1)
-            SEND_PKG(PKG_BASE+2) = RHOS(IDX2)
-            SEND_PKG(PKG_BASE+3) = MU(IDX1)
-            SEND_PKG(PKG_BASE+4) = KRES(IDX1)
-            SEND_PKG(PKG_BASE+5) = D_FIELD(IDX1)
-            SEND_PKG(PKG_BASE+6) = Q(IDX1)
+            SEND_PKG(PKG_BASE+1) = RHOS(II1,JJ1,KK1)
+            SEND_PKG(PKG_BASE+2) = RHOS(II2,JJ2,KK2)
+            SEND_PKG(PKG_BASE+3) = MU(II1,JJ1,KK1)
+            SEND_PKG(PKG_BASE+4) = KRES(II1,JJ1,KK1)
+            SEND_PKG(PKG_BASE+5) = D_FIELD(II1,JJ1,KK1)
+            SEND_PKG(PKG_BASE+6) = Q(II1,JJ1,KK1)
             DO NN=1,N_SCALARS
-                SEND_PKG(PKG_BASE+6+2*NN-1) = ZZS(IDX1+FIELD_SIZE*(NN-1))
-                SEND_PKG(PKG_BASE+6+2*NN  ) = ZZS(IDX2+FIELD_SIZE*(NN-1))
+                SEND_PKG(PKG_BASE+6+2*NN-1) = ZZS(II1,JJ1,KK1,NN)
+                SEND_PKG(PKG_BASE+6+2*NN  ) = ZZS(II2,JJ2,KK2,NN)
             ENDDO
 
         END SUBROUTINE PACK_GPU_EXCHANGE_CODE_1_KERNEL
@@ -377,9 +390,14 @@ MODULE G_EXCH
             H,U,V,W,SEND_PKG,I_MIN,I_MAX,J_MIN,J_MAX,K_MIN,K_MAX,NI,NJ,N_ITEMS)
             IMPLICIT NONE
 
+            ! NI,NJ = IBP1+1,JBP1+1. U, V, W have an extra row of faces below the mesh (FDS 6.11.1).
             INTEGER, VALUE :: I_MIN,I_MAX,J_MIN,J_MAX,K_MIN,K_MAX,NI,NJ,N_ITEMS
-            REAL(EB), DEVICE, DIMENSION(*) :: H,U,V,W,SEND_PKG
-            INTEGER :: LL,I,J,K,NX,NY,SRC_IDX,PKG_BASE
+            REAL(EB), DEVICE, DIMENSION(0:NI-1,0:NJ-1,0:*) :: H
+            REAL(EB), DEVICE, DIMENSION(-1:NI-1,0:NJ-1,0:*) :: U
+            REAL(EB), DEVICE, DIMENSION(0:NI-1,-1:NJ-1,0:*) :: V
+            REAL(EB), DEVICE, DIMENSION(0:NI-1,0:NJ-1,-1:*) :: W
+            REAL(EB), DEVICE, DIMENSION(*) :: SEND_PKG
+            INTEGER :: LL,I,J,K,NX,NY,PKG_BASE
 
             LL = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 1
             IF (LL>=N_ITEMS) RETURN
@@ -389,13 +407,12 @@ MODULE G_EXCH
             I = I_MIN + MOD(LL,NX)
             J = J_MIN + MOD(LL/NX,NY)
             K = K_MIN + LL/(NX*NY)
-            SRC_IDX = 1 + I + NI*(J + NJ*K)
             PKG_BASE = 4*LL
 
-            SEND_PKG(PKG_BASE+1) = H(SRC_IDX)
-            SEND_PKG(PKG_BASE+2) = U(SRC_IDX)
-            SEND_PKG(PKG_BASE+3) = V(SRC_IDX)
-            SEND_PKG(PKG_BASE+4) = W(SRC_IDX)
+            SEND_PKG(PKG_BASE+1) = H(I,J,K)
+            SEND_PKG(PKG_BASE+2) = U(I,J,K)
+            SEND_PKG(PKG_BASE+3) = V(I,J,K)
+            SEND_PKG(PKG_BASE+4) = W(I,J,K)
 
         END SUBROUTINE PACK_GPU_EXCHANGE_CODE_3_KERNEL
 
@@ -541,19 +558,84 @@ MODULE G_EXCH
         !--------------------------------------------------------------------------
         ! Same-rank device-to-device source copy
         !--------------------------------------------------------------------------
+        !> Replay (capturing it the first time) the graph of the single-process exchange CODE. The graph is launched on
+        !> the legacy default stream, so it starts after all work launched before on the mesh streams, as the copies did
+        !> on the source mesh streams. .FALSE.: not available, copy directly.
+
+        LOGICAL FUNCTION EXCHANGE_GRAPH_LAUNCH(CODE) RESULT(DONE)
+            INTEGER, INTENT(IN) :: CODE
+            INTEGER :: IG,NSRC,ISTAT,IERR,LEN_ENV
+            CHARACTER(8) :: ENV
+            TYPE(cudaGraph) :: GRAPH
+
+            DONE = .FALSE.
+            IF (EXCH_GRAPH_MODE==0) RETURN
+            IF (CODE<1 .OR. CODE>6 .OR. CODE==2) RETURN
+            IF (EXCH_GRAPH_MODE<0) THEN
+                EXCH_GRAPH_MODE = 1
+                CALL GET_ENVIRONMENT_VARIABLE('GFDS_EXCHANGE_GRAPH',ENV,LENGTH=LEN_ENV,STATUS=ISTAT)
+                IF (ISTAT==0 .AND. LEN_ENV>0) THEN
+                    IF (ENV(1:1)=='0') EXCH_GRAPH_MODE = 0
+                ENDIF
+                IF (GPU_DEBUG_H2D_D2H) EXCH_GRAPH_MODE = 0
+                IF (EXCH_GRAPH_MODE==0) RETURN
+            ENDIF
+            ! Capture only once all meshes are set up on the device (their arrays then keep their addresses)
+            IF (ICYC<1) RETURN
+            DO NSRC=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                IF (.NOT.GPU_MESHES(NSRC)%INITIALIZED) RETURN
+                IF (GPU_MESHES(NSRC)%STRM==0) RETURN
+            ENDDO
+
+            IG = 2*CODE - MERGE(1,0,PREDICTOR)
+            IF (.NOT.EXCH_GRAPH_READY(IG)) THEN
+                IERR = 0
+                IF (EXCH_CAPTURE_STRM==0) THEN
+                    IERR = IERR + ABS(cudaStreamCreate(EXCH_CAPTURE_STRM))
+                    IERR = IERR + ABS(cudaEventCreateWithFlags(EXCH_EV0,cudaEventDisableTiming))
+                    ALLOCATE(EXCH_EV(LOWER_MESH_INDEX:UPPER_MESH_INDEX))
+                    DO NSRC=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                        IERR = IERR + ABS(cudaEventCreateWithFlags(EXCH_EV(NSRC),cudaEventDisableTiming))
+                    ENDDO
+                ENDIF
+                IERR = IERR + ABS(cudaStreamBeginCapture(EXCH_CAPTURE_STRM,cudaStreamCaptureModeRelaxed))
+                IERR = IERR + ABS(cudaEventRecord(EXCH_EV0,EXCH_CAPTURE_STRM))
+                DO NSRC=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                    IERR = IERR + ABS(cudaStreamWaitEvent(GPU_MESHES(NSRC)%STRM,EXCH_EV0,0))
+                    CALL COPY_GPU_EXCHANGE_SOURCE(CODE,NSRC)
+                    IERR = IERR + ABS(cudaEventRecord(EXCH_EV(NSRC),GPU_MESHES(NSRC)%STRM))
+                    IERR = IERR + ABS(cudaStreamWaitEvent(EXCH_CAPTURE_STRM,EXCH_EV(NSRC),0))
+                ENDDO
+                IERR = IERR + ABS(cudaStreamEndCapture(EXCH_CAPTURE_STRM,GRAPH))
+                IF (IERR==0) IERR = IERR + ABS(cudaGraphInstantiate(EXCH_GRAPH(IG),GRAPH,0))
+                IF (IERR/=0) THEN
+                    WRITE(LU_ERR,'(A,I0,A)') ' GFDS: exchange graph capture failed (', IERR, '), direct copies are used'
+                    EXCH_GRAPH_MODE = 0
+                    RETURN
+                ENDIF
+                ISTAT = cudaGraphDestroy(GRAPH)
+                EXCH_GRAPH_READY(IG) = .TRUE.
+            ENDIF
+
+            ISTAT = cudaGraphLaunch(EXCH_GRAPH(IG),0_CUDA_STREAM_KIND)
+            IF (ISTAT/=0) THEN
+                WRITE(LU_ERR,'(A,I0)') ' GFDS: exchange graph launch failed ', ISTAT
+                RETURN
+            ENDIF
+            DONE = .TRUE.
+
+        END FUNCTION EXCHANGE_GRAPH_LAUNCH
+
         SUBROUTINE COPY_GPU_EXCHANGE_SOURCE(CODE,NSRC)
             IMPLICIT NONE
 
             INTEGER, INTENT(IN) :: CODE,NSRC
             INTEGER, PARAMETER :: BS = 8
             INTEGER :: NN,NDST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX
-            INTEGER :: SRC_NI,SRC_NJ,DST_NI,DST_NJ,DST_LB_I,DST_LB_J,DST_LB_K
+            INTEGER(KIND=CUDA_STREAM_KIND) :: STRM
             TYPE(OMESH_TYPE), POINTER :: SEND_OM
             TYPE(GPU_OMESH_TYPE), POINTER :: RECV_GOM
             TYPE(DIM3) :: BLKD,GRDD
-            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: SRC3_1(:,:,:),SRC3_2(:,:,:),SRC3_3(:,:,:),SRC3_4(:,:,:),SRC3_5(:,:,:)
-            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: DST3_1(:,:,:),DST3_2(:,:,:),DST3_3(:,:,:),DST3_4(:,:,:),DST3_5(:,:,:)
-            REAL(EB), DEVICE, POINTER, CONTIGUOUS :: SRC4(:,:,:,:),DST4(:,:,:,:)
 
             IF (.NOT.ALLOCATED(GPU_MESHES)) RETURN
             IF (NSRC < LBOUND(GPU_MESHES,1) .OR. NSRC > UBOUND(GPU_MESHES,1)) RETURN
@@ -579,91 +661,74 @@ MODULE G_EXCH
                 KMAX = SEND_OM%K_MAX_S
                 IF (IMIN>IMAX .OR. JMIN>JMAX .OR. KMIN>KMAX) CYCLE
 
-                SRC_NI = MESHES(NSRC)%IBP1 + 1
-                SRC_NJ = MESHES(NSRC)%JBP1 + 1
-                DST_NI = SIZE(RECV_GOM%RHO_D,1)
-                DST_NJ = SIZE(RECV_GOM%RHO_D,2)
-                DST_LB_I = LBOUND(RECV_GOM%RHO_D,1)
-                DST_LB_J = LBOUND(RECV_GOM%RHO_D,2)
-                DST_LB_K = LBOUND(RECV_GOM%RHO_D,3)
-
+                ! Source fields are copied one by one with their own bounds: RHO/RHOS/ZZ/ZZS and U/V/W are
+                ! padded for the second ghost layer (FDS 6.11.1), the other fields are 0:IBP1.
                 BLKD = DIM3(BS,BS,BS)
                 GRDD = DIM3((IMAX-IMIN+BS)/BS,(JMAX-JMIN+BS)/BS,(KMAX-KMIN+BS)/BS)
+                STRM = GPU_MESHES(NSRC)%STRM
 
                 SELECT CASE(CODE)
                     CASE(1)
-                        SRC3_1 => GPU_MESHES(NSRC)%RHOSD; DST3_1 => RECV_GOM%RHOS_D
-                        SRC3_2 => GPU_MESHES(NSRC)%D_D;   DST3_2 => RECV_GOM%D_D
-                        SRC3_3 => GPU_MESHES(NSRC)%MUD;   DST3_3 => RECV_GOM%MU_D
-                        SRC3_4 => GPU_MESHES(NSRC)%KRESD; DST3_4 => RECV_GOM%KRES_D
-                        SRC3_5 => GPU_MESHES(NSRC)%QD;    DST3_5 => RECV_GOM%Q_D
-                        CALL COPY_GPU_FIELDS_5X3D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC3_1,SRC3_2,SRC3_3,SRC3_4,SRC3_5, &
-                            DST3_1,DST3_2,DST3_3,DST3_4,DST3_5,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                            DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
-                        SRC4 => GPU_MESHES(NSRC)%ZZSD
-                        DST4 => RECV_GOM%ZZS_D
-                        CALL COPY_GPU_FIELD_4D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC4,DST4,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                                                                     LBOUND(DST4,1),LBOUND(DST4,2),LBOUND(DST4,3), &
-                                                                     SIZE(SRC4,1),SIZE(SRC4,2),SIZE(SRC4,3), &
-                                                                     SIZE(DST4,1),SIZE(DST4,2),SIZE(DST4,3),N_TOTAL_SCALARS)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%RHOSD,RECV_GOM%RHOS_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%D_D,  RECV_GOM%D_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%MUD,  RECV_GOM%MU_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%KRESD,RECV_GOM%KRES_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%QD,   RECV_GOM%Q_D)
+                        CALL COPY_FIELD_4D(GPU_MESHES(NSRC)%ZZSD, RECV_GOM%ZZS_D)
                     CASE(3)
-                        SRC3_1 => GPU_MESHES(NSRC)%HSD; DST3_1 => RECV_GOM%HS_D
-                        SRC3_2 => GPU_MESHES(NSRC)%USD; DST3_2 => RECV_GOM%US_D
-                        SRC3_3 => GPU_MESHES(NSRC)%VSD; DST3_3 => RECV_GOM%VS_D
-                        SRC3_4 => GPU_MESHES(NSRC)%WSD; DST3_4 => RECV_GOM%WS_D
-                        CALL COPY_GPU_FIELDS_4X3D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC3_1,SRC3_2,SRC3_3,SRC3_4, &
-                            DST3_1,DST3_2,DST3_3,DST3_4,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                            DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%HSD,RECV_GOM%HS_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%USD,RECV_GOM%US_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%VSD,RECV_GOM%VS_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%WSD,RECV_GOM%WS_D)
                     CASE(4)
-                        SRC3_1 => GPU_MESHES(NSRC)%RHOD;  DST3_1 => RECV_GOM%RHO_D
-                        SRC3_2 => GPU_MESHES(NSRC)%DS_D;  DST3_2 => RECV_GOM%DS_D
-                        SRC3_3 => GPU_MESHES(NSRC)%MUD;   DST3_3 => RECV_GOM%MU_D
-                        SRC3_4 => GPU_MESHES(NSRC)%KRESD; DST3_4 => RECV_GOM%KRES_D
-                        SRC3_5 => GPU_MESHES(NSRC)%QD;    DST3_5 => RECV_GOM%Q_D
-                        CALL COPY_GPU_FIELDS_5X3D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC3_1,SRC3_2,SRC3_3,SRC3_4,SRC3_5, &
-                            DST3_1,DST3_2,DST3_3,DST3_4,DST3_5,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                            DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
-                        SRC4 => GPU_MESHES(NSRC)%ZZD
-                        DST4 => RECV_GOM%ZZ_D
-                        CALL COPY_GPU_FIELD_4D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC4,DST4,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                                                                     LBOUND(DST4,1),LBOUND(DST4,2),LBOUND(DST4,3), &
-                                                                     SIZE(SRC4,1),SIZE(SRC4,2),SIZE(SRC4,3), &
-                                                                     SIZE(DST4,1),SIZE(DST4,2),SIZE(DST4,3),N_TOTAL_SCALARS)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%RHOD, RECV_GOM%RHO_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%DS_D, RECV_GOM%DS_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%MUD,  RECV_GOM%MU_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%KRESD,RECV_GOM%KRES_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%QD,   RECV_GOM%Q_D)
+                        CALL COPY_FIELD_4D(GPU_MESHES(NSRC)%ZZD,  RECV_GOM%ZZ_D)
                     CASE(5)
-                        SRC3_1 => GPU_MESHES(NSRC)%FVXD; DST3_1 => RECV_GOM%FVX_D
-                        SRC3_2 => GPU_MESHES(NSRC)%FVYD; DST3_2 => RECV_GOM%FVY_D
-                        SRC3_3 => GPU_MESHES(NSRC)%FVZD; DST3_3 => RECV_GOM%FVZ_D
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%FVXD,RECV_GOM%FVX_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%FVYD,RECV_GOM%FVY_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%FVZD,RECV_GOM%FVZ_D)
                         IF (PREDICTOR) THEN
-                            SRC3_4 => GPU_MESHES(NSRC)%HD
-                            DST3_4 => RECV_GOM%H_D
+                            CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%HD,RECV_GOM%H_D)
                         ELSE
-                            SRC3_4 => GPU_MESHES(NSRC)%HSD
-                            DST3_4 => RECV_GOM%HS_D
+                            CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%HSD,RECV_GOM%HS_D)
                         ENDIF
-                        CALL COPY_GPU_FIELDS_4X3D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC3_1,SRC3_2,SRC3_3,SRC3_4, &
-                            DST3_1,DST3_2,DST3_3,DST3_4,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                            DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
                     CASE(6)
-                        SRC3_1 => GPU_MESHES(NSRC)%HD; DST3_1 => RECV_GOM%H_D
-                        SRC3_2 => GPU_MESHES(NSRC)%UD; DST3_2 => RECV_GOM%U_D
-                        SRC3_3 => GPU_MESHES(NSRC)%VD; DST3_3 => RECV_GOM%V_D
-                        SRC3_4 => GPU_MESHES(NSRC)%WD; DST3_4 => RECV_GOM%W_D
-                        CALL COPY_GPU_FIELDS_4X3D_KERNEL<<<GRDD,BLKD,0,GPU_MESHES(NSRC)%STRM>>>(SRC3_1,SRC3_2,SRC3_3,SRC3_4, &
-                            DST3_1,DST3_2,DST3_3,DST3_4,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
-                            DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%HD,RECV_GOM%H_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%UD,RECV_GOM%U_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%VD,RECV_GOM%V_D)
+                        CALL COPY_FIELD_3D(GPU_MESHES(NSRC)%WD,RECV_GOM%W_D)
                 END SELECT
             ENDDO
 
+        CONTAINS
+
+            SUBROUTINE COPY_FIELD_3D(SRC,DST)
+                REAL(EB), DEVICE, ALLOCATABLE, DIMENSION(:,:,:) :: SRC,DST
+                CALL COPY_GPU_FIELD_3D_KERNEL<<<GRDD,BLKD,0,STRM>>>(SRC,DST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
+                    LBOUND(SRC,1),UBOUND(SRC,1),LBOUND(SRC,2),UBOUND(SRC,2),LBOUND(SRC,3), &
+                    LBOUND(DST,1),UBOUND(DST,1),LBOUND(DST,2),UBOUND(DST,2),LBOUND(DST,3))
+            END SUBROUTINE COPY_FIELD_3D
+
+            SUBROUTINE COPY_FIELD_4D(SRC,DST)
+                REAL(EB), DEVICE, ALLOCATABLE, DIMENSION(:,:,:,:) :: SRC,DST
+                CALL COPY_GPU_FIELD_4D_KERNEL<<<GRDD,BLKD,0,STRM>>>(SRC,DST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
+                    LBOUND(SRC,1),UBOUND(SRC,1),LBOUND(SRC,2),UBOUND(SRC,2),LBOUND(SRC,3),UBOUND(SRC,3), &
+                    LBOUND(DST,1),UBOUND(DST,1),LBOUND(DST,2),UBOUND(DST,2),LBOUND(DST,3),UBOUND(DST,3),N_TOTAL_SCALARS)
+            END SUBROUTINE COPY_FIELD_4D
+
         END SUBROUTINE COPY_GPU_EXCHANGE_SOURCE
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE COPY_GPU_FIELDS_4X3D_KERNEL(SRC1,SRC2,SRC3,SRC4,DST1,DST2,DST3,DST4, &
-            IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
+        ATTRIBUTES(GLOBAL) SUBROUTINE COPY_GPU_FIELD_3D_KERNEL(SRC,DST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
+            SLI,SUI,SLJ,SUJ,SLK,DLI,DUI,DLJ,DUJ,DLK)
             IMPLICIT NONE
 
-            INTEGER, VALUE :: IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K
-            INTEGER, VALUE :: SRC_NI,SRC_NJ,DST_NI,DST_NJ
-            REAL(EB), DEVICE, DIMENSION(*) :: SRC1,SRC2,SRC3,SRC4,DST1,DST2,DST3,DST4
-            INTEGER :: I,J,K,SRC_IDX,DST_IDX
+            INTEGER, VALUE :: IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,SLI,SUI,SLJ,SUJ,SLK,DLI,DUI,DLJ,DUJ,DLK
+            REAL(EB), DEVICE :: SRC(SLI:SUI,SLJ:SUJ,SLK:*),DST(DLI:DUI,DLJ:DUJ,DLK:*)
+            INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X + IMIN - 1
             J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y + JMIN - 1
@@ -671,49 +736,17 @@ MODULE G_EXCH
 
             IF (I>IMAX .OR. J>JMAX .OR. K>KMAX) RETURN
 
-            SRC_IDX = 1 + I + SRC_NI*(J + SRC_NJ*K)
-            DST_IDX = 1 + (I-DST_LB_I) + DST_NI*((J-DST_LB_J) + DST_NJ*(K-DST_LB_K))
-            DST1(DST_IDX) = SRC1(SRC_IDX)
-            DST2(DST_IDX) = SRC2(SRC_IDX)
-            DST3(DST_IDX) = SRC3(SRC_IDX)
-            DST4(DST_IDX) = SRC4(SRC_IDX)
+            DST(I,J,K) = SRC(I,J,K)
 
-        END SUBROUTINE COPY_GPU_FIELDS_4X3D_KERNEL
+        END SUBROUTINE COPY_GPU_FIELD_3D_KERNEL
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE COPY_GPU_FIELDS_5X3D_KERNEL(SRC1,SRC2,SRC3,SRC4,SRC5,DST1,DST2,DST3,DST4,DST5, &
-            IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K,SRC_NI,SRC_NJ,DST_NI,DST_NJ)
+        ATTRIBUTES(GLOBAL) SUBROUTINE COPY_GPU_FIELD_4D_KERNEL(SRC,DST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX, &
+            SLI,SUI,SLJ,SUJ,SLK,SUK,DLI,DUI,DLJ,DUJ,DLK,DUK,N_SCALARS)
             IMPLICIT NONE
 
-            INTEGER, VALUE :: IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K
-            INTEGER, VALUE :: SRC_NI,SRC_NJ,DST_NI,DST_NJ
-            REAL(EB), DEVICE, DIMENSION(*) :: SRC1,SRC2,SRC3,SRC4,SRC5,DST1,DST2,DST3,DST4,DST5
-            INTEGER :: I,J,K,SRC_IDX,DST_IDX
-
-            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X + IMIN - 1
-            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y + JMIN - 1
-            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z + KMIN - 1
-
-            IF (I>IMAX .OR. J>JMAX .OR. K>KMAX) RETURN
-
-            SRC_IDX = 1 + I + SRC_NI*(J + SRC_NJ*K)
-            DST_IDX = 1 + (I-DST_LB_I) + DST_NI*((J-DST_LB_J) + DST_NJ*(K-DST_LB_K))
-            DST1(DST_IDX) = SRC1(SRC_IDX)
-            DST2(DST_IDX) = SRC2(SRC_IDX)
-            DST3(DST_IDX) = SRC3(SRC_IDX)
-            DST4(DST_IDX) = SRC4(SRC_IDX)
-            DST5(DST_IDX) = SRC5(SRC_IDX)
-
-        END SUBROUTINE COPY_GPU_FIELDS_5X3D_KERNEL
-
-        ATTRIBUTES(GLOBAL) SUBROUTINE COPY_GPU_FIELD_4D_KERNEL( &
-            SRC,DST,IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K, &
-            SRC_NI,SRC_NJ,SRC_NK,DST_NI,DST_NJ,DST_NK,N_SCALARS)
-            IMPLICIT NONE
-
-            INTEGER, VALUE :: IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,DST_LB_I,DST_LB_J,DST_LB_K
-            INTEGER, VALUE :: SRC_NI,SRC_NJ,SRC_NK,DST_NI,DST_NJ,DST_NK,N_SCALARS
-            REAL(EB), DEVICE, DIMENSION(*) :: SRC,DST
-            INTEGER :: I,J,K,N,SRC_IDX,DST_IDX
+            INTEGER, VALUE :: IMIN,IMAX,JMIN,JMAX,KMIN,KMAX,SLI,SUI,SLJ,SUJ,SLK,SUK,DLI,DUI,DLJ,DUJ,DLK,DUK,N_SCALARS
+            REAL(EB), DEVICE :: SRC(SLI:SUI,SLJ:SUJ,SLK:SUK,1:*),DST(DLI:DUI,DLJ:DUJ,DLK:DUK,1:*)
+            INTEGER :: I,J,K,N
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X + IMIN - 1
             J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y + JMIN - 1
@@ -722,9 +755,7 @@ MODULE G_EXCH
             IF (I>IMAX .OR. J>JMAX .OR. K>KMAX) RETURN
 
             DO N=1,N_SCALARS
-                SRC_IDX = 1 + I + SRC_NI*(J + SRC_NJ*(K + SRC_NK*(N-1)))
-                DST_IDX = 1 + (I-DST_LB_I) + DST_NI*((J-DST_LB_J) + DST_NJ*((K-DST_LB_K) + DST_NK*(N-1)))
-                DST(DST_IDX) = SRC(SRC_IDX)
+                DST(I,J,K,N) = SRC(I,J,K,N)
             ENDDO
 
         END SUBROUTINE COPY_GPU_FIELD_4D_KERNEL

@@ -87,6 +87,34 @@ target_compile_options(fds PRIVATE
 # Intel MKL interfaces.
 target_compile_definitions(fds PRIVATE WITH_MKL)
 
+# Revision in .out and .smv. Without .git (source copied as a tarball) pass -DGFDS_REVISION=... and
+# -DGFDS_REVISION_DATE=...;
+# otherwise "GFDS-" + git describe of the source tree.
+set(GFDS_REVISION "" CACHE STRING "Revision string written to .out and .smv")
+set(GFDS_REVISION_DATE "" CACHE STRING "Revision date for GFDS_REVISION (git log date if empty)")
+if(NOT GFDS_REVISION)
+  execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" describe --always --dirty --abbrev=10
+                  OUTPUT_VARIABLE _gfds_rev OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _gfds_rc)
+  if(_gfds_rc EQUAL 0 AND _gfds_rev)
+    set(GFDS_REVISION "GFDS-${_gfds_rev}")
+  endif()
+endif()
+if(GFDS_REVISION)
+  set(_gfds_defs GITHASH_PP="${GFDS_REVISION}")
+  set(_gfds_date "${GFDS_REVISION_DATE}")
+  if(NOT _gfds_date)
+    execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" log -1 --format=%cd
+                    OUTPUT_VARIABLE _gfds_date OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  if(_gfds_date)
+    list(APPEND _gfds_defs GITDATE_PP="${_gfds_date}")
+  endif()
+endif()
+string(TIMESTAMP _gfds_build "%b %d, %Y %H:%M:%S")
+list(APPEND _gfds_defs BUILDDATE_PP="${_gfds_build}")
+# only the two files that print them, so a new build date does not rebuild everything
+set_source_files_properties(Source/func.f90 Source/dump.f90 PROPERTIES COMPILE_DEFINITIONS "${_gfds_defs}")
+
 if(SINGLE_PRECISION)
   target_compile_definitions(fds PRIVATE GFDS_SINGLE_PRECISION)
 endif()
@@ -144,9 +172,20 @@ target_link_libraries(fds PRIVATE
 # Runtime library paths relative to the executable.
 set(RPATH_FLAGS "-Wl,-rpath,$ORIGIN:$ORIGIN/../../lib:$ORIGIN/../../../../../compilers/lib:$ORIGIN/../../../../../../compilers/lib")
 
+# MKL cluster sparse solver (pressure solvers GLMAT, UGLMAT, ULMAT) loads its MPI wrappers from the BLACS
+# library at run time ("Cannot load symbol MKLMPI_Get_wrappers" without it), so it must be linked even though
+# nothing references it directly.
+find_library(MKL_BLACS_LIB mkl_blacs_openmpi_lp64 HINTS ENV MKLROOT PATH_SUFFIXES lib lib/intel64)
+if(MKL_BLACS_LIB)
+  target_link_libraries(fds PRIVATE -Wl,--no-as-needed ${MKL_BLACS_LIB} -Wl,--as-needed)
+else()
+  message(WARNING "libmkl_blacs_openmpi_lp64 not found: GLMAT/UGLMAT/ULMAT pressure solvers will fail at run time")
+endif()
+
 target_link_options(fds PRIVATE
   ${RPATH_FLAGS}
   -Wl,-rpath,${NVHPC_MPI_ROOT}/lib
   -cuda
+  -cudalib=nvtx
   -Mmkl
 )

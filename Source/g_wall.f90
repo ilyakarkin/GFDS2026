@@ -35,6 +35,7 @@ MODULE G_WALL
     INTEGER, PARAMETER :: WALL_OUTPUT_M_DOT_ACTUAL    = 262144
     INTEGER, PARAMETER :: WALL_OUTPUT_U_TAU           = 524288
     INTEGER, PARAMETER :: WALL_OUTPUT_Y_PLUS          = 1048576
+    INTEGER, PARAMETER :: WALL_OUTPUT_VEL_ERR         = 2097152
     CONTAINS
 
         !--------------------------------------------------------------------------
@@ -297,7 +298,7 @@ MODULE G_WALL
             REAL(EB), ALLOCATABLE :: WALL_DUNDT_H(:)
             REAL(EB), ALLOCATABLE :: WALL_ZZ_F_H(:,:),WALL_RHO_D_F_H(:,:),WALL_RHO_D_DZDN_F_H(:,:)
             REAL(EB), ALLOCATABLE :: WALL_M_DOT_ADJUST_H(:,:),WALL_M_DOT_ACTUAL_H(:,:)
-            REAL(EB), ALLOCATABLE :: WALL_U_TAU_H(:),WALL_Y_PLUS_H(:)
+            REAL(EB), ALLOCATABLE :: WALL_U_TAU_H(:),WALL_Y_PLUS_H(:),WALL_VEL_ERR_H(:)
             REAL(EB), ALLOCATABLE :: T_IGN_H(:),Q_IN_SMOOTH_H(:),Q_IN_SMOOTH_INT_H(:,:),QDOTPP_INT_H(:,:)
 
             CALL POINT_TO_MESH(NM)
@@ -379,6 +380,10 @@ MODULE G_WALL
             IF (IAND(OUTPUT_MASK,WALL_OUTPUT_Y_PLUS)/=0) THEN
                 ALLOCATE(WALL_Y_PLUS_H(GM%WALL_LB:GM%WALL_UB)); WALL_Y_PLUS_H = GM%WALL_Y_PLUS
             ENDIF
+            IF (IAND(OUTPUT_MASK,WALL_OUTPUT_VEL_ERR)/=0 .AND. ALLOCATED(GM%WALL_VEL_ERR_NEW_D)) THEN
+                ALLOCATE(WALL_VEL_ERR_H(LBOUND(GM%WALL_VEL_ERR_NEW_D,1):UBOUND(GM%WALL_VEL_ERR_NEW_D,1)))
+                WALL_VEL_ERR_H = GM%WALL_VEL_ERR_NEW_D
+            ENDIF
 
             IF (PRESENT(SAVE_RESTART)) THEN
                 IF (SAVE_RESTART) THEN
@@ -427,6 +432,13 @@ MODULE G_WALL
                     B1%M_DOT_G_PP_ADJUST(1:N_TRACKED_SPECIES) = WALL_M_DOT_ADJUST_H(IW,1:N_TRACKED_SPECIES)
                 IF (ALLOCATED(WALL_M_DOT_ACTUAL_H) .AND. ALLOCATED(B1%M_DOT_G_PP_ACTUAL)) &
                     B1%M_DOT_G_PP_ACTUAL(1:N_TRACKED_SPECIES) = WALL_M_DOT_ACTUAL_H(IW,1:N_TRACKED_SPECIES)
+                ! COMPUTE_VELOCITY_ERROR (pres.f90) sets VEL_ERR_NEW only on these walls.
+                IF (ALLOCATED(WALL_VEL_ERR_H) .AND. WC%CUT_FACE_INDEX<=0) THEN
+                    IF (WC%BOUNDARY_TYPE==SOLID_BOUNDARY) B1%VEL_ERR_NEW = WALL_VEL_ERR_H(IW)
+                    IF (WC%BOUNDARY_TYPE==INTERPOLATED_BOUNDARY .AND. IW<=N_EXTERNAL_WALL_CELLS) THEN
+                        IF (EXTERNAL_WALL(IW)%AREA_RATIO>=0.9_EB) B1%VEL_ERR_NEW = WALL_VEL_ERR_H(IW)
+                    ENDIF
+                ENDIF
                 IF (WC%B2_INDEX>0) THEN
                     B2 => BOUNDARY_PROP2(WC%B2_INDEX)
                     IF (ALLOCATED(WALL_U_TAU_H)) B2%U_TAU = WALL_U_TAU_H(IW)
@@ -454,6 +466,7 @@ MODULE G_WALL
             IF (ALLOCATED(WALL_M_DOT_ADJUST_H)) DEALLOCATE(WALL_M_DOT_ADJUST_H)
             IF (ALLOCATED(WALL_M_DOT_ACTUAL_H)) DEALLOCATE(WALL_M_DOT_ACTUAL_H)
             IF (ALLOCATED(WALL_U_TAU_H)) DEALLOCATE(WALL_U_TAU_H)
+            IF (ALLOCATED(WALL_VEL_ERR_H)) DEALLOCATE(WALL_VEL_ERR_H)
             IF (ALLOCATED(WALL_Y_PLUS_H)) DEALLOCATE(WALL_Y_PLUS_H)
 
         END SUBROUTINE WALL_SYNC_OUTPUT_D2H
@@ -573,6 +586,12 @@ MODULE G_WALL
                     PBAR_PD(:,N) = PBAR_P(:,N)
                 ENDDO
                 GM%RSUMD   = RSUM
+                ! INTERPOLATED_BC takes the interface face values of RHO*ZZ from FX/FY/FZ
+                DO N=1,N_TOTAL_SCALARS
+                    GM%FXD(:,:,:,N) = FX(:,:,:,N)
+                    GM%FYD(:,:,:,N) = FY(:,:,:,N)
+                    GM%FZD(:,:,:,N) = FZ(:,:,:,N)
+                ENDDO
                 DO NOM=1,NMESHES
                     IF (.NOT.ALLOCATED(GM%OMESH)) EXIT
                     GOM_LOCAL => GM%OMESH(NOM)
@@ -695,15 +714,22 @@ MODULE G_WALL
                 DX_OTHERD => GPU_MESHES(NOM)%DXD
                 DY_OTHERD => GPU_MESHES(NOM)%DYD
                 DZ_OTHERD => GPU_MESHES(NOM)%DZD
+                CELL_INDEX_OTHERD => GPU_MESHES(NOM)%CELL_INDEXD
+                CELL_SOLID_OTHERD => GPU_MESHES(NOM)%CELL_SOLID
                 CALL ASSIGN_GHOST_VALUE_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(N_EXTERNAL_WALL_CELLS,N_TOTAL_SCALARS,N_TRACKED_SPECIES, &
                     GM%WALL_TOPO_AOS,GM%WALL_PRESSURE_ZONE,GM%EXTERNAL_WALL_NOMD,GM%WALL_IIO,GM%WALL_JJO,GM%WALL_KKO,GM%WALL_IIO_MAX, &
                     GM%WALL_JJO_MAX,GM%WALL_KKO_MAX,OM_RHOPD,OM_ZZPD,RHOPD,ZZPD,GM%TMPD,GM%RSUMD,PBAR_PD,MWR_ZD,GM%DXD,GM%DYD,GM%DZD, &
                     DX_OTHERD,DY_OTHERD,DZ_OTHERD,NOM,LBOUND(OM_RHOPD,1),LBOUND(OM_RHOPD,2),LBOUND(OM_RHOPD,3),R0, &
-                    IBP1,JBP1,KBP1,SIZE(OM_RHOPD,1),SIZE(OM_RHOPD,2),SIZE(OM_RHOPD,3))
+                    IBP1,JBP1,KBP1,SIZE(OM_RHOPD,1),SIZE(OM_RHOPD,2),SIZE(OM_RHOPD,3), &
+                    GM%EXTERNAL_WALL_AREA_RATIOD,GM%CELL_INDEXD,GM%CELL_SOLID,CELL_INDEX_OTHERD,CELL_SOLID_OTHERD, &
+                    SIZE(CELL_INDEX_OTHERD,1),SIZE(CELL_INDEX_OTHERD,2),INTERPOLATED_BOUNDARY)
             ENDDO
 
             CALL NEAR_SURFACE_GAS_VARIABLES_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(UUD, VVD, WWD, RHOPD, GM%TMPD, ZZPD, GM%WALL_TOPO_AOS, GM%WALL_U_TANG, &
-                GM%WALL_TMP_G,GM%WALL_RHO_G,WALL_ZZ_GD,TOTAL_WALL_CELLS,N_TRACKED_SPECIES,IBP1,JBP1,KBP1)
+                GM%WALL_TMP_G,GM%WALL_RHO_G,WALL_ZZ_GD,TOTAL_WALL_CELLS,N_TRACKED_SPECIES,IBP1,JBP1,KBP1, &
+                GM%WALL_SF_INDEX,SF_TMP_GAS_FRONT,SF_RAMP_TGF_INDEX,SF_EXTERNAL_FLUX,SURF_VEL_T_1,SURF_VEL_T_2, &
+                SF_RAMP_VELO_INDEX,SF_RAMP_VELO_TAU,SF_T_IGN,GM%WALL_EMISSIVITY,GM%WALL_Q_RAD_IN, &
+                RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D,RAMP_NPOINTS_D,RAMP_OFFSET_D,RAMP_INTERP_D,T,T_BEGIN,TMPA)
 
             CALL SURFACE_HEAT_TRANSFER_NO_CONVECTION_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(TOTAL_WALL_CELLS, GM%WALL_TOPO_AOS, GM%WALL_SF_INDEX, &
                 SF_THERMAL_BC_INDEX, GM%WALL_TMP_G, GM%WALL_TMP_F, GM%WALL_EMISSIVITY, GM%WALL_Q_RAD_OUT, MERGE(1,0,RADIATION))
@@ -751,7 +777,7 @@ MODULE G_WALL
             IF (.NOT.INITIALIZATION_PHASE .AND. CORRECTOR .AND. &
                 WALL_COUNTER==WALL_INCREMENT) THEN
                 DT_BC_HT1D = T-BC_CLOCK
-                IF (DT_BC_HT1D>TWO_EPSILON_EB) THEN
+                IF (DT_BC_HT1D>TWENTY_EPSILON_EB) THEN
                     CALL SOLID_HEAT_TRANSFER_GPU(NM,T,DT_BC_HT1D,TMPMIN, TMPMAX,MERGE(1,0,RADIATION))
                 ENDIF
                 BC_CLOCK = T
@@ -760,7 +786,8 @@ MODULE G_WALL
             IF (N_TRACKED_SPECIES > 1) THEN
             CALL WALL_BC_RHO_D_F_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(TOTAL_WALL_CELLS, N_TRACKED_SPECIES, GM%WALL_TOPO_AOS, GM%MUD, GM%RHOD, &
                     GM%WALL_RHO_F,GM%WALL_RHO_G,GM%WALL_RHO_D_F,RSC,NULL_BOUNDARY,OPEN_BOUNDARY,INTERPOLATED_BOUNDARY, &
-                    IBP1,JBP1,GM%WALL_LB,GM%WALL_UB)
+                    IBP1,JBP1,GM%WALL_LB,GM%WALL_UB,GM%MU_DNSD,GM%WALL_TMP_F,D_Z_TABLED,SPECIES_SC_FAC_D,I_MAX_TEMP, &
+                    MERGE(1,MERGE(2,0,SIM_MODE==DNS_MODE),SIM_MODE==LES_MODE))
             ENDIF
 
             DO NOM=1,NMESHES
@@ -784,14 +811,10 @@ MODULE G_WALL
                 RDYN_OTHERD => GPU_MESHES(NOM)%RDYND
                 RDZN_OTHERD => GPU_MESHES(NOM)%RDZND
                 CALL INTERPOLATED_RHO_F_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(N_EXTERNAL_WALL_CELLS,N_TOTAL_SCALARS,N_TRACKED_SPECIES, &
-                    GM%WALL_TOPO_AOS,GM%WALL_PRESSURE_ZONE,GM%EXTERNAL_WALL_NOMD,GM%WALL_IIO,GM%WALL_JJO,GM%WALL_KKO, &
-                    GM%EXTERNAL_WALL_AREA_RATIOD,UUD,VVD,WWD,RHOPD,ZZPD,OM_RHOPD,OM_ZZPD,GM%WALL_RHO_G,GM%WALL_RHO_F,GM%WALL_ZZ_F, &
-                    GM%WALL_TMP_F,GM%WALL_Q_CON_F,PBAR_PD,GM%DZD,MWR_ZD,GM%CELL_INDEXD,GM%CELL_SOLID,CELL_INDEX_OTHERD,CELL_SOLID_OTHERD, &
-                    INTERPOLATED_BOUNDARY,I_FLUX_LIMITER,NOM,LBOUND(OM_RHOPD,1),LBOUND(OM_RHOPD,2),LBOUND(OM_RHOPD,3), &
-                    TWO_EPSILON_EB,R0,IBP1,JBP1,KBP1,SIZE(OM_RHOPD,1),SIZE(OM_RHOPD,2),SIZE(OM_RHOPD,3), &
-                    SIZE(CELL_INDEX_OTHERD,1),SIZE(CELL_INDEX_OTHERD,2),GM%WALL_LB,GM%WALL_UB, &
-                    USE_ATMOSPHERIC_INTERPOLATION.AND.STRATIFICATION,DZ_OTHERD,GPU_MESHES(NOM)%P_0D,GM%TMPD,GM%RSUMD, &
-                    MERGE(1,0,RADIATION),GM%WALL_EMISSIVITY,GM%WALL_Q_RAD_OUT,FLUX_LIMITER_MW_CORRECTION)
+                    GM%WALL_TOPO_AOS,GM%WALL_PRESSURE_ZONE,GM%EXTERNAL_WALL_NOMD,GM%WALL_KKO,GM%FXD,GM%FYD,GM%FZD, &
+                    RHOPD,ZZPD,GM%TMPD,GM%WALL_RHO_F,GM%WALL_ZZ_F,GM%WALL_TMP_F,GM%WALL_Q_CON_F,PBAR_PD,GM%DZD,DZ_OTHERD,MWR_ZD, &
+                    INTERPOLATED_BOUNDARY,NOM,R0,RSUM0,IBP1,JBP1,KBP1,GM%WALL_LB,GM%WALL_UB, &
+                    USE_ATMOSPHERIC_INTERPOLATION.AND.STRATIFICATION,MERGE(1,0,RADIATION),GM%WALL_EMISSIVITY,GM%WALL_Q_RAD_OUT)
                 IF (N_TOTAL_SCALARS > 1) THEN
                     CALL INTERPOLATED_DIFFUSIVE_FLUX_VLES_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(N_EXTERNAL_WALL_CELLS,N_TRACKED_SPECIES, &
                         GM%WALL_TOPO_AOS,GM%EXTERNAL_WALL_NOMD,GM%EXTERNAL_WALL_NICD,GM%WALL_IIO,GM%WALL_JJO,GM%WALL_KKO,GM%WALL_IIO_MAX, &
@@ -806,7 +829,9 @@ MODULE G_WALL
                 GM%WALL_SF_INDEX, SF_SPECIES_BC_INDEX, SF_MASS_FRACTION, GM%WALL_U_NORMAL_S, WALL_ZZ_GD, GM%WALL_ZZ_F, &
                 UUD, VVD, WWD, GM%WALL_RHO_F, GM%WALL_RHO_D_DZDN_F, GM%WALL_M_DOT_G_PP_ADJUST, GM%WALL_M_DOT_G_PP_ACTUAL, &
                 NULL_BOUNDARY,OPEN_BOUNDARY,INTERPOLATED_BOUNDARY,SPECIFIED_MASS_FRACTION, &
-                GM%SURF_LB,GM%SURF_UB,GM%WALL_LB,GM%WALL_UB,IBP1,JBP1,KBP1)
+                GM%SURF_LB,GM%SURF_UB,GM%WALL_LB,GM%WALL_UB,IBP1,JBP1,KBP1, &
+                SF_RAMP_MF_INDEX,SF_RAMP_MF_TAU,GM%WALL_T_IGN,SPECIES_ZZ0D,RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D, &
+                RAMP_NPOINTS_D,RAMP_OFFSET_D,RAMP_INTERP_D,T,DT,T_BEGIN,MERGE(1,0,PREDICTOR))
 
             CALL WALL_SPECIFIED_MASS_FLUX_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(TOTAL_WALL_CELLS, N_TRACKED_SPECIES, GM%WALL_TOPO_AOS, &
                 GM%WALL_SF_INDEX, GM%WALL_PRESSURE_ZONE, SF_SPECIES_BC_INDEX, SF_MASS_FLUX, SF_M_DOT_G_PP_ADJUST_FAC, &
@@ -900,9 +925,142 @@ MODULE G_WALL
                            WALL_RHO_D_DZDN_F_H, &
                            WALL_M_DOT_G_PP_ADJUST_H, WALL_M_DOT_G_PP_ACTUAL_H)
             ENDIF
+
+            ! Mass consumed from BURN_AWAY obstructions, as CONSUME_MASS in CALCULATE_ZZ_F (corrector)
+            IF (CORRECTOR .AND. .NOT.INITIALIZATION_PHASE) CALL WALL_CONSUME_MASS_GPU(NM,DT)
+
             T_USED(6)=T_USED(6)+CURRENT_TIME()-TNOW
 
         END SUBROUTINE WALL_BC_GPU
+
+
+        !> \brief Reduce the mass of CONSUMABLE (BURN_AWAY) obstructions by the mass lost by their WALL cells
+        !> \details Same logic as CONSUME_MASS in CALCULATE_ZZ_F (wall.f90), done for the CORRECTOR. The device computes
+        !> SUM(M_DOT_G_PP_ACTUAL) of the WALL cells attached to a consumable OBST (CONSUME_IW list); the host updates
+        !> OB%MASS in WALL cell order, or packs the loss into OMESH%REAL_SEND_PKG8 when the OBST lives in the
+        !> neighbouring mesh (exchanged by MESH_EXCHANGE 15-18 in the GPU time loop). OPEN_AND_CLOSE removes the OBST
+        !> when its mass is gone.
+        SUBROUTINE WALL_CONSUME_MASS_GPU(NM,DT)
+            INTEGER, INTENT(IN) :: NM
+            REAL(EB), INTENT(IN) :: DT
+            INTEGER :: I,IW,OBST_INDEX,OTHER_MESH_OBST_INDEX,NOM,LL,GRDD
+            REAL(EB) :: MASS_LOSS
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(WALL_TYPE), POINTER :: WC
+
+            M => MESHES(NM)
+            GM => GPU_MESHES(NM)
+            IF (.NOT.GM%CONSUME_LIST_VALID) CALL BUILD_CONSUME_LIST(NM)
+            IF (GM%CONSUME_N<=0) RETURN
+
+            GRDD = (GM%CONSUME_N+GPU_BLKD_1D-1)/GPU_BLKD_1D
+            CALL GATHER_WALL_MASS_LOSS_GPU<<<GRDD,GPU_BLKD_1D,0,GM%STRM>>>(GM%CONSUME_N,N_TRACKED_SPECIES, &
+                GM%CONSUME_IW_D,GM%WALL_M_DOT_G_PP_ACTUAL,GM%CONSUME_MDOT_D,GM%WALL_LB,GM%WALL_UB)
+            CALL GPU_WAIT(GM%STRM)
+            GM%CONSUME_MDOT_H = GM%CONSUME_MDOT_D
+
+            DO I=1,GM%CONSUME_N
+                IW = GM%CONSUME_IW_H(I)
+                WC => M%WALL(IW)
+                OBST_INDEX = WC%OBST_INDEX
+                MASS_LOSS = GM%CONSUME_MDOT_H(I)*DT*M%BOUNDARY_PROP1(WC%B1_INDEX)%AREA
+                OTHER_MESH_OBST_INDEX = 0
+                NOM = 0
+                IF (IW<=M%N_EXTERNAL_WALL_CELLS) THEN
+                    NOM = M%EXTERNAL_WALL(IW)%NOM
+                    IF (NOM>0) OTHER_MESH_OBST_INDEX = MESHES(NOM)%CELL(MESHES(NOM)%CELL_INDEX(M%EXTERNAL_WALL(IW)%IIO_MIN, &
+                        M%EXTERNAL_WALL(IW)%JJO_MIN,M%EXTERNAL_WALL(IW)%KKO_MIN))%OBST_INDEX
+                ENDIF
+                IF (OTHER_MESH_OBST_INDEX>0) THEN
+                    IF (OBST_INDEX>0) M%OBSTRUCTION(OBST_INDEX)%MASS = MESHES(NOM)%OBSTRUCTION(OTHER_MESH_OBST_INDEX)%MASS
+                    IF (MESHES(NOM)%OBSTRUCTION(OTHER_MESH_OBST_INDEX)%CONSUMABLE) THEN
+                        M%OMESH(NOM)%N_EXTERNAL_OBST = M%OMESH(NOM)%N_EXTERNAL_OBST + 1
+                        LL = 2*M%OMESH(NOM)%N_EXTERNAL_OBST
+                        M%OMESH(NOM)%REAL_SEND_PKG8(LL-1) = REAL(OTHER_MESH_OBST_INDEX,EB)
+                        M%OMESH(NOM)%REAL_SEND_PKG8(LL)   = MASS_LOSS
+                    ENDIF
+                ELSE
+                    IF (OBST_INDEX>0) M%OBSTRUCTION(OBST_INDEX)%MASS = M%OBSTRUCTION(OBST_INDEX)%MASS - MASS_LOSS
+                ENDIF
+            ENDDO
+
+        END SUBROUTINE WALL_CONSUME_MASS_GPU
+
+
+        !> \brief List the WALL cells of mesh NM whose mass loss goes to a CONSUMABLE obstruction (see WALL_CONSUME_MASS_GPU)
+        !> \details CALCULATE_ZZ_F does CONSUME_MASS for WALL cells that are not NULL, OPEN or INTERPOLATED and have a
+        !> SPECIFIED_MASS_FLUX surface. Only cells attached to a consumable OBST, here or in the neighbouring mesh, are kept;
+        !> for the others OB%MASS has no effect. The list is rebuilt after obstructions are created or removed.
+        SUBROUTINE BUILD_CONSUME_LIST(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW,N,NOM,OBST_INDEX,OTHER_MESH_OBST_INDEX
+            LOGICAL :: KEEP
+            INTEGER, ALLOCATABLE :: IW_H(:)
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(WALL_TYPE), POINTER :: WC
+
+            M => MESHES(NM)
+            GM => GPU_MESHES(NM)
+            ALLOCATE(IW_H(1:MAX(1,M%N_EXTERNAL_WALL_CELLS+M%N_INTERNAL_WALL_CELLS)))
+            N = 0
+            DO IW=1,M%N_EXTERNAL_WALL_CELLS+M%N_INTERNAL_WALL_CELLS
+                WC => M%WALL(IW)
+                IF (WC%BOUNDARY_TYPE==NULL_BOUNDARY .OR. WC%BOUNDARY_TYPE==OPEN_BOUNDARY .OR. &
+                    WC%BOUNDARY_TYPE==INTERPOLATED_BOUNDARY) CYCLE
+                IF (SURFACE(WC%SURF_INDEX)%SPECIES_BC_INDEX/=SPECIFIED_MASS_FLUX) CYCLE
+                OBST_INDEX = WC%OBST_INDEX
+                KEEP = .FALSE.
+                IF (OBST_INDEX>0) KEEP = M%OBSTRUCTION(OBST_INDEX)%CONSUMABLE
+                IF (IW<=M%N_EXTERNAL_WALL_CELLS) THEN
+                    NOM = M%EXTERNAL_WALL(IW)%NOM
+                    IF (NOM>0) THEN
+                        OTHER_MESH_OBST_INDEX = MESHES(NOM)%CELL(MESHES(NOM)%CELL_INDEX(M%EXTERNAL_WALL(IW)%IIO_MIN, &
+                            M%EXTERNAL_WALL(IW)%JJO_MIN,M%EXTERNAL_WALL(IW)%KKO_MIN))%OBST_INDEX
+                        IF (OTHER_MESH_OBST_INDEX>0) THEN
+                            IF (MESHES(NOM)%OBSTRUCTION(OTHER_MESH_OBST_INDEX)%CONSUMABLE) KEEP = .TRUE.
+                        ENDIF
+                    ENDIF
+                ENDIF
+                IF (.NOT.KEEP) CYCLE
+                N = N + 1
+                IW_H(N) = IW
+            ENDDO
+
+            IF (ALLOCATED(GM%CONSUME_IW_H))   DEALLOCATE(GM%CONSUME_IW_H)
+            IF (ALLOCATED(GM%CONSUME_MDOT_H)) DEALLOCATE(GM%CONSUME_MDOT_H)
+            IF (ALLOCATED(GM%CONSUME_IW_D))   DEALLOCATE(GM%CONSUME_IW_D)
+            IF (ALLOCATED(GM%CONSUME_MDOT_D)) DEALLOCATE(GM%CONSUME_MDOT_D)
+            GM%CONSUME_N = N
+            IF (N>0) THEN
+                ALLOCATE(GM%CONSUME_IW_H(N),GM%CONSUME_MDOT_H(N),GM%CONSUME_IW_D(N),GM%CONSUME_MDOT_D(N))
+                GM%CONSUME_IW_H = IW_H(1:N)
+                GM%CONSUME_IW_D = GM%CONSUME_IW_H
+                GM%CONSUME_MDOT_H = 0._EB
+                GM%CONSUME_MDOT_D = 0._EB
+            ENDIF
+            DEALLOCATE(IW_H)
+            GM%CONSUME_LIST_VALID = .TRUE.
+
+        END SUBROUTINE BUILD_CONSUME_LIST
+
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE GATHER_WALL_MASS_LOSS_GPU(N_LIST,N_TRACKED_SPECIES_IN,IW_D,WALL_M_DOT_G_PP_ACTUALD, &
+            MDOT_D,WALL_LB,WALL_UB)
+            INTEGER, VALUE :: N_LIST,N_TRACKED_SPECIES_IN,WALL_LB,WALL_UB
+            INTEGER, DEVICE :: IW_D(*)
+            REAL(EB), DEVICE :: WALL_M_DOT_G_PP_ACTUALD(WALL_LB:WALL_UB,1:*),MDOT_D(*)
+            INTEGER :: I,IW,N
+            REAL(EB) :: MSUM
+
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (I<1 .OR. I>N_LIST) RETURN
+            IW = IW_D(I)
+            MSUM = 0._EB
+            DO N=1,N_TRACKED_SPECIES_IN
+                MSUM = MSUM + WALL_M_DOT_G_PP_ACTUALD(IW,N)
+            ENDDO
+            MDOT_D(I) = MSUM
+        END SUBROUTINE GATHER_WALL_MASS_LOSS_GPU
 
         !--------------------------------------------------------------------------
         ! Wall gas, heat-transfer, mass-transfer, and ghost-value kernels
@@ -910,27 +1068,41 @@ MODULE G_WALL
         ATTRIBUTES(GLOBAL) SUBROUTINE ASSIGN_GHOST_VALUE_GPU(N_EXTERNAL_WALL_CELLS, N_TOTAL_SCALARS, N_TRACKED_SPECIES, &
             WALL_TOPO,WALL_PRESSURE_ZONED,EXT_NOMD,EXT_IIOD,EXT_JJOD,EXT_KKOD,EXT_IIOD_MAX,EXT_JJOD_MAX,EXT_KKOD_MAX, &
             OM_RHOP,OM_ZZP,RHOPD,ZZPD,TMPD,RSUMD,PBAR_PD,MWR_ZD_IN,DX_LOCAL,DY_LOCAL,DZ_LOCAL,DX_OTHER,DY_OTHER,DZ_OTHER, &
-            NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K,R0D_IN,IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK)
+            NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K,R0D_IN,IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK, &
+            EXT_AREA_RATIO,CELL_INDEX_LOCAL,CELL_SOLID_LOCAL,CELL_INDEX_OTHER,CELL_SOLID_OTHER,OTHER_NI,OTHER_NJ, &
+            INTERPOLATED_BOUNDARY_IN)
+
+            ! wall.f90 ASSIGN_GHOST_VALUE (FDS 6.11.1): area-weighted neighbour values in the first ghost cell (II)
+            ! and, for 4 equally sized non-solid cells across an interpolated boundary, in the second ghost cell (II2);
+            ! otherwise II2 is a copy of II. One thread per external wall cell, each writes only its own II and II2.
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
 
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_TOTAL_SCALARS,N_TRACKED_SPECIES
             INTEGER, VALUE :: NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K,IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK
+            INTEGER, VALUE :: OTHER_NI,OTHER_NJ,INTERPOLATED_BOUNDARY_IN
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_PRESSURE_ZONED
             INTEGER, DEVICE, DIMENSION(1:*) :: EXT_NOMD,EXT_IIOD,EXT_JJOD,EXT_KKOD
             INTEGER, DEVICE, DIMENSION(1:*) :: EXT_IIOD_MAX,EXT_JJOD_MAX,EXT_KKOD_MAX
+            REAL(EB), DEVICE, DIMENSION(1:*) :: EXT_AREA_RATIO
             REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:*) :: OM_RHOP
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RHOPD,TMPD,RSUMD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RSUMD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,TMPD
             REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:OM_NK-1,1:*) :: OM_ZZP
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(0:KBP1,0:*) :: PBAR_PD
             REAL(EB), DEVICE, DIMENSION(*) :: MWR_ZD_IN
             REAL(EB), DEVICE, DIMENSION(0:*) :: DX_LOCAL,DY_LOCAL,DZ_LOCAL,DX_OTHER,DY_OTHER,DZ_OTHER
+            INTEGER, DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: CELL_INDEX_LOCAL
+            INTEGER, DEVICE, DIMENSION(0:OTHER_NI-1,0:OTHER_NJ-1,0:*) :: CELL_INDEX_OTHER
+            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_LOCAL,CELL_SOLID_OTHER
             REAL(EB), VALUE :: R0D_IN
 
-            INTEGER :: IW,II,JJ,KK,IIO,JJO,KKO,IIO1,IIO2,JJO1,JJO2,KKO1,KKO2,N,IPZ,IOR
-            REAL(EB) :: ARO,RHO_OTHER,RHO_ZZ_OTHER,RSUM_GHOST
+            INTEGER :: IW,II,JJ,KK,IIG,JJG,KKG,II2,JJ2,KK2,IIO,JJO,KKO,IIO1,IIO2,JJO1,JJO2,KKO1,KKO2,N,IPZ,IOR
+            INTEGER :: DI,DJ,DK,ICG,ICO
+            REAL(EB) :: ARO,RHO_OTHER,RHO_ZZ_OTHER,RHO_OTHER_2,RHO_ZZ_OTHER_2,RSUM_GHOST,RSUM_2,PBAR_P_2
+            LOGICAL :: SECOND_ORDER_INTERPOLATED_BOUNDARY
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
             IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS) RETURN
@@ -939,6 +1111,9 @@ MODULE G_WALL
             II  = WALL_TOPO(IW)%II
             JJ  = WALL_TOPO(IW)%JJ
             KK  = WALL_TOPO(IW)%KK
+            IIG = WALL_TOPO(IW)%IIG
+            JJG = WALL_TOPO(IW)%JJG
+            KKG = WALL_TOPO(IW)%KKG
             IOR = WALL_TOPO(IW)%IOR
             IIO1 = EXT_IIOD(IW)
             JJO1 = EXT_JJOD(IW)
@@ -947,7 +1122,20 @@ MODULE G_WALL
             JJO2 = EXT_JJOD_MAX(IW)
             KKO2 = EXT_KKOD_MAX(IW)
 
+            ! Offset from the first to the second ghost layer (BC%II2-BC%II etc.)
+            DI = 0 ; DJ = 0 ; DK = 0
+            SELECT CASE(IOR)
+                CASE( 1) ; DI = -1
+                CASE(-1) ; DI =  1
+                CASE( 2) ; DJ = -1
+                CASE(-2) ; DJ =  1
+                CASE( 3) ; DK = -1
+                CASE(-3) ; DK =  1
+            END SELECT
+            II2 = II + DI ; JJ2 = JJ + DJ ; KK2 = KK + DK
+
             RHO_OTHER = 0._EB
+            RHO_OTHER_2 = 0._EB
             DO KKO=KKO1,KKO2
                 DO JJO=JJO1,JJO2
                     DO IIO=IIO1,IIO2
@@ -958,15 +1146,28 @@ MODULE G_WALL
                             CASE DEFAULT; ARO = 0._EB
                         END SELECT
                         RHO_OTHER = RHO_OTHER + ARO*OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)
+                        RHO_OTHER_2 = RHO_OTHER_2 + ARO*OM_RHOP(IIO+DI-OM_LB_I,JJO+DJ-OM_LB_J,KKO+DK-OM_LB_K)
                     ENDDO
                 ENDDO
             ENDDO
             IF (RHO_OTHER <= 0._EB) RETURN
             RHOPD(II,JJ,KK) = RHO_OTHER
 
+            ! Second-order interpolated boundary test (CC_IBM is not supported on the device)
+            SECOND_ORDER_INTERPOLATED_BOUNDARY = .FALSE.
+            IF (WALL_TOPO(IW)%BOUNDARY_TYPE==INTERPOLATED_BOUNDARY_IN .AND. RHO_OTHER_2>0._EB) THEN
+                IF (ABS(EXT_AREA_RATIO(IW)-1._EB) < 0.01_EB) THEN
+                    ICG = CELL_INDEX_LOCAL(IIG-DI,JJG-DJ,KKG-DK)
+                    ICO = CELL_INDEX_OTHER(IIO1+DI,JJO1+DJ,KKO1+DK)
+                    IF (.NOT.CELL_SOLID_LOCAL(ICG) .AND. .NOT.CELL_SOLID_OTHER(ICO)) SECOND_ORDER_INTERPOLATED_BOUNDARY = .TRUE.
+                ENDIF
+            ENDIF
+
             RSUM_GHOST = 0._EB
+            RSUM_2 = 0._EB
             DO N = 1, N_TOTAL_SCALARS
                 RHO_ZZ_OTHER = 0._EB
+                RHO_ZZ_OTHER_2 = 0._EB
                 DO KKO=KKO1,KKO2
                     DO JJO=JJO1,JJO2
                         DO IIO=IIO1,IIO2
@@ -978,11 +1179,19 @@ MODULE G_WALL
                             END SELECT
                             RHO_ZZ_OTHER = RHO_ZZ_OTHER + ARO*OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)* &
                                 OM_ZZP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K,N)
+                            RHO_ZZ_OTHER_2 = RHO_ZZ_OTHER_2 + ARO*OM_RHOP(IIO+DI-OM_LB_I,JJO+DJ-OM_LB_J,KKO+DK-OM_LB_K)* &
+                                OM_ZZP(IIO+DI-OM_LB_I,JJO+DJ-OM_LB_J,KKO+DK-OM_LB_K,N)
                         ENDDO
                     ENDDO
                 ENDDO
                 ZZPD(II,JJ,KK,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_OTHER/RHO_OTHER))
                 IF (N <= N_TRACKED_SPECIES) RSUM_GHOST = RSUM_GHOST + MWR_ZD_IN(N)*ZZPD(II,JJ,KK,N)
+                IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
+                    ZZPD(II2,JJ2,KK2,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_OTHER_2/RHO_OTHER_2))
+                    IF (N <= N_TRACKED_SPECIES) RSUM_2 = RSUM_2 + MWR_ZD_IN(N)*ZZPD(II2,JJ2,KK2,N)
+                ELSE
+                    ZZPD(II2,JJ2,KK2,N) = ZZPD(II,JJ,KK,N)
+                ENDIF
             ENDDO
             RSUM_GHOST = R0D_IN*RSUM_GHOST
             IF (RSUM_GHOST <= 0._EB) RETURN
@@ -991,25 +1200,50 @@ MODULE G_WALL
             IPZ = WALL_PRESSURE_ZONED(IW)
             TMPD(II,JJ,KK) = PBAR_PD(KK,IPZ)/(RSUM_GHOST*RHO_OTHER)
 
+            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
+                RHOPD(II2,JJ2,KK2) = RHO_OTHER_2
+                RSUM_2 = R0D_IN*RSUM_2
+                PBAR_P_2 = 2._EB*PBAR_PD(KK,IPZ) - PBAR_PD(KKG,IPZ)
+                TMPD(II2,JJ2,KK2) = PBAR_P_2/(RSUM_2*RHO_OTHER_2)
+            ELSE
+                RHOPD(II2,JJ2,KK2) = RHOPD(II,JJ,KK)
+                TMPD(II2,JJ2,KK2) = TMPD(II,JJ,KK)
+            ENDIF
+
         END SUBROUTINE ASSIGN_GHOST_VALUE_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE NEAR_SURFACE_GAS_VARIABLES_GPU(UUD, VVD, WWD, RHOPD, TMPD, ZZPD, WALL_TOPO, &
-            WALL_U_TANGD,WALL_TMP_GD,WALL_RHO_GD,WALL_ZZ_GD,TOTAL_WALL_CELLS,N_TRACKED_SPECIES,IBP1,JBP1,KBP1)
+            WALL_U_TANGD,WALL_TMP_GD,WALL_RHO_GD,WALL_ZZ_GD,TOTAL_WALL_CELLS,N_TRACKED_SPECIES,IBP1,JBP1,KBP1, &
+            WALL_SF_INDEXD,SF_TMP_GAS_FRONTD,SF_RAMP_TGF_INDEXD,SF_EXTERNAL_FLUXD,SF_VEL_T_1D,SF_VEL_T_2D, &
+            SF_RAMP_VELO_INDEXD,SF_RAMP_VELO_TAUD,SF_T_IGND,WALL_EMISSIVITYD,WALL_Q_RAD_IND, &
+            RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP,T_IN,T_BEGIN_IN,TMPA_IN)
 
+            ! As NEAR_SURFACE_GAS_VARIABLES (wall.f90) for a WALL cell: tangential velocity relative to the
+            ! surface VEL_T, and the gas temperature fixed by SURF TMP_GAS_FRONT.
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
 
             INTEGER, VALUE :: TOTAL_WALL_CELLS,N_TRACKED_SPECIES,IBP1,JBP1,KBP1
+            REAL(EB), VALUE :: T_IN,T_BEGIN_IN,TMPA_IN
+            INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEXD,SF_RAMP_TGF_INDEXD,SF_RAMP_VELO_INDEXD
+            REAL(EB), DEVICE, DIMENSION(0:*) :: SF_TMP_GAS_FRONTD,SF_EXTERNAL_FLUXD,SF_VEL_T_1D,SF_VEL_T_2D, &
+                SF_RAMP_VELO_TAUD,SF_T_IGND,WALL_EMISSIVITYD,WALL_Q_RAD_IND
+            REAL(EB), DEVICE, DIMENSION(0:*) :: RAMP_T_MIN,RAMP_SPAN,RAMP_RDT
+            INTEGER, DEVICE, DIMENSION(0:*) :: RAMP_NPOINTS,RAMP_OFFSET
+            REAL(EB), DEVICE, DIMENSION(1:*) :: RAMP_INTERP
 
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: UUD,VVD,WWD,RHOPD,TMPD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UUD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VVD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WWD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
 
             REAL(EB), DEVICE, DIMENSION(0:*)     :: WALL_U_TANGD,WALL_TMP_GD,WALL_RHO_GD
             REAL(EB), DEVICE, DIMENSION(1:TOTAL_WALL_CELLS,1:*) :: WALL_ZZ_GD
 
-            INTEGER :: IW, N
+            INTEGER :: IW, N, SF_IDX
             INTEGER :: IIG,JJG,KKG
-            REAL(EB) :: UBAR,VBAR,WBAR
+            REAL(EB) :: UBAR,VBAR,WBAR,VT1,VT2,TSI,RAMP_FACTOR
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
             IF (IW < 1 .OR. IW > TOTAL_WALL_CELLS) RETURN
@@ -1017,23 +1251,46 @@ MODULE G_WALL
             IIG = WALL_TOPO(IW)%IIG
             JJG = WALL_TOPO(IW)%JJG
             KKG = WALL_TOPO(IW)%KKG
+            SF_IDX = WALL_SF_INDEXD(IW)
+
+            VT1 = 0._EB
+            VT2 = 0._EB
+            IF (WALL_TOPO(IW)%BOUNDARY_TYPE/=0 .AND. &
+                (ABS(SF_VEL_T_1D(SF_IDX))>0._EB .OR. ABS(SF_VEL_T_2D(SF_IDX))>0._EB)) THEN
+                IF (ABS(SF_T_IGND(SF_IDX)-T_BEGIN_IN)<=SPACING(SF_T_IGND(SF_IDX)) .AND. SF_RAMP_VELO_INDEXD(SF_IDX)>=1) THEN
+                    TSI = T_IN
+                ELSE
+                    TSI = T_IN-SF_T_IGND(SF_IDX)
+                ENDIF
+                RAMP_FACTOR = EVALUATE_RAMP_DEVICE(TSI,SF_RAMP_VELO_INDEXD(SF_IDX),SF_RAMP_VELO_TAUD(SF_IDX), &
+                    RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)
+                VT1 = SF_VEL_T_1D(SF_IDX)*RAMP_FACTOR
+                VT2 = SF_VEL_T_2D(SF_IDX)*RAMP_FACTOR
+            ENDIF
 
             SELECT CASE(WALL_TOPO(IW)%IOR)
                 CASE(1,-1)
-                    VBAR = 0.5_EB*(VVD(IIG,JJG,KKG)+VVD(IIG,JJG-1,KKG))
-                    WBAR = 0.5_EB*(WWD(IIG,JJG,KKG)+WWD(IIG,JJG,KKG-1))
+                    VBAR = 0.5_EB*(VVD(IIG,JJG,KKG)+VVD(IIG,JJG-1,KKG)) - VT1
+                    WBAR = 0.5_EB*(WWD(IIG,JJG,KKG)+WWD(IIG,JJG,KKG-1)) - VT2
                     WALL_U_TANGD(IW) = SQRT(VBAR**2+WBAR**2)
                 CASE(2,-2)
-                    UBAR = 0.5_EB*(UUD(IIG,JJG,KKG)+UUD(IIG-1,JJG,KKG))
-                    WBAR = 0.5_EB*(WWD(IIG,JJG,KKG)+WWD(IIG,JJG,KKG-1))
+                    UBAR = 0.5_EB*(UUD(IIG,JJG,KKG)+UUD(IIG-1,JJG,KKG)) - VT1
+                    WBAR = 0.5_EB*(WWD(IIG,JJG,KKG)+WWD(IIG,JJG,KKG-1)) - VT2
                     WALL_U_TANGD(IW) = SQRT(UBAR**2+WBAR**2)
                 CASE(3,-3)
-                    UBAR = 0.5_EB*(UUD(IIG,JJG,KKG)+UUD(IIG-1,JJG,KKG))
-                    VBAR = 0.5_EB*(VVD(IIG,JJG,KKG)+VVD(IIG,JJG-1,KKG))
+                    UBAR = 0.5_EB*(UUD(IIG,JJG,KKG)+UUD(IIG-1,JJG,KKG)) - VT1
+                    VBAR = 0.5_EB*(VVD(IIG,JJG,KKG)+VVD(IIG,JJG-1,KKG)) - VT2
                     WALL_U_TANGD(IW) = SQRT(UBAR**2+VBAR**2)
             END SELECT
 
-            WALL_TMP_GD(IW) = TMPD(IIG,JJG,KKG)
+            IF (WALL_TOPO(IW)%BOUNDARY_TYPE/=0 .AND. SF_TMP_GAS_FRONTD(SF_IDX)>0._EB) THEN
+                WALL_TMP_GD(IW) = TMPA_IN + EVALUATE_RAMP_DEVICE(T_IN-T_BEGIN_IN,SF_RAMP_TGF_INDEXD(SF_IDX),0._EB, &
+                    RAMP_T_MIN,RAMP_SPAN,RAMP_RDT,RAMP_NPOINTS,RAMP_OFFSET,RAMP_INTERP)*(SF_TMP_GAS_FRONTD(SF_IDX)-TMPA_IN)
+                IF (SF_EXTERNAL_FLUXD(SF_IDX)<TWENTY_EPSILON_EB) &
+                    WALL_Q_RAD_IND(IW) = WALL_EMISSIVITYD(IW)*SIGMA*WALL_TMP_GD(IW)**4
+            ELSE
+                WALL_TMP_GD(IW) = TMPD(IIG,JJG,KKG)
+            ENDIF
             WALL_RHO_GD(IW) = RHOPD(IIG,JJG,KKG)
 
             DO N = 1, N_TRACKED_SPECIES
@@ -1080,8 +1337,12 @@ MODULE G_WALL
             REAL(EB), DEVICE, DIMENSION(0:*) :: U_WIND,V_WIND,W_WIND
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEXD
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_PRESSURE_ZONED, SF_THERMAL_BC_INDEXD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: UUD,VVD,WWD,RHOPD,TMPD,RSUMD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RSUMD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UUD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VVD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WWD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(0:KBP1,0:*) :: PBAR_PD
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_TMP_GD, TMP_0D,WALL_TMP_EXTERIORD
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_TMP_FD, WALL_HEAT_TRANS_COEFD, WALL_Q_CON_FD
@@ -1092,7 +1353,7 @@ MODULE G_WALL
             REAL(EB), DEVICE, DIMENSION(*) :: SPECIES_ZZ0D_IN, MWR_ZD_IN
             REAL(EB), VALUE :: R0D_IN
 
-            INTEGER :: IW, IOR, II, JJ, KK, SF_IDX, IPZ, N
+            INTEGER :: IW, IOR, II, JJ, KK, II2, JJ2, KK2, SF_IDX, IPZ, N
             REAL(EB) :: UN, RSUM_F,WIND_NORMAL
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
@@ -1117,7 +1378,7 @@ MODULE G_WALL
                 CASE DEFAULT; UN = 0._EB
             END SELECT
 
-            IF (UN > TWO_EPSILON_EB) THEN
+            IF (UN > TWENTY_EPSILON_EB) THEN
                 WALL_TMP_FD(IW) = TMP_0D(KK)
                 IF (WALL_TMP_EXTERIORD(IW)>0._EB) WALL_TMP_FD(IW) = WALL_TMP_EXTERIORD(IW)
                 DO N = 1, N_TRACKED_SPECIES
@@ -1139,7 +1400,7 @@ MODULE G_WALL
                     CASE( 3); WIND_NORMAL =  W_WIND(KK)
                     CASE(-3); WIND_NORMAL = -W_WIND(KK)
                 END SELECT
-                IF (WIND_NORMAL<-TWO_EPSILON_EB) THEN
+                IF (WIND_NORMAL<-TWENTY_EPSILON_EB) THEN
                     WALL_TMP_FD(IW) = WALL_TMP_GD(IW)
                     DO N=1,N_TRACKED_SPECIES
                         WALL_ZZ_FD(IW,N) = WALL_ZZ_GD(IW,N)
@@ -1160,6 +1421,22 @@ MODULE G_WALL
             IPZ = WALL_PRESSURE_ZONED(IW)
             RSUMD(II,JJ,KK) = RSUM_F
             RHOPD(II,JJ,KK) = PBAR_PD(KK,IPZ)/(RSUM_F*TMPD(II,JJ,KK))
+
+            ! Second ghost layer (BC%II2,BC%JJ2,BC%KK2)
+            II2 = II ; JJ2 = JJ ; KK2 = KK
+            SELECT CASE(IOR)
+                CASE( 1); II2 = II-1
+                CASE(-1); II2 = II+1
+                CASE( 2); JJ2 = JJ-1
+                CASE(-2); JJ2 = JJ+1
+                CASE( 3); KK2 = KK-1
+                CASE(-3); KK2 = KK+1
+            END SELECT
+            TMPD(II2,JJ2,KK2) = WALL_TMP_FD(IW)
+            DO N = 1, N_TRACKED_SPECIES
+                ZZPD(II2,JJ2,KK2,N) = WALL_ZZ_FD(IW,N)
+            ENDDO
+            RHOPD(II2,JJ2,KK2) = RHOPD(II,JJ,KK)
 
             WALL_HEAT_TRANS_COEFD(IW) = 0._EB
             WALL_Q_CON_FD(IW) = 2._EB*WALL_K_GD(IW)*(WALL_TMP_GD(IW)-WALL_TMP_FD(IW))*WALL_RDND(IW)
@@ -1223,15 +1500,15 @@ MODULE G_WALL
                 QNET = -RAMP_FACTOR*SF_CONVECTIVE_HEAT_FLUXD(SF_IDX)
             ENDIF
 
-            IF (ABS(QNET) < TWO_EPSILON_EB .AND. RADIATION_FLAG == 0) THEN
+            IF (ABS(QNET) < TWENTY_EPSILON_EB .AND. RADIATION_FLAG == 0) THEN
                 WALL_HEAT_TRANS_COEFD(IW) = 0._EB
                 WALL_TMP_FD(IW) = WALL_TMP_GD(IW)
                 WALL_Q_CON_FD(IW) = 0._EB
                 RETURN
             ENDIF
 
-            IF (ABS(H_FIXED) < TWO_EPSILON_EB) THEN
-                IF (RADIATION_FLAG /= 0 .AND. WALL_EMISSIVITYD(IW) > TWO_EPSILON_EB) THEN
+            IF (ABS(H_FIXED) < TWENTY_EPSILON_EB) THEN
+                IF (RADIATION_FLAG /= 0 .AND. WALL_EMISSIVITYD(IW) > TWENTY_EPSILON_EB) THEN
                     RAD_ARG = MAX(0._EB,(-QNET + WALL_Q_RAD_IND(IW))/(WALL_EMISSIVITYD(IW)*SIGMA))
                     WALL_TMP_FD(IW) = RAD_ARG**0.25_EB
                     WALL_Q_RAD_OUTD(IW) = SIGMA*WALL_EMISSIVITYD(IW)*WALL_TMP_FD(IW)**4
@@ -1247,7 +1524,7 @@ MODULE G_WALL
             DO
                 ADCOUNT = ADCOUNT + 1
                 DTMP = WALL_TMP_GD(IW) - WALL_TMP_FD(IW)
-                IF (ABS(QNET) > 0._EB .AND. ABS(DTMP) < TWO_EPSILON_EB) DTMP = 1._EB
+                IF (ABS(QNET) > 0._EB .AND. ABS(DTMP) < TWENTY_EPSILON_EB) DTMP = 1._EB
 
                 ! Heat-transfer coefficient.
                 IF (H_FIXED >= 0._EB) THEN
@@ -1269,7 +1546,7 @@ MODULE G_WALL
                         NUMER = NUMER + K_RSQMW_ZD_IN(ITMP,N) * WALL_ZZ_GD(IW,N)
                         DENOM = DENOM + WALL_ZZ_GD(IW,N) * RSQ_MW_ZD_IN(N)
                     ENDDO
-                    IF (ABS(DENOM) > TWO_EPSILON_EB) THEN
+                    IF (ABS(DENOM) > TWENTY_EPSILON_EB) THEN
                         K_G = NUMER / DENOM
                     ELSE
                         K_G = 0._EB
@@ -1281,13 +1558,13 @@ MODULE G_WALL
                         NUMER = NUMER + MU_RSQMW_ZD_IN(ITMP,N) * WALL_ZZ_GD(IW,N)
                         DENOM = DENOM + WALL_ZZ_GD(IW,N) * RSQ_MW_ZD_IN(N)
                     ENDDO
-                    IF (ABS(DENOM) > TWO_EPSILON_EB) THEN
+                    IF (ABS(DENOM) > TWENTY_EPSILON_EB) THEN
                         MU_G = NUMER / DENOM
                     ELSE
                         MU_G = 0._EB
                     ENDIF
 
-                    IF (ABS(MU_G) <= TWO_EPSILON_EB .OR. ABS(K_G) <= TWO_EPSILON_EB .OR. CONV_LENGTH <= TWO_EPSILON_EB) THEN
+                    IF (ABS(MU_G) <= TWENTY_EPSILON_EB .OR. ABS(K_G) <= TWENTY_EPSILON_EB .OR. CONV_LENGTH <= TWENTY_EPSILON_EB) THEN
                         WALL_HEAT_TRANS_COEFD(IW) = 0._EB
                     ELSE
                         RE = MAX(0._EB,WALL_RHO_GD(IW) * WALL_U_TANGD(IW) * CONV_LENGTH / MU_G)
@@ -1306,7 +1583,7 @@ MODULE G_WALL
                                         NUSSELT_FREE = 0.15_EB*RA**ONTH
                                     ENDIF
                                 ELSE
-                                    NUSSELT_FREE = 0.52_EB*RA**0.2_EB
+                                    NUSSELT_FREE = 0.52_EB*RA**0.2  ! 4-byte 0.2 as in FDS turb.f90
                                 ENDIF
                         END SELECT
 
@@ -1315,18 +1592,18 @@ MODULE G_WALL
                 ENDIF
 
                 IF (RADIATION_FLAG == 0) THEN
-                    IF (ABS(QNET) < TWO_EPSILON_EB) THEN
+                    IF (ABS(QNET) < TWENTY_EPSILON_EB) THEN
                         HTC_OLD = 0._EB
                         WALL_TMP_FD(IW) = WALL_TMP_GD(IW)
                     ELSE
                         HTC_OLD = WALL_HEAT_TRANS_COEFD(IW)
-                        IF (ABS(WALL_HEAT_TRANS_COEFD(IW)) < TWO_EPSILON_EB) EXIT
+                        IF (ABS(WALL_HEAT_TRANS_COEFD(IW)) < TWENTY_EPSILON_EB) EXIT
                         WALL_TMP_FD(IW) = (-QNET + WALL_HEAT_TRANS_COEFD(IW)*WALL_TMP_GD(IW))/WALL_HEAT_TRANS_COEFD(IW)
                     ENDIF
                     EXIT
                 ENDIF
 
-                IF (WALL_EMISSIVITYD(IW) <= TWO_EPSILON_EB .OR. ABS(WALL_HEAT_TRANS_COEFD(IW)) < TWO_EPSILON_EB) THEN
+                IF (WALL_EMISSIVITYD(IW) <= TWENTY_EPSILON_EB .OR. ABS(WALL_HEAT_TRANS_COEFD(IW)) < TWENTY_EPSILON_EB) THEN
                     HTC_OLD = WALL_HEAT_TRANS_COEFD(IW)
                     EXIT
                 ENDIF
@@ -1338,13 +1615,13 @@ MODULE G_WALL
                 QQQ = -0.125_EB*BBB**2
                 RRR = -0.5_EB*QQQ + SQRT(MAX(0._EB,0.25_EB*QQQ**2+PPP**3/27._EB))
                 UUU = SIGN(ABS(RRR)**ONTH,RRR)
-                IF (ABS(UUU) < TWO_EPSILON_EB) THEN
+                IF (ABS(UUU) < TWENTY_EPSILON_EB) THEN
                     YYY = SIGN(ABS(-QQQ)**ONTH,-QQQ)
                 ELSE
                     YYY = UUU - ONTH*PPP/UUU
                 ENDIF
                 WWW = SQRT(MAX(0._EB,2._EB*YYY))
-                IF (WWW > TWO_EPSILON_EB) THEN
+                IF (WWW > TWENTY_EPSILON_EB) THEN
                     WALL_TMP_FD(IW) = 0.5_EB*(-WWW + SQRT(MAX(0._EB,-2._EB*(YYY-BBB/WWW))))
                 ELSE
                     WALL_TMP_FD(IW) = (-QNET + WALL_HEAT_TRANS_COEFD(IW)*WALL_TMP_GD(IW))/WALL_HEAT_TRANS_COEFD(IW)
@@ -1415,7 +1692,7 @@ MODULE G_WALL
                 TSI = T_IN - WALL_T_IGND(IW)
             ENDIF
 
-            IF (WALL_U_NORMALD(IW) > TWO_EPSILON_EB) THEN
+            IF (WALL_U_NORMALD(IW) > TWENTY_EPSILON_EB) THEN
                 WALL_TMP_FD(IW) = WALL_TMP_GD(IW)
             ELSEIF (SF_TMP_FRONTD(SF_IDX) > 0._EB) THEN
                 RAMP_FACTOR = EVALUATE_RAMP_DEVICE(TSI,SF_RAMP_TEMP_INDEXD(SF_IDX),SF_RAMP_TEMP_TAUD(SF_IDX), &
@@ -1436,7 +1713,7 @@ MODULE G_WALL
                 NUMER = NUMER + K_RSQMW_ZD_IN(ITMP,N) * WALL_ZZ_GD(IW,N)
                 DENOM = DENOM + WALL_ZZ_GD(IW,N) * RSQ_MW_ZD_IN(N)
             ENDDO
-            IF (ABS(DENOM) > TWO_EPSILON_EB) THEN
+            IF (ABS(DENOM) > TWENTY_EPSILON_EB) THEN
                 K_G = NUMER / DENOM
             ELSE
                 K_G = 0._EB
@@ -1470,7 +1747,7 @@ MODULE G_WALL
                                 NUSSELT_FREE = 0.15_EB*RA**ONTH
                             ENDIF
                         ELSE
-                            NUSSELT_FREE = 0.52_EB*RA**0.2_EB
+                            NUSSELT_FREE = 0.52_EB*RA**0.2  ! 4-byte 0.2 as in FDS turb.f90
                         ENDIF
                 END SELECT
 
@@ -1482,117 +1759,41 @@ MODULE G_WALL
 
         END SUBROUTINE SURFACE_HEAT_TRANSFER_SPECIFIED_TEMPERATURE_GPU
 
-        !--------------------------------------------------------------------------
-        ! Local wall scalar-face interpolation helper
-        !--------------------------------------------------------------------------
-        ATTRIBUTES(DEVICE) REAL(EB) FUNCTION SCALAR_FACE_VALUE_LOCAL(A,Q0,Q1,Q2,Q3,LIMITER,TWO_EPS)
-            IMPLICIT NONE
-            REAL(EB), VALUE :: A,Q0,Q1,Q2,Q3,TWO_EPS
-            INTEGER, VALUE :: LIMITER
-            REAL(EB) :: R,B,DU_LOC,DU_UP
-
-            SELECT CASE(LIMITER)
-                CASE(0)
-                    SCALAR_FACE_VALUE_LOCAL = 0.5_EB*(Q1+Q2)
-                CASE(1)
-                    IF (A > 0._EB) THEN
-                        SCALAR_FACE_VALUE_LOCAL = Q1
-                    ELSE
-                        SCALAR_FACE_VALUE_LOCAL = Q2
-                    ENDIF
-                CASE(3)
-                    DU_LOC = Q2-Q1
-                    IF (A > 0._EB) THEN
-                        DU_UP = Q1-Q0
-                        R = DU_UP/(DU_LOC+SIGN(TWO_EPS,DU_LOC))
-                        B = MAX(0._EB,MIN(R,1._EB))
-                        SCALAR_FACE_VALUE_LOCAL = Q1 + 0.5_EB*B*DU_LOC
-                    ELSE
-                        DU_UP = Q3-Q2
-                        R = DU_UP/(DU_LOC+SIGN(TWO_EPS,DU_LOC))
-                        B = MAX(0._EB,MIN(R,1._EB))
-                        SCALAR_FACE_VALUE_LOCAL = Q2 - 0.5_EB*B*DU_LOC
-                    ENDIF
-                CASE(4)
-                    DU_LOC = Q2-Q1
-                    IF (A > 0._EB) THEN
-                        DU_UP = Q1-Q0
-                        R = 0._EB
-                        B = 0._EB
-                        IF (ABS(DU_UP) > TWO_EPS) R = DU_LOC/DU_UP
-                        IF (R > 0._EB) B = R*(3._EB*R+1._EB)/((R+1._EB)**2)
-                        SCALAR_FACE_VALUE_LOCAL = Q1 + 0.5_EB*B*DU_UP
-                    ELSE
-                        DU_UP = Q3-Q2
-                        R = 0._EB
-                        B = 0._EB
-                        IF (ABS(DU_UP) > TWO_EPS) R = DU_LOC/DU_UP
-                        IF (R > 0._EB) B = R*(3._EB*R+1._EB)/((R+1._EB)**2)
-                        SCALAR_FACE_VALUE_LOCAL = Q2 - 0.5_EB*B*DU_UP
-                    ENDIF
-                CASE DEFAULT
-                    DU_LOC = Q2-Q1
-                    IF (A > 0._EB) THEN
-                        DU_UP = Q1-Q0
-                        R = DU_UP/(DU_LOC+SIGN(TWO_EPS,DU_LOC))
-                        B = MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                        SCALAR_FACE_VALUE_LOCAL = Q1 + 0.5_EB*B*DU_LOC
-                    ELSE
-                        DU_UP = Q3-Q2
-                        R = DU_UP/(DU_LOC+SIGN(TWO_EPS,DU_LOC))
-                        B = MAX(0._EB,MIN(2._EB*R,1._EB),MIN(R,2._EB))
-                        SCALAR_FACE_VALUE_LOCAL = Q2 - 0.5_EB*B*DU_LOC
-                    ENDIF
-            END SELECT
-
-        END FUNCTION SCALAR_FACE_VALUE_LOCAL
-
         ATTRIBUTES(GLOBAL) SUBROUTINE INTERPOLATED_RHO_F_GPU(N_EXTERNAL_WALL_CELLS,N_TOTAL_SCALARS,N_TRACKED_SPECIES, &
-            WALL_TOPO,WALL_PRESSURE_ZONED,EXT_NOMD,EXT_IIOD,EXT_JJOD,EXT_KKOD,EXT_AREA_RATIO,UUD,VVD,WWD,RHOPD,ZZPD, &
-            OM_RHOP,OM_ZZP,WALL_RHO_GD,WALL_RHO_FD,WALL_ZZ_FD,WALL_TMP_FD,WALL_Q_CON_FD,PBAR_PD,DZD_IN,MWR_ZD_IN, &
-            CELL_INDEX_LOCAL,CELL_SOLID_LOCAL,CELL_INDEX_OTHER,CELL_SOLID_OTHER,INTERPOLATED_BOUNDARY_IN, &
-            I_FLUX_LIMITER_IN,NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K,TWO_EPSILON_EB_IN,R0D_IN, &
-            IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK,OTHER_NI,OTHER_NJ,WALL_LB,WALL_UB, &
-            USE_ATMOSPHERIC_INTERPOLATION_IN,DZ_OTHER,P_0_OTHER,TMPD,RSUMD,RADIATION_FLAG,WALL_EMISSIVITYD,WALL_Q_RAD_OUTD, &
-            MW_CORR)
+            WALL_TOPO,WALL_PRESSURE_ZONED,EXT_NOMD,EXT_KKOD,FXD,FYD,FZD,RHOPD,ZZPD,TMPD, &
+            WALL_RHO_FD,WALL_ZZ_FD,WALL_TMP_FD,WALL_Q_CON_FD,PBAR_PD,DZD_IN,DZ_OTHER,MWR_ZD_IN, &
+            INTERPOLATED_BOUNDARY_IN,NOM_FILTER,R0D_IN,RSUM0_IN,IBP1,JBP1,KBP1,WALL_LB,WALL_UB, &
+            USE_ATMOSPHERIC_INTERPOLATION_IN,RADIATION_FLAG,WALL_EMISSIVITYD,WALL_Q_RAD_OUTD)
+
+            ! wall.f90 SURFACE_HEAT_TRANSFER, INTERPOLATED_BC (FDS 6.11.1): the face values of RHO*ZZ at the mesh
+            ! interface are the flux-limited values FX/FY/FZ computed in MASS_FINITE_DIFFERENCES over faces 0:IBAR.
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
 
             INTEGER, VALUE :: N_EXTERNAL_WALL_CELLS,N_TOTAL_SCALARS,N_TRACKED_SPECIES
-            INTEGER, VALUE :: INTERPOLATED_BOUNDARY_IN,I_FLUX_LIMITER_IN
-            INTEGER, VALUE :: NOM_FILTER,OM_LB_I,OM_LB_J,OM_LB_K
-            INTEGER, VALUE :: IBP1,JBP1,KBP1,OM_NI,OM_NJ,OM_NK,OTHER_NI,OTHER_NJ,WALL_LB,WALL_UB
+            INTEGER, VALUE :: INTERPOLATED_BOUNDARY_IN,NOM_FILTER
+            INTEGER, VALUE :: IBP1,JBP1,KBP1,WALL_LB,WALL_UB
             INTEGER, VALUE :: RADIATION_FLAG
-            REAL(EB), VALUE :: TWO_EPSILON_EB_IN
+            REAL(EB), VALUE :: R0D_IN,RSUM0_IN
+            LOGICAL, VALUE :: USE_ATMOSPHERIC_INTERPOLATION_IN
 
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_PRESSURE_ZONED
-            INTEGER, DEVICE, DIMENSION(1:*) :: EXT_NOMD, EXT_IIOD, EXT_JJOD, EXT_KKOD
-            REAL(EB), DEVICE, DIMENSION(1:*) :: EXT_AREA_RATIO
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: UUD,VVD,WWD,RHOPD,TMPD,RSUMD
-            REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:*) :: OM_RHOP
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
-            REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:OM_NK-1,1:*) :: OM_ZZP
-            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_RHO_GD,WALL_RHO_FD,WALL_TMP_FD,WALL_Q_CON_FD
+            INTEGER, DEVICE, DIMENSION(1:*) :: EXT_NOMD, EXT_KKOD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: FXD,FYD,FZD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_RHO_FD,WALL_TMP_FD,WALL_Q_CON_FD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_FD
             REAL(EB), DEVICE, DIMENSION(0:KBP1,0:*) :: PBAR_PD
             REAL(EB), DEVICE, DIMENSION(0:*) :: DZD_IN
-            REAL(EB), DEVICE, DIMENSION(0:*) :: DZ_OTHER,P_0_OTHER
+            REAL(EB), DEVICE, DIMENSION(0:*) :: DZ_OTHER
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_EMISSIVITYD,WALL_Q_RAD_OUTD
             REAL(EB), DEVICE, DIMENSION(*) :: MWR_ZD_IN
-            INTEGER, DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: CELL_INDEX_LOCAL
-            INTEGER, DEVICE, DIMENSION(0:OTHER_NI-1,0:OTHER_NJ-1,0:*) :: CELL_INDEX_OTHER
-            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_LOCAL,CELL_SOLID_OTHER
-            REAL(EB), VALUE :: R0D_IN
-            LOGICAL, VALUE :: USE_ATMOSPHERIC_INTERPOLATION_IN,MW_CORR
 
-            INTEGER :: IW,IOR,II,JJ,KK,IIG,JJG,KKG,IIO,JJO,KKO,IPZ,ICG,ICO,N
-            INTEGER :: NMAX,DI,DJ,DK
-            REAL(EB) :: R_G,R_G2,R_O,R_O2,S_MW
-            REAL(EB) :: FACE_VEL,Q0,Q1,Q2,Q3,PBAR_F,RSUM_F,RHO_G_2,RHO_OTHER,RHO_OTHER_2
-            REAL(EB) :: RHO_ZZ_F,RHO_ZZ_G,RHO_ZZ_G_2,RHO_ZZ_OTHER,RHO_ZZ_OTHER_2
-            REAL(EB) :: DDO,RSUM_GHOST,TMP_G,DENOM
-            LOGICAL :: SECOND_ORDER_INTERPOLATED_BOUNDARY
+            INTEGER :: IW,IOR,II,JJ,KK,IIG,JJG,KKG,KKO,IPZ,N
+            REAL(EB) :: PBAR_F,RSUM_F,DDO,RHO_F,RHO_ZZ_F
+            LOGICAL :: ATMOSPHERIC_INTERPOLATION
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
             IF (IW < 1 .OR. IW > N_EXTERNAL_WALL_CELLS) RETURN
@@ -1607,291 +1808,85 @@ MODULE G_WALL
             JJG = WALL_TOPO(IW)%JJG
             KKG = WALL_TOPO(IW)%KKG
             IPZ = WALL_PRESSURE_ZONED(IW)
-            IIO = EXT_IIOD(IW)
-            JJO = EXT_JJOD(IW)
             KKO = EXT_KKOD(IW)
 
-            RHO_OTHER = RHOPD(II,JJ,KK)
-            IF (USE_ATMOSPHERIC_INTERPOLATION_IN .AND. ABS(IOR)==3) THEN
-                DDO = (DZD_IN(KK)+DZD_IN(KKG))/(DZ_OTHER(KKO)+DZD_IN(KKG))
-                IF (ABS(DDO-1._EB)>0.01_EB) THEN
-                    RSUM_GHOST = 0._EB
-                    DO N=1,N_TRACKED_SPECIES
-                        RSUM_GHOST = RSUM_GHOST + MWR_ZD_IN(N)*MAX(0._EB,MIN(1._EB,ZZPD(II,JJ,KK,N)))
-                    ENDDO
-                    RSUM_GHOST = R0D_IN*RSUM_GHOST
-                    RSUMD(II,JJ,KK) = RSUM_GHOST
-                    TMP_G = PBAR_PD(KKG,IPZ)/WALL_RHO_GD(IW)/RSUMD(IIG,JJG,KKG)
-                    DENOM = TMP_G + DDO*(P_0_OTHER(KKO)/RHO_OTHER/RSUM_GHOST-TMP_G)
-                    RHOPD(II,JJ,KK) = PBAR_PD(KK,IPZ)/RSUM_GHOST/DENOM
-                    TMPD(II,JJ,KK) = PBAR_PD(KK,IPZ)/(RSUM_GHOST*RHOPD(II,JJ,KK))
+            ATMOSPHERIC_INTERPOLATION = .FALSE.
+            DDO = 1._EB
+            IF (ABS(IOR)==3) DDO = (DZD_IN(KK)+DZD_IN(KKG))/(DZ_OTHER(KKO)+DZD_IN(KKG))
+            IF (USE_ATMOSPHERIC_INTERPOLATION_IN .AND. ABS(DDO-1._EB)>0.01_EB .AND. ABS(IOR)==3) &
+                ATMOSPHERIC_INTERPOLATION = .TRUE.
 
-                    WALL_TMP_FD(IW) = (TMPD(II,JJ,KK)*DZD_IN(KKG)+TMPD(IIG,JJG,KKG)*DZD_IN(KK)) / &
-                                     (DZD_IN(KK)+DZD_IN(KKG))
-                    IF (N_TOTAL_SCALARS==1) THEN
-                        WALL_ZZ_FD(IW,1) = 1._EB
-                    ELSE
-                        DO N=1,N_TOTAL_SCALARS
-                            WALL_ZZ_FD(IW,N) = (ZZPD(II,JJ,KK,N)*DZD_IN(KKG)+ZZPD(IIG,JJG,KKG,N)*DZD_IN(KK)) / &
-                                              (DZD_IN(KK)+DZD_IN(KKG))
-                        ENDDO
-                    ENDIF
+            IF (N_TOTAL_SCALARS > 1) THEN
+
+                IF (ATMOSPHERIC_INTERPOLATION) THEN
+                    WALL_TMP_FD(IW) = (TMPD(II,JJ,KK)*DZD_IN(KKG)+TMPD(IIG,JJG,KKG)*DZD_IN(KK)) / (DZD_IN(KK)+DZD_IN(KKG))
+                    DO N=1,N_TOTAL_SCALARS
+                        WALL_ZZ_FD(IW,N) = (ZZPD(II,JJ,KK,N)*DZD_IN(KKG)+ZZPD(IIG,JJG,KKG,N)*DZD_IN(KK)) / &
+                                           (DZD_IN(KK)+DZD_IN(KKG))
+                    ENDDO
                     RSUM_F = 0._EB
                     DO N=1,N_TRACKED_SPECIES
                         RSUM_F = RSUM_F + MWR_ZD_IN(N)*WALL_ZZ_FD(IW,N)
                     ENDDO
                     RSUM_F = R0D_IN*RSUM_F
-                    PBAR_F = (PBAR_PD(KK,IPZ)*DZD_IN(KKG)+PBAR_PD(KKG,IPZ)*DZD_IN(KK)) / &
-                             (DZD_IN(KK)+DZD_IN(KKG))
+                    ! IOR=+-3 only
+                    PBAR_F = (PBAR_PD(KK,IPZ)*DZD_IN(KKG)+PBAR_PD(KKG,IPZ)*DZD_IN(KK)) / (DZD_IN(KK)+DZD_IN(KKG))
                     WALL_RHO_FD(IW) = PBAR_F/(RSUM_F*WALL_TMP_FD(IW))
-                    WALL_Q_CON_FD(IW) = 0._EB
-                    IF (RADIATION_FLAG/=0) WALL_Q_RAD_OUTD(IW) = SIGMA*WALL_EMISSIVITYD(IW)*WALL_TMP_FD(IW)**4
-                    RETURN
-                ENDIF
-            ENDIF
-            RHO_OTHER_2 = RHO_OTHER
-            RHO_G_2 = WALL_RHO_GD(IW)
-            SECOND_ORDER_INTERPOLATED_BOUNDARY = .FALSE.
-            IF (ABS(EXT_AREA_RATIO(IW)-1._EB) < 0.01_EB) THEN
-                SELECT CASE(IOR)
-                    CASE( 1)
-                        ICG = CELL_INDEX_LOCAL(IIG+1,JJG,KKG)
-                        ICO = CELL_INDEX_OTHER(IIO-1,JJO,KKO)
-                    CASE(-1)
-                        ICG = CELL_INDEX_LOCAL(IIG-1,JJG,KKG)
-                        ICO = CELL_INDEX_OTHER(IIO+1,JJO,KKO)
-                    CASE( 2)
-                        ICG = CELL_INDEX_LOCAL(IIG,JJG+1,KKG)
-                        ICO = CELL_INDEX_OTHER(IIO,JJO-1,KKO)
-                    CASE(-2)
-                        ICG = CELL_INDEX_LOCAL(IIG,JJG-1,KKG)
-                        ICO = CELL_INDEX_OTHER(IIO,JJO+1,KKO)
-                    CASE( 3)
-                        ICG = CELL_INDEX_LOCAL(IIG,JJG,KKG+1)
-                        ICO = CELL_INDEX_OTHER(IIO,JJO,KKO-1)
-                    CASE(-3)
-                        ICG = CELL_INDEX_LOCAL(IIG,JJG,KKG-1)
-                        ICO = CELL_INDEX_OTHER(IIO,JJO,KKO+1)
-                    CASE DEFAULT
-                        RETURN
-                END SELECT
-                IF (.NOT.CELL_SOLID_LOCAL(ICG) .AND. .NOT.CELL_SOLID_OTHER(ICO)) &
-                    SECOND_ORDER_INTERPOLATED_BOUNDARY = .TRUE.
-            ENDIF
-
-            SELECT CASE(IOR)
-                CASE( 1)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG+1,JJG,KKG)
-                        RHO_OTHER_2 = OM_RHOP(IIO-1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_OTHER_2
-                    Q1 = RHO_OTHER
-                    Q2 = WALL_RHO_GD(IW)
-                    Q3 = RHO_G_2
-                    FACE_VEL = UUD(II,JJ,KK)
-                CASE(-1)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG-1,JJG,KKG)
-                        RHO_OTHER_2 = OM_RHOP(IIO+1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_G_2
-                    Q1 = WALL_RHO_GD(IW)
-                    Q2 = RHO_OTHER
-                    Q3 = RHO_OTHER_2
-                    FACE_VEL = UUD(II-1,JJ,KK)
-                CASE( 2)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG,JJG+1,KKG)
-                        RHO_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-1-OM_LB_J,KKO-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_OTHER_2
-                    Q1 = RHO_OTHER
-                    Q2 = WALL_RHO_GD(IW)
-                    Q3 = RHO_G_2
-                    FACE_VEL = VVD(II,JJ,KK)
-                CASE(-2)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG,JJG-1,KKG)
-                        RHO_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO+1-OM_LB_J,KKO-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_G_2
-                    Q1 = WALL_RHO_GD(IW)
-                    Q2 = RHO_OTHER
-                    Q3 = RHO_OTHER_2
-                    FACE_VEL = VVD(II,JJ-1,KK)
-                CASE( 3)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG,JJG,KKG+1)
-                        RHO_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-1-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_OTHER_2
-                    Q1 = RHO_OTHER
-                    Q2 = WALL_RHO_GD(IW)
-                    Q3 = RHO_G_2
-                    FACE_VEL = WWD(II,JJ,KK)
-                CASE(-3)
-                    IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                        RHO_G_2 = RHOPD(IIG,JJG,KKG-1)
-                        RHO_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO+1-OM_LB_K)
-                    ENDIF
-                    Q0 = RHO_G_2
-                    Q1 = WALL_RHO_GD(IW)
-                    Q2 = RHO_OTHER
-                    Q3 = RHO_OTHER_2
-                    FACE_VEL = WWD(II,JJ,KK-1)
-                CASE DEFAULT
-                    RETURN
-            END SELECT
-
-            ! FLUX_LIMITER_MW_CORRECTION (wall.f90): interpolate RHO/MW instead of RHO
-            IF (MW_CORR) THEN
-                R_G = 0._EB; R_O = 0._EB
-                DO N=1,N_TRACKED_SPECIES
-                    R_G = R_G + MWR_ZD_IN(N)*ZZPD(IIG,JJG,KKG,N)
-                    R_O = R_O + MWR_ZD_IN(N)*ZZPD(II,JJ,KK,N)
-                ENDDO
-                R_G2 = R_G; R_O2 = R_O
-                IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                    DI = 0; DJ = 0; DK = 0
-                    SELECT CASE(ABS(IOR))
-                        CASE(1); DI = SIGN(1,IOR)
-                        CASE(2); DJ = SIGN(1,IOR)
-                        CASE(3); DK = SIGN(1,IOR)
-                    END SELECT
-                    R_G2 = 0._EB; R_O2 = 0._EB
-                    DO N=1,N_TRACKED_SPECIES
-                        R_G2 = R_G2 + MWR_ZD_IN(N)*ZZPD(IIG+DI,JJG+DJ,KKG+DK,N)
-                        R_O2 = R_O2 + MWR_ZD_IN(N)*OM_ZZP(IIO-DI-OM_LB_I,JJO-DJ-OM_LB_J,KKO-DK-OM_LB_K,N)
-                    ENDDO
-                ENDIF
-                IF (IOR>0) THEN
-                    Q0 = Q0*R_O2; Q1 = Q1*R_O; Q2 = Q2*R_G; Q3 = Q3*R_G2
                 ELSE
-                    Q0 = Q0*R_G2; Q1 = Q1*R_G; Q2 = Q2*R_O; Q3 = Q3*R_O2
-                ENDIF
-            ENDIF
-
-            WALL_RHO_FD(IW) = SCALAR_FACE_VALUE_LOCAL(FACE_VEL,Q0,Q1,Q2,Q3,I_FLUX_LIMITER_IN,TWO_EPSILON_EB_IN)
-
-            IF (N_TOTAL_SCALARS == 1) THEN
-                WALL_ZZ_FD(IW,1) = 1._EB
-            ELSE
-                DO N=1,N_TOTAL_SCALARS
-                    RHO_ZZ_G = WALL_RHO_GD(IW)*ZZPD(IIG,JJG,KKG,N)
-                    RHO_ZZ_G_2 = RHO_ZZ_G
-                    RHO_ZZ_OTHER = RHO_OTHER*ZZPD(II,JJ,KK,N)
-                    RHO_ZZ_OTHER_2 = RHO_ZZ_OTHER
-
-                    SELECT CASE(IOR)
-                        CASE( 1)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG+1,JJG,KKG)*ZZPD(IIG+1,JJG,KKG,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO-1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)* &
-                                                 OM_ZZP(IIO-1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_OTHER_2
-                            Q1 = RHO_ZZ_OTHER
-                            Q2 = RHO_ZZ_G
-                            Q3 = RHO_ZZ_G_2
-                        CASE(-1)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG-1,JJG,KKG)*ZZPD(IIG-1,JJG,KKG,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO+1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K)* &
-                                                 OM_ZZP(IIO+1-OM_LB_I,JJO-OM_LB_J,KKO-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_G_2
-                            Q1 = RHO_ZZ_G
-                            Q2 = RHO_ZZ_OTHER
-                            Q3 = RHO_ZZ_OTHER_2
-                        CASE( 2)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG,JJG+1,KKG)*ZZPD(IIG,JJG+1,KKG,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-1-OM_LB_J,KKO-OM_LB_K)* &
-                                                 OM_ZZP(IIO-OM_LB_I,JJO-1-OM_LB_J,KKO-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_OTHER_2
-                            Q1 = RHO_ZZ_OTHER
-                            Q2 = RHO_ZZ_G
-                            Q3 = RHO_ZZ_G_2
-                        CASE(-2)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG,JJG-1,KKG)*ZZPD(IIG,JJG-1,KKG,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO+1-OM_LB_J,KKO-OM_LB_K)* &
-                                                 OM_ZZP(IIO-OM_LB_I,JJO+1-OM_LB_J,KKO-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_G_2
-                            Q1 = RHO_ZZ_G
-                            Q2 = RHO_ZZ_OTHER
-                            Q3 = RHO_ZZ_OTHER_2
-                        CASE( 3)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG,JJG,KKG+1)*ZZPD(IIG,JJG,KKG+1,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-1-OM_LB_K)* &
-                                                 OM_ZZP(IIO-OM_LB_I,JJO-OM_LB_J,KKO-1-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_OTHER_2
-                            Q1 = RHO_ZZ_OTHER
-                            Q2 = RHO_ZZ_G
-                            Q3 = RHO_ZZ_G_2
-                        CASE(-3)
-                            IF (SECOND_ORDER_INTERPOLATED_BOUNDARY) THEN
-                                RHO_ZZ_G_2 = RHOPD(IIG,JJG,KKG-1)*ZZPD(IIG,JJG,KKG-1,N)
-                                RHO_ZZ_OTHER_2 = OM_RHOP(IIO-OM_LB_I,JJO-OM_LB_J,KKO+1-OM_LB_K)* &
-                                                 OM_ZZP(IIO-OM_LB_I,JJO-OM_LB_J,KKO+1-OM_LB_K,N)
-                            ENDIF
-                            Q0 = RHO_ZZ_G_2
-                            Q1 = RHO_ZZ_G
-                            Q2 = RHO_ZZ_OTHER
-                            Q3 = RHO_ZZ_OTHER_2
-                    END SELECT
-
-                    RHO_ZZ_F = SCALAR_FACE_VALUE_LOCAL(FACE_VEL,Q0,Q1,Q2,Q3,I_FLUX_LIMITER_IN,TWO_EPSILON_EB_IN)
-                    IF (MW_CORR) THEN
-                        WALL_ZZ_FD(IW,N) = RHO_ZZ_F
-                    ELSE
-                        WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_F/WALL_RHO_FD(IW)))
-                    ENDIF
-                ENDDO
-
-                ! FLUX_LIMITER_MW_CORRECTION: WALL_ZZ_FD holds RHO*ZZ at the face, WALL_RHO_FD holds RHO/MW.
-                ! Reset the largest species so that SUM(RHO*ZZ/MW) = RHO/MW, then RHO_F = SUM(RHO*ZZ).
-                IF (MW_CORR) THEN
-                    NMAX = 1
-                    DO N=2,N_TRACKED_SPECIES
-                        IF (WALL_ZZ_FD(IW,N)>WALL_ZZ_FD(IW,NMAX)) NMAX = N
-                    ENDDO
-                    S_MW = 0._EB
+                    RHO_F = 0._EB
                     DO N=1,N_TRACKED_SPECIES
-                        IF (N/=NMAX) S_MW = S_MW + WALL_ZZ_FD(IW,N)*MWR_ZD_IN(N)
+                        SELECT CASE(IOR)
+                            CASE( 1); RHO_ZZ_F = FXD(II  ,JJ,KK,N)
+                            CASE(-1); RHO_ZZ_F = FXD(II-1,JJ,KK,N)
+                            CASE( 2); RHO_ZZ_F = FYD(II,JJ  ,KK,N)
+                            CASE(-2); RHO_ZZ_F = FYD(II,JJ-1,KK,N)
+                            CASE( 3); RHO_ZZ_F = FZD(II,JJ,KK  ,N)
+                            CASE DEFAULT; RHO_ZZ_F = FZD(II,JJ,KK-1,N)
+                        END SELECT
+                        RHO_F = RHO_F + RHO_ZZ_F
                     ENDDO
-                    WALL_ZZ_FD(IW,NMAX) = MAX(0._EB,WALL_RHO_FD(IW)-S_MW)/MWR_ZD_IN(NMAX)
-                    S_MW = 0._EB
-                    DO N=1,N_TRACKED_SPECIES
-                        S_MW = S_MW + WALL_ZZ_FD(IW,N)
-                    ENDDO
-                    WALL_RHO_FD(IW) = S_MW
+                    WALL_RHO_FD(IW) = RHO_F
                     DO N=1,N_TOTAL_SCALARS
-                        WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,WALL_ZZ_FD(IW,N)/WALL_RHO_FD(IW)))
+                        SELECT CASE(IOR)
+                            CASE( 1); RHO_ZZ_F = FXD(II  ,JJ,KK,N)
+                            CASE(-1); RHO_ZZ_F = FXD(II-1,JJ,KK,N)
+                            CASE( 2); RHO_ZZ_F = FYD(II,JJ  ,KK,N)
+                            CASE(-2); RHO_ZZ_F = FYD(II,JJ-1,KK,N)
+                            CASE( 3); RHO_ZZ_F = FZD(II,JJ,KK  ,N)
+                            CASE DEFAULT; RHO_ZZ_F = FZD(II,JJ,KK-1,N)
+                        END SELECT
+                        WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,RHO_ZZ_F/RHO_F))
                     ENDDO
+                    RSUM_F = 0._EB
+                    DO N=1,N_TRACKED_SPECIES
+                        RSUM_F = RSUM_F + MWR_ZD_IN(N)*WALL_ZZ_FD(IW,N)
+                    ENDDO
+                    RSUM_F = R0D_IN*RSUM_F
+                    PBAR_F = PBAR_PD(KKG,IPZ)
+                    WALL_TMP_FD(IW) = PBAR_F/(RSUM_F*WALL_RHO_FD(IW))
                 ENDIF
+
+            ELSE
+
+                WALL_ZZ_FD(IW,1) = 1._EB
+                TMPD(II,JJ,KK) = PBAR_PD(KK,IPZ)/(RSUM0_IN*RHOPD(II,JJ,KK))
+                SELECT CASE(IOR)
+                    CASE(-3,3)
+                        PBAR_F = (PBAR_PD(KK,IPZ)*DZD_IN(KKG) + PBAR_PD(KKG,IPZ)*DZD_IN(KK)) / (DZD_IN(KK)+DZD_IN(KKG))
+                    CASE DEFAULT
+                        PBAR_F = PBAR_PD(KKG,IPZ)
+                END SELECT
+                IF (ATMOSPHERIC_INTERPOLATION) THEN
+                    WALL_TMP_FD(IW) = (TMPD(II,JJ,KK)*DZD_IN(KKG)+TMPD(IIG,JJG,KKG)*DZD_IN(KK)) / (DZD_IN(KK)+DZD_IN(KKG))
+                    WALL_RHO_FD(IW) = PBAR_F/(RSUM0_IN*WALL_TMP_FD(IW))
+                ELSE
+                    WALL_TMP_FD(IW) = PBAR_F/(RSUM0_IN*WALL_RHO_FD(IW))
+                ENDIF
+
             ENDIF
 
-            SELECT CASE(IOR)
-                CASE(-3,3)
-                    PBAR_F = (PBAR_PD(KK,IPZ)*DZD_IN(KKG) + PBAR_PD(KKG,IPZ)*DZD_IN(KK)) / &
-                             (DZD_IN(KK)+DZD_IN(KKG))
-                CASE DEFAULT
-                    PBAR_F = PBAR_PD(KKG,IPZ)
-            END SELECT
-
-            RSUM_F = 0._EB
-            DO N=1,N_TRACKED_SPECIES
-                RSUM_F = RSUM_F + MWR_ZD_IN(N)*WALL_ZZ_FD(IW,N)
-            ENDDO
-            RSUM_F = R0D_IN*RSUM_F
-            WALL_TMP_FD(IW) = PBAR_F/(RSUM_F*WALL_RHO_FD(IW))
             WALL_Q_CON_FD(IW) = 0._EB
+            IF (RADIATION_FLAG/=0) WALL_Q_RAD_OUTD(IW) = SIGMA*WALL_EMISSIVITYD(IW)*WALL_TMP_FD(IW)**4
 
         END SUBROUTINE INTERPOLATED_RHO_F_GPU
 
@@ -1910,7 +1905,7 @@ MODULE G_WALL
             INTEGER, DEVICE, DIMENSION(1:*) :: EXT_IIOD_MAX,EXT_JJOD_MAX,EXT_KKOD_MAX
             REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD
             REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:*) :: OM_MUD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(0:OM_NI-1,0:OM_NJ-1,0:OM_NK-1,1:*) :: OM_ZZP
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_RHO_D_DZDN_FD
             REAL(EB), DEVICE, DIMENSION(0:*) :: DX_LOCAL,DY_LOCAL,DZ_LOCAL,DX_OTHER,DY_OTHER,DZ_OTHER
@@ -1982,7 +1977,7 @@ MODULE G_WALL
 
         ATTRIBUTES(GLOBAL) SUBROUTINE WALL_BC_RHO_D_F_GPU(TOTAL_WALL_CELLS, N_TRACKED_SPECIES, WALL_TOPO, MUD, RHOD, &
             WALL_RHO_FD,WALL_RHO_GD,WALL_RHO_D_FD,RSC_IN,NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN,INTERPOLATED_BOUNDARY_IN, &
-            IBP1,JBP1,WALL_LB,WALL_UB)
+            IBP1,JBP1,WALL_LB,WALL_UB,MU_DNSD,WALL_TMP_FD,D_Z_TABLE,SC_FAC,I_MAX_TEMP_IN,MODE_FLAG)
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
@@ -1991,11 +1986,15 @@ MODULE G_WALL
             INTEGER, VALUE :: NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN,INTERPOLATED_BOUNDARY_IN,IBP1,JBP1,WALL_LB,WALL_UB
             REAL(EB), VALUE :: RSC_IN
 
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD,RHOD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MUD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOD
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_RHO_FD, WALL_RHO_GD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_RHO_D_FD
+            INTEGER, VALUE :: I_MAX_TEMP_IN,MODE_FLAG   ! wall.f90 CALCULATE_RHO_D_F: 0 VLES/SVLES, 1 LES, 2 DNS
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: MU_DNSD
+            REAL(EB), DEVICE :: WALL_TMP_FD(0:*),D_Z_TABLE(0:I_MAX_TEMP_IN,1:*),SC_FAC(1:*)
 
-            INTEGER :: IW, N, IIG, JJG, KKG, BTYPE
+            INTEGER :: IW, N, IIG, JJG, KKG, BTYPE, ITMP
             REAL(EB) :: MU_G, RHO_G, FACTOR
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
@@ -2014,8 +2013,20 @@ MODULE G_WALL
             MU_G  = MUD(IIG,JJG,KKG)
             WALL_RHO_GD(IW) = RHO_G
 
+            IF (MODE_FLAG /= 0) THEN
+                ITMP = MIN(I_MAX_TEMP_IN-1,NINT(WALL_TMP_FD(IW)))
+                DO N=1,N_TRACKED_SPECIES
+                    IF (MODE_FLAG == 1) THEN
+                        WALL_RHO_D_FD(IW,N) = WALL_RHO_FD(IW)*(D_Z_TABLE(ITMP,N) + &
+                            (MU_G-MU_DNSD(IIG,JJG,KKG))/RHO_G*RSC_IN*SC_FAC(N))
+                    ELSE
+                        WALL_RHO_D_FD(IW,N) = WALL_RHO_FD(IW)*D_Z_TABLE(ITMP,N)
+                    ENDIF
+                ENDDO
+                RETURN
+            ENDIF
             FACTOR = 0._EB
-            IF (ABS(RHO_G) > TWO_EPSILON_EB) FACTOR = MU_G*RSC_IN*WALL_RHO_FD(IW)/RHO_G
+            IF (ABS(RHO_G) > TWENTY_EPSILON_EB) FACTOR = MU_G*RSC_IN*WALL_RHO_FD(IW)/RHO_G
             DO N=1,N_TRACKED_SPECIES
                 WALL_RHO_D_FD(IW,N) = FACTOR
             ENDDO
@@ -2187,7 +2198,7 @@ MODULE G_WALL
 
             MFT = 0._EB
             DO N=1,N_TRACKED_SPECIES
-                IF (ABS(SF_MASS_FLUXD(SF_IDX,N)) > TWO_EPSILON_EB) THEN
+                IF (ABS(SF_MASS_FLUXD(SF_IDX,N)) > TWENTY_EPSILON_EB) THEN
                     IF (SF_N_QDOTPP_REFD(SF_IDX)>0 .AND. N_REACTIONS_IN>=1) THEN
                         IF (PREDICTOR_FLAG==1) THEN
                             IF (WALL_T_IGND(IW)<=T_IN) THEN
@@ -2223,19 +2234,8 @@ MODULE G_WALL
                 MFT = MFT + WALL_M_DOT_G_PP_ADJUSTD(IW,N)
             ENDDO
 
-            IF (ABS(MFT) <= TWO_EPSILON_EB) THEN
-                DO N=1,N_TRACKED_SPECIES
-                    WALL_ZZ_FD(IW,N) = WALL_ZZ_GD(IW,N)
-                    WALL_M_DOT_G_PP_ADJUSTD(IW,N) = 0._EB
-                    WALL_M_DOT_G_PP_ACTUALD(IW,N) = 0._EB
-                ENDDO
-                IF (PREDICTOR_FLAG == 1) THEN
-                    WALL_U_NORMAL_SD(IW) = 0._EB
-                ELSE
-                    WALL_U_NORMALD(IW) = 0._EB
-                ENDIF
-                RETURN
-            ENDIF
+            ! As CALCULATE_ZZ_F: a tiny (or zero) mass flux total is kept and goes through the face iteration below.
+            ! Zeroing it here dropped HRRPUA of order 1E-10 kW/m2 that the CPU keeps (spreading_fire after the ramp).
 
             KK = WALL_TOPO(IW)%KK
             IPZ = WALL_PRESSURE_ZONED(IW)
@@ -2243,16 +2243,16 @@ MODULE G_WALL
             UN = 0._EB
 
             DO ITER=1,3
-                IF (ABS(WALL_RHO_FD(IW)) > TWO_EPSILON_EB) UN = MFT/WALL_RHO_FD(IW)
+                IF (ABS(WALL_RHO_FD(IW)) > TWENTY_EPSILON_EB) UN = MFT/WALL_RHO_FD(IW)
 
                 DO N=1,N_TRACKED_SPECIES
-                    IF (ABS(RHO_F_PREVIOUS) > TWO_EPSILON_EB) THEN
+                    IF (ABS(RHO_F_PREVIOUS) > TWENTY_EPSILON_EB) THEN
                         WALL_RHO_D_FD(IW,N) = WALL_RHO_D_FD(IW,N)*WALL_RHO_FD(IW)/RHO_F_PREVIOUS
                     ENDIF
                     DD = 2._EB*WALL_RHO_D_FD(IW,N)*WALL_RDND(IW)
                     DENOM = DD + UN*WALL_RHO_FD(IW)
                     M_DOT_ADJUST = WALL_M_DOT_G_PP_ADJUSTD(IW,N)
-                    IF (ABS(DENOM) > TWO_EPSILON_EB) THEN
+                    IF (ABS(DENOM) > TWENTY_EPSILON_EB) THEN
                         WALL_ZZ_FD(IW,N) = (M_DOT_ADJUST + DD*WALL_ZZ_GD(IW,N))/DENOM
                     ELSE
                         WALL_ZZ_FD(IW,N) = WALL_ZZ_GD(IW,N)
@@ -2317,12 +2317,13 @@ MODULE G_WALL
             REAL(EB), DEVICE, DIMENSION(1:TOTAL_WALL_CELLS,1:*) :: WALL_ZZ_GD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_FD
             REAL(EB), DEVICE, DIMENSION(0:KBP1,0:*) :: PBARD_IN
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RHOPD,TMPD,RSUMD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:KBP1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: RSUMD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:*) :: RHOPD,TMPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1+1,-1:JBP1+1,-1:KBP1+1,1:*) :: ZZPD
             REAL(EB), DEVICE, DIMENSION(*) :: MWR_ZD_IN
             REAL(EB), VALUE :: R0D_IN
 
-            INTEGER :: IW, N, II, JJ, KK, IIG, JJG, KKG, IPZ, SF_IDX, IC, ICG
+            INTEGER :: IW, N, II, JJ, KK, II2, JJ2, KK2, IPZ, SF_IDX
             REAL(EB) :: RSUM_F, RHO_F_LOCAL, UN_P
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
@@ -2332,8 +2333,21 @@ MODULE G_WALL
 
             SF_IDX = WALL_SF_INDEXD(IW)
 
+            II = WALL_TOPO(IW)%II
+            JJ = WALL_TOPO(IW)%JJ
             KK = WALL_TOPO(IW)%KK
             IPZ = WALL_PRESSURE_ZONED(IW)
+
+            ! Second ghost layer (BC%II2,BC%JJ2,BC%KK2)
+            II2 = II ; JJ2 = JJ ; KK2 = KK
+            SELECT CASE(WALL_TOPO(IW)%IOR)
+                CASE( 1); II2 = II-1
+                CASE(-1); II2 = II+1
+                CASE( 2); JJ2 = JJ-1
+                CASE(-2); JJ2 = JJ+1
+                CASE( 3); KK2 = KK-1
+                CASE(-3); KK2 = KK+1
+            END SELECT
 
             IF (SF_SPECIES_BC_INDEXD(SF_IDX) == SPECIFIED_MASS_FLUX_IN) THEN
                 RHO_F_LOCAL = WALL_RHO_FD(IW)
@@ -2349,6 +2363,15 @@ MODULE G_WALL
                 ENDDO
                 RSUM_F = R0D_IN*RSUM_F
                 RHO_F_LOCAL = PBARD_IN(KK,IPZ)/(RSUM_F*WALL_TMP_FD(IW))
+            ENDIF
+
+            ! Exterior ghost cells, both layers (CPU: end of CALCULATE_ZZ_F, i.e. before the SOLID inflow override below).
+            ! FDS 54bd18d6e5, 47c184ddf4: Z_ghost=Z_F in II and II2.
+            IF (IW <= N_EXTERNAL_WALL_CELLS .AND. WALL_TOPO(IW)%BOUNDARY_TYPE /= OPEN_BOUNDARY_IN) THEN
+                DO N = 1, N_TRACKED_SPECIES
+                    ZZPD(II,JJ,KK,N) = WALL_ZZ_FD(IW,N)
+                    ZZPD(II2,JJ2,KK2,N) = WALL_ZZ_FD(IW,N)
+                ENDDO
             ENDIF
 
             IF (WALL_TOPO(IW)%BOUNDARY_TYPE == SOLID_BOUNDARY_IN) THEN
@@ -2375,35 +2398,22 @@ MODULE G_WALL
             IF (IW <= N_EXTERNAL_WALL_CELLS .AND. &
                 WALL_TOPO(IW)%BOUNDARY_TYPE /= OPEN_BOUNDARY_IN .AND. &
                 WALL_TOPO(IW)%BOUNDARY_TYPE /= INTERPOLATED_BOUNDARY_IN) THEN
-                II = WALL_TOPO(IW)%II
-                JJ = WALL_TOPO(IW)%JJ
-                KK = WALL_TOPO(IW)%KK
-                RHOPD(II,JJ,KK) = 2._EB*RHO_F_LOCAL - WALL_RHO_GD(IW)
+                ! FDS 54bd18d6e5, 1ae78563b6: rho_ghost=RHO_F and TMP_ghost=TMP_F in both ghost layers
+                RHOPD(II,JJ,KK) = RHO_F_LOCAL
+                RHOPD(II2,JJ2,KK2) = RHO_F_LOCAL
+                TMPD(II,JJ,KK)  = WALL_TMP_FD(IW)
+                TMPD(II2,JJ2,KK2)  = WALL_TMP_FD(IW)
             ELSEIF (IW <= N_EXTERNAL_WALL_CELLS .AND. &
                     SF_THERMAL_BC_INDEXD(SF_IDX) == INFLOW_OUTFLOW_IN) THEN
-                II = WALL_TOPO(IW)%II
-                JJ = WALL_TOPO(IW)%JJ
-                KK = WALL_TOPO(IW)%KK
+                ! Same values as SURFACE_HEAT_TRANSFER_INFLOW_OUTFLOW_GPU (both layers)
                 TMPD(II,JJ,KK) = WALL_TMP_FD(IW)
+                TMPD(II2,JJ2,KK2) = WALL_TMP_FD(IW)
                 RHOPD(II,JJ,KK) = RHO_F_LOCAL
+                RHOPD(II2,JJ2,KK2) = RHO_F_LOCAL
                 RSUMD(II,JJ,KK) = RSUM_F
                 DO N = 1, N_TRACKED_SPECIES
                     ZZPD(II,JJ,KK,N) = WALL_ZZ_FD(IW,N)
-                ENDDO
-            ENDIF
-
-            II  = WALL_TOPO(IW)%II
-            JJ  = WALL_TOPO(IW)%JJ
-            KK  = WALL_TOPO(IW)%KK
-            IIG = WALL_TOPO(IW)%IIG
-            JJG = WALL_TOPO(IW)%JJG
-            KKG = WALL_TOPO(IW)%KKG
-            IC  = CELL_INDEXD(II,JJ,KK)
-            ICG = CELL_INDEXD(IIG,JJG,KKG)
-            IF (IW <= N_EXTERNAL_WALL_CELLS .AND. WALL_TOPO(IW)%BOUNDARY_TYPE /= OPEN_BOUNDARY_IN .AND. &
-                .NOT.CELL_SOLIDD(IC) .AND. .NOT.CELL_SOLIDD(ICG)) THEN
-                DO N = 1, N_TRACKED_SPECIES
-                    ZZPD(II,JJ,KK,N) = 2._EB*WALL_ZZ_FD(IW,N) - WALL_ZZ_GD(IW,N)
+                    ZZPD(II2,JJ2,KK2,N) = WALL_ZZ_FD(IW,N)
                 ENDDO
             ENDIF
 
@@ -2413,7 +2423,9 @@ MODULE G_WALL
             WALL_SF_INDEXD, SF_SPECIES_BC_INDEXD, SF_MASS_FRACTIOND, WALL_U_NORMAL_SD, WALL_ZZ_GD, WALL_ZZ_FD, &
             UUD, VVD, WWD, WALL_RHO_FD, WALL_RHO_D_DZDN_FD, WALL_M_DOT_G_PP_ADJUSTD, WALL_M_DOT_G_PP_ACTUALD, &
             NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN,INTERPOLATED_BOUNDARY_IN,SPECIFIED_MASS_FRACTION_IN, &
-            SURF_LB,SURF_UB,WALL_LB,WALL_UB,IBP1,JBP1,KBP1)
+            SURF_LB,SURF_UB,WALL_LB,WALL_UB,IBP1,JBP1,KBP1, &
+            SF_RAMP_MF_INDEXD,SF_RAMP_MF_TAUD,WALL_T_IGND,ZZ0D,RAMP_T_MIND,RAMP_SPAND,RAMP_RDTD, &
+            RAMP_NPOINTSD,RAMP_OFFSETD,RAMP_INTERPD,T_IN,DT_IN,T_BEGIN_IN,PREDICTOR_FLAG)
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
@@ -2424,14 +2436,26 @@ MODULE G_WALL
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEXD, SF_SPECIES_BC_INDEXD
             REAL(EB), DEVICE, DIMENSION(SURF_LB:SURF_UB,1:*) :: SF_MASS_FRACTIOND
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_U_NORMAL_SD
-            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,0:*) :: UUD,VVD,WWD
+            REAL(EB), DEVICE, DIMENSION(-1:IBP1,0:JBP1,0:*) :: UUD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,-1:JBP1,0:*) :: VVD
+            REAL(EB), DEVICE, DIMENSION(0:IBP1,0:JBP1,-1:*) :: WWD
             REAL(EB), DEVICE, DIMENSION(1:TOTAL_WALL_CELLS,1:*) :: WALL_ZZ_GD
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_RHO_FD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_ZZ_FD,WALL_RHO_D_DZDN_FD
             REAL(EB), DEVICE, DIMENSION(WALL_LB:WALL_UB,1:*) :: WALL_M_DOT_G_PP_ADJUSTD,WALL_M_DOT_G_PP_ACTUALD
+            INTEGER, DEVICE, DIMENSION(SURF_LB:SURF_UB,1:*) :: SF_RAMP_MF_INDEXD
+            REAL(EB), DEVICE, DIMENSION(SURF_LB:SURF_UB,1:*) :: SF_RAMP_MF_TAUD
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_T_IGND
+            REAL(EB), DEVICE, DIMENSION(1:*) :: ZZ0D
+            REAL(EB), DEVICE, DIMENSION(0:*) :: RAMP_T_MIND,RAMP_SPAND,RAMP_RDTD
+            INTEGER, DEVICE, DIMENSION(0:*) :: RAMP_NPOINTSD,RAMP_OFFSETD
+            REAL(EB), DEVICE, DIMENSION(1:*) :: RAMP_INTERPD
+            REAL(EB), VALUE :: T_IN,DT_IN,T_BEGIN_IN
+            INTEGER, VALUE :: PREDICTOR_FLAG
 
-            INTEGER :: IW, N, SF_IDX, IOR, IIG, JJG, KKG
-            REAL(EB) :: SUM_OTHER_SPECIES, UN
+            INTEGER :: IW, N, SF_IDX, IOR, IIG, JJG, KKG, N_ZZ_MAX
+            REAL(EB) :: SUM_OTHER_SPECIES, UN, TSI, ZMAX
+            LOGICAL :: ANY_RAMP
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
             IF (IW < 1 .OR. IW > TOTAL_WALL_CELLS) RETURN
@@ -2446,12 +2470,32 @@ MODULE G_WALL
             ENDDO
 
             IF (SF_SPECIES_BC_INDEXD(SF_IDX) == SPECIFIED_MASS_FRACTION_IN .AND. WALL_U_NORMAL_SD(IW) < 0._EB) THEN
+                ! wall.f90 SPECIFIED_MASS_FRACTION: ZZ0 + ramp(t)*(MASS_FRACTION-ZZ0) (default ramp tanh(t/TAU_MF)),
+                ! background species by difference, then GET_REALIZABLE_MF
+                ANY_RAMP = .FALSE.
+                DO N=1,N_TRACKED_SPECIES
+                    IF (SF_RAMP_MF_INDEXD(SF_IDX,N)>=1) ANY_RAMP = .TRUE.
+                ENDDO
+                IF (ABS(WALL_T_IGND(IW)-T_BEGIN_IN)<SPACING(WALL_T_IGND(IW)) .AND. ANY_RAMP) THEN
+                    TSI = T_IN
+                ELSE
+                    TSI = T_IN - WALL_T_IGND(IW)
+                ENDIF
+                IF (PREDICTOR_FLAG==1) TSI = TSI + DT_IN
                 SUM_OTHER_SPECIES = 0._EB
                 DO N=2,MIN(N_TOTAL_SCALARS,N_TRACKED_SPECIES)
-                    WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,SF_MASS_FRACTIOND(SF_IDX,N)))
+                    WALL_ZZ_FD(IW,N) = ZZ0D(N) + EVALUATE_RAMP_DEVICE(TSI,SF_RAMP_MF_INDEXD(SF_IDX,N),SF_RAMP_MF_TAUD(SF_IDX,N), &
+                        RAMP_T_MIND,RAMP_SPAND,RAMP_RDTD,RAMP_NPOINTSD,RAMP_OFFSETD,RAMP_INTERPD)*(SF_MASS_FRACTIOND(SF_IDX,N)-ZZ0D(N))
                     SUM_OTHER_SPECIES = SUM_OTHER_SPECIES + WALL_ZZ_FD(IW,N)
                 ENDDO
                 IF (N_TRACKED_SPECIES >= 1) WALL_ZZ_FD(IW,1) = 1._EB - SUM_OTHER_SPECIES
+                N_ZZ_MAX = 1 ; ZMAX = -1._EB ; SUM_OTHER_SPECIES = 0._EB
+                DO N=1,N_TRACKED_SPECIES
+                    WALL_ZZ_FD(IW,N) = MAX(0._EB,MIN(1._EB,WALL_ZZ_FD(IW,N)))
+                    IF (WALL_ZZ_FD(IW,N)>ZMAX) THEN ; ZMAX = WALL_ZZ_FD(IW,N) ; N_ZZ_MAX = N ; ENDIF
+                    SUM_OTHER_SPECIES = SUM_OTHER_SPECIES + WALL_ZZ_FD(IW,N)
+                ENDDO
+                WALL_ZZ_FD(IW,N_ZZ_MAX) = 1._EB - (SUM_OTHER_SPECIES - WALL_ZZ_FD(IW,N_ZZ_MAX))
             ELSE
                 DO N=1,MIN(N_TOTAL_SCALARS,N_TRACKED_SPECIES)
                     WALL_ZZ_FD(IW,N) = WALL_ZZ_GD(IW,N)

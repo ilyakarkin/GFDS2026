@@ -9,8 +9,11 @@ MODULE G_RADI
     USE MESH_POINTERS
     USE COMP_FUNCTIONS
     USE G_FUNC, ONLY: EVALUATE_RAMP_DEVICE
-    USE G_ERRO, ONLY: GPU_WAIT_ALL,GPU_MPI_IRECV,GPU_MPI_ISEND,GPU_MPI_WAITALL
+    USE G_ERRO, ONLY: GPU_WAIT_ALL,GPU_STREAM_BARRIER,GPU_MPI_IRECV,GPU_MPI_ISEND,GPU_MPI_WAITALL
     USE RADCONS
+    USE CUDAFOR, ONLY: CUDA_STREAM_KIND,cudaMemcpyAsync,cudaGraph,cudaGraphExec,cudaGraphLaunch, &
+        cudaGraphInstantiate,cudaGraphDestroy,cudaGraphExecDestroy,cudaStreamBeginCapture,cudaStreamEndCapture, &
+        cudaStreamCaptureModeRelaxed
     IMPLICIT NONE
 
     ! Radiation sweep: per-slice kernels (SLICE, as originally), or the cell data that does not depend on the upwind
@@ -19,9 +22,13 @@ MODULE G_RADI
     INTEGER, PARAMETER :: RADI_SWEEP_SLICE=0,RADI_SWEEP_RECORDS=1,RADI_SWEEP_CHECK=2
     INTEGER :: RADI_SWEEP_MODE=-1
     INTEGER, PARAMETER :: RADI_SWEEP_N_COEF=10
+    INTEGER :: RADI_GRAPH_MODE=-1   ! angle-group graphs: -1 not decided, 0 off (GFDS_RADI_GRAPH=0), 1 on
     !> Meshes whose largest slice has at most this many cells are swept by one thread block, with a block barrier
     !> between slices instead of a kernel launch per slice.
     INTEGER, PARAMETER :: RADI_SWEEP_BLOCK_THREADS=512
+    !> The one-block sweep is used for slices of up to this many cells (each thread then takes up to 4 cells of a slice).
+    !> Each mesh is swept on its own stream, so the one-block sweeps of different meshes run side by side.
+    INTEGER, PARAMETER :: RADI_SWEEP_BLOCK_MAX_SLICE=4*RADI_SWEEP_BLOCK_THREADS
 
     CONTAINS
 
@@ -61,6 +68,15 @@ MODULE G_RADI
                     ALLOCATE(GM%RADI%OMESH(NOM)%IL_R_D(LBOUND(OM%IL_R,1):UBOUND(OM%IL_R,1), &
                         LBOUND(OM%IL_R,2):UBOUND(OM%IL_R,2),LBOUND(OM%IL_R,3):UBOUND(OM%IL_R,3)))
                     GM%RADI%OMESH(NOM)%IL_R_D = OM%IL_R
+                    IF (PROCESS(NOM)/=PROCESS(NM)) THEN
+                        ALLOCATE(GM%RADI%OMESH(NOM)%IL_R_RECV_D(LBOUND(OM%IL_R,1):UBOUND(OM%IL_R,1), &
+                            LBOUND(OM%IL_R,2):UBOUND(OM%IL_R,2),LBOUND(OM%IL_R,3):UBOUND(OM%IL_R,3)))
+                        GM%RADI%OMESH(NOM)%IL_R_RECV_D = OM%IL_R
+                        ALLOCATE(GM%RADI%OMESH(NOM)%IOR_R_D(1:MAX(1,SIZE(OM%IL_R,1))))
+                        GM%RADI%OMESH(NOM)%IOR_R_D = 0
+                        IF (ALLOCATED(OM%IOR_R)) GM%RADI%OMESH(NOM)%IOR_R_D(1:SIZE(OM%IL_R,1)) = &
+                            OM%IOR_R(LBOUND(OM%IOR_R,1):LBOUND(OM%IOR_R,1)+SIZE(OM%IL_R,1)-1)
+                    ENDIF
                 ENDIF
             ENDDO
 
@@ -122,8 +138,9 @@ MODULE G_RADI
             GM%RADI%IJK_SLICE_MAP_D = IJK_SLICE_MAP_H
             DEALLOCATE(IJK_SLICE_MAP_H)
             GM%RADI%KAPPA_GAS_D = 0._EB
-            GM%RADI%UII_D = 0._EB
-            IF (RESTART) GM%RADI%UII_D = UII
+            ! UII holds the result of the initial radiation iterations (or the restart file). The first time step
+            ! uses it in the RTE source correction sums before the intensity is updated, as the CPU path does.
+            GM%RADI%UII_D = UII
             GM%RADI%UIID_D = UIID
             GM%RADI%QR_W_D = 0._EB
             IF (N_LP_ARRAY_INDICES>0 .AND. ASSOCIATED(QR_W)) GM%RADI%QR_W_D = QR_W
@@ -190,6 +207,16 @@ MODULE G_RADI
             GM%RADI%CELL_ILW_D = CELL_ILW
             GM%RADI%BOUNDARY_RADIA_ILW_D = GM%RADI%BOUNDARY_RADIA_ILW_H
             DEALLOCATE(WALL_NIC_MIN_H,WALL_NIC_MAX_H)
+
+            IF (.NOT.ALLOCATED(RADI_BBFRAC_D)) THEN
+                IF (WIDE_BAND_MODEL .AND. ALLOCATED(BBFRAC)) THEN
+                    ALLOCATE(RADI_BBFRAC_D(0:NLAMBDAT))
+                    RADI_BBFRAC_D = BBFRAC(0:NLAMBDAT)
+                ELSE
+                    ALLOCATE(RADI_BBFRAC_D(0:0))
+                    RADI_BBFRAC_D = 0._EB
+                ENDIF
+            ENDIF
 
             IF (N_RADCAL_ARRAY_SIZE>0 .AND. ALLOCATED(Z2RADCAL_SPECIES) .AND. ALLOCATED(RADCAL_SPECIES2KAPPA) .AND. &
                 .NOT.ALLOCATED(RADI_RADCAL_SPECIES_INDEX_D)) THEN
@@ -262,6 +289,35 @@ MODULE G_RADI
 
         END SUBROUTINE RADI_SYNC_BOUNDARY_RADIA_ILW_H2D
 
+        !> Upload the WALL radiation storage after REASSIGN_WALL_CELLS (obstruction created or removed). The storage
+        !> index BR_INDEX of a reassigned wall can change and BOUNDARY_RADIA can grow, so the index map and the
+        !> packed wall intensities are sent again. The caller has copied the device intensities to the host first.
+        SUBROUTINE RADI_REFRESH_WALL_STORAGE(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW
+
+            CALL POINT_TO_MESH(NM)
+            CALL POINT_GPU_MESHES(NM)
+            IF (.NOT.ALLOCATED(GM%RADI)) RETURN
+            IF (SIZE(GM%RADI%BOUNDARY_RADIA_ILW_H,1)/=MAX(1,N_BOUNDARY_RADIA_DIM)) THEN
+                DEALLOCATE(GM%RADI%BOUNDARY_RADIA_ILW_D,GM%RADI%BOUNDARY_RADIA_ILW_H)
+                ALLOCATE(GM%RADI%BOUNDARY_RADIA_ILW_D(1:MAX(1,N_BOUNDARY_RADIA_DIM),1:NUMBER_SPECTRAL_BANDS, &
+                                                       1:NUMBER_RADIATION_ANGLES))
+                ALLOCATE(GM%RADI%BOUNDARY_RADIA_ILW_H(1:MAX(1,N_BOUNDARY_RADIA_DIM),1:NUMBER_SPECTRAL_BANDS, &
+                                                       1:NUMBER_RADIATION_ANGLES))
+                CALL POINT_GPU_MESHES(NM)
+                ! The angle-group graphs hold the address and the size of the old storage: capture them again
+                CALL RADI_ANGLE_GRAPHS_RESET
+            ENDIF
+            CALL RADI_SYNC_BOUNDARY_RADIA_ILW_H2D
+            GM%RADI%WALL_BR_INDEX_H = 0
+            DO IW=1,GM%WALL_UB
+                GM%RADI%WALL_BR_INDEX_H(IW) = WALL(IW)%BR_INDEX
+            ENDDO
+            GM%RADI%WALL_BR_INDEX_D = GM%RADI%WALL_BR_INDEX_H
+
+        END SUBROUTINE RADI_REFRESH_WALL_STORAGE
+
         SUBROUTINE RADI_SYNC_BOUNDARY_RADIA_ILW_D2H
             INTEGER :: IBR,IB,N,NLIM
 
@@ -285,7 +341,7 @@ MODULE G_RADI
         ! Inter-mesh radiation-intensity exchange
         !--------------------------------------------------------------------------
         SUBROUTINE GPU_RADIATION_EXCHANGE
-            INTEGER :: NSRC,NDST,N_REQ,N_REQ_MAX
+            INTEGER :: NSRC,NDST,N_REQ,N_REQ_MAX,N_TOT
             TYPE(MPI_REQUEST), ALLOCATABLE :: REQUEST(:)
 
             N_REQ_MAX = 0
@@ -318,8 +374,8 @@ MODULE G_RADI
                     IF (PROCESS(NSRC)==MY_RANK) CYCLE
                     IF (.NOT.ALLOCATED(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D)) CYCLE
                     N_REQ = N_REQ + 1
-                    CALL GPU_MPI_IRECV(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D, &
-                        SIZE(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D), &
+                    CALL GPU_MPI_IRECV(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_RECV_D, &
+                        SIZE(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_RECV_D), &
                         PROCESS(NSRC),NSRC,REQUEST(N_REQ))
                 ENDDO
             ENDDO
@@ -358,6 +414,26 @@ MODULE G_RADI
             IF (N_REQ>0) THEN
                 CALL GPU_MPI_WAITALL(REQUEST(1:N_REQ))
             ENDIF
+
+            ! Unpack as MESH_EXCHANGE(2) does between MPI processes: after the first time step only the angles of the
+            ! current ANGLE_INC_COUNTER group are taken, and only those with DLN(IOR_R,N)>0. This matters after all
+            ! angles were updated at once (UPDATE_ALL_ANGLES, an obstruction created or removed).
+            DO NDST=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                IF (.NOT.ALLOCATED(GPU_MESHES(NDST)%RADI)) CYCLE
+                IF (.NOT.ALLOCATED(GPU_MESHES(NDST)%RADI%OMESH)) CYCLE
+                DO NSRC=1,NMESHES
+                    IF (PROCESS(NSRC)==MY_RANK) CYCLE
+                    IF (.NOT.ALLOCATED(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_RECV_D)) CYCLE
+                    N_TOT = SIZE(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D)
+                    IF (N_TOT<=0) CYCLE
+                    CALL RADIATION_UNPACK_IL_R_GPU<<<(N_TOT+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D>>>( &
+                        GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D,GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_RECV_D, &
+                        GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IOR_R_D,DLN_D, &
+                        SIZE(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D,1),NUMBER_RADIATION_ANGLES, &
+                        SIZE(GPU_MESHES(NDST)%RADI%OMESH(NSRC)%IL_R_D,3),MESHES(NDST)%ANGLE_INC_COUNTER,ANGLE_INCREMENT, &
+                        MERGE(1,0,ICYC<=1))
+                ENDDO
+            ENDDO
 
             CALL GPU_WAIT_ALL
 
@@ -410,6 +486,12 @@ MODULE G_RADI
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
 
+            ! The radiation kernels of this mesh are launched on the stream of the mesh: the meshes are independent within
+            ! the radiation stage (they read IL_R of the last exchange), so their sweeps overlap on the device.
+            ! GPU_RADIATION_EXCHANGE and the later stages order themselves through the legacy default stream, which waits
+            ! for all mesh streams. The CUDA Fortran default stream is not changed (cudaforSetDefaultStream): once set, the
+            ! array assignments of the other stages became slower on the host (DENSITY_GPU twice as slow on a 44-mesh building model).
+
             IF (RADIATION) THEN
                 RADIATION_COMPLETED(NM) = .FALSE.
                 GM%RADI%T = T
@@ -426,7 +508,7 @@ MODULE G_RADI
                     GM%CHI_RD = 0._EB
                 ENDIF
                 IF (N_REACTIONS>0) THEN
-                    CALL RADIATION_OFF_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>(GM%QRD,GM%CHI_RD,GM%QD,IBP1,JBP1,KBP1)
+                    CALL RADIATION_OFF_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>(GM%QRD,GM%CHI_RD,GM%QD,IBP1,JBP1,KBP1)
                 ENDIF
                 IF (INIT_HRRPUV) CALL RADIATION_APPLY_INIT_HRRPUV_GPU(T,0)
                 IF (GPU_DEBUG_H2D_D2H) THEN
@@ -440,6 +522,7 @@ MODULE G_RADI
         END SUBROUTINE COMPUTE_RADIATION_GPU
 
         SUBROUTINE RADIATION_FVM_GPU
+            USE RAD, ONLY : BLACKBODY_FRACTION
             USE MIEV
             USE MATH_FUNCTIONS, ONLY : INTERPOLATE1D, EVALUATE_RAMP
             USE TRAN, ONLY : GET_IJK
@@ -460,8 +543,9 @@ MODULE G_RADI
             INTEGER  :: IADD,IFACE,INDCF
             REAL(EB) :: XID,YJD,ZKD,KAPPA_PART_SINGLE,DLF,DLA(3),TSI,TMP_EXTERIOR,TEMP_ORIENTATION(3)
             REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
-            INTEGER :: IID,JJD,KKD,IP
-            LOGICAL :: UPDATE_INTENSITY
+            INTEGER :: IID,JJD,KKD,IP,GRAPH_STATE
+            LOGICAL :: UPDATE_INTENSITY,BAND_MODEL
+            REAL(EB) :: WL1,WL2
             REAL(EB), POINTER, DIMENSION(:,:,:) :: KFST4_GAS,IL,UIIOLD,KAPPA_PART,KFST4_PART,EXTCOE,SCAEFF,SCAEFF_G,IL_UP
             REAL(EB), POINTER, DIMENSION(:)     :: OUTRAD_W,INRAD_W,OUTRAD_F,INRAD_F,IL_F
             REAL(EB), DEVICE, POINTER, DIMENSION(:,:,:) :: KFST4_GAS_D,IL_D,UIIOLD_D,EXTCOE_D,KAPPA_PART_D,SCAEFF_D,SCAEFF_G_D, &
@@ -550,32 +634,98 @@ MODULE G_RADI
                 ENDIF
             ENDIF
 
+            ! Walls of a SURF with TMP_GAS_FRONT keep the Q_RAD_IN set in NEAR_SURFACE_GAS_VARIABLES, as in RADIATION_FVM.
             IF (UPDATE_INTENSITY) THEN
-                GM%WALL_Q_RAD_IN = 0._EB
+                IF (ANY(SURFACE(:)%TMP_GAS_FRONT>0._EB)) THEN
+                    CALL RADIATION_ZERO_WALL_Q_RAD_IN_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                        GM%WALL_Q_RAD_IN,GM%WALL_TOPO_AOS,GM%WALL_SF_INDEX,SF_TMP_GAS_FRONT, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS)
+                ELSE
+                    CALL RADIATION_FILL_GPU<<<(SIZE(GM%WALL_Q_RAD_IN)+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                        GM%WALL_Q_RAD_IN,SIZE(GM%WALL_Q_RAD_IN),0._EB)
+                ENDIF
             ENDIF
 
-            ! IF (WIDE_BAND_MODEL .OR. WSGG_MODEL) THEN
-            !    QRD = 0._EB
-            !    IF (STORE_RADIATION_TERMS) THEN
-            !       RADIATION_EMISSION_D = 0._EB
-            !       RADIATION_ABSORPTION_D = 0._EB
-            !    ENDIF
-            !    IF (N_LP_ARRAY_INDICES>0 .AND. PARTICLES_EXISTED .AND. ASSOCIATED(QR_W)) RADI_QR_W_D = 0._EB
-            ! ENDIF
+            ! Wide-band model: QR and the stored terms are summed over the bands below (RADIATION_FVM).
+            ! WSGG_MODEL is refused before the time loop (see main.f90).
+            BAND_MODEL = WIDE_BAND_MODEL .OR. WSGG_MODEL
+            WL1 = 0._EB
+            WL2 = 0._EB
+            IF (BAND_MODEL) THEN
+                GM%QRD = 0._EB
+                IF (STORE_RADIATION_TERMS) THEN
+                    GM%RADI%EMISSION_D = 0._EB
+                    GM%RADI%ABSORPTION_D = 0._EB
+                ENDIF
+                IF (N_LP_ARRAY_INDICES>0 .AND. PARTICLES_EXISTED) GM%RADI%QR_W_D = 0._EB
+            ENDIF
+
+            ! Oriented targets of this mesh: their IL is gathered on the device in the angle loop (no per-angle readback)
+            GM%RADI%TARGETS_PENDING = .FALSE.
+            GM%RADI%N_TARGETS = 0
+            IF (ORIENTED_PARTICLES .AND. UPDATE_INTENSITY) CALL RADIATION_SETUP_TARGETS_GPU(NRA)
 
             ! Loop over spectral bands
             BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
 
-                KAPPA_PART = 0._EB
-                KFST4_GAS  = 0._EB
-                KFST4_PART = 0._EB
-                SCAEFF = 0._EB
-                SCAEFF_G = 0._EB
+                ! The host scratch arrays are not read on the GPU path (their device copies are zeroed below)
+                IF (GPU_DEBUG_H2D_D2H) THEN
+                    KAPPA_PART = 0._EB
+                    KFST4_GAS  = 0._EB
+                    KFST4_PART = 0._EB
+                    SCAEFF = 0._EB
+                    SCAEFF_G = 0._EB
+                ENDIF
 
-                BBFA = 1._EB
+                ! Fraction of ambient black body radiation in this band
+                IF (NUMBER_SPECTRAL_BANDS==1) THEN
+                    BBFA = 1._EB
+                ELSE
+                    WL1 = WL_LOW(IBND)
+                    WL2 = WL_HIGH(IBND)
+                    BBFA = BLACKBODY_FRACTION(WL1,WL2,TMPA)
+                ENDIF
 
-                CALL RADIATION_ZERO_BAND_FIELDS_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_ZERO_BAND_FIELDS_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     GM%RADI%KAPPA_GAS_D,KAPPA_PART_D,KFST4_GAS_D,KFST4_PART_D,SCAEFF_D,SCAEFF_G_D,IBP1,JBP1,KBP1)
+
+                ! Droplet absorption, emission and scattering, as in RADIATION_FVM, from the running averages AVG_DROP_*
+                ! that PARTICLE_MASS_ENERGY_TRANSFER keeps on the host (see GPU_PARTICLES_CORRECTOR in main.f90)
+                IF (N_LP_ARRAY_INDICES>0 .AND. LIQUID_DROPLETS .AND. PARTICLES_EXISTED) THEN
+                    IF (NUMBER_SPECTRAL_BANDS==1) THEN
+                        BBF = 1._EB
+                    ELSE
+                        BBF = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),RADTMP)
+                    ENDIF
+                    ! The host arrays are the work arrays WORK5-7, which PARTICLE_RUNNING_AVERAGES fills with its sums
+                    KAPPA_PART = 0._EB
+                    KFST4_PART = 0._EB
+                    SCAEFF     = 0._EB
+                    GPU_DROPLET_CLASS_LOOP: DO N=1,N_LAGRANGIAN_CLASSES
+                        LPC => LAGRANGIAN_PARTICLE_CLASS(N)
+                        IF (.NOT.LPC%LIQUID_DROPLET) CYCLE GPU_DROPLET_CLASS_LOOP
+                        ARRAY_INDEX = LPC%ARRAY_INDEX
+                        IF (ARRAY_INDEX==0) CYCLE GPU_DROPLET_CLASS_LOOP
+                        DO K=1,KBAR
+                            DO J=1,JBAR
+                                DO I=1,IBAR
+                                    IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
+                                    IF (ABS(AVG_DROP_AREA(I,J,K,ARRAY_INDEX))<TWENTY_EPSILON_EB) CYCLE
+                                    NCSDROP = AVG_DROP_AREA(I,J,K,ARRAY_INDEX)
+                                    CALL INTERPOLATE1D(LPC%R50,LPC%WQABS(:,IBND),AVG_DROP_RAD(I,J,K,ARRAY_INDEX),QVAL)
+                                    KAPPA_PART(I,J,K) = KAPPA_PART(I,J,K) + NCSDROP*QVAL
+                                    KFST4_PART(I,J,K) = KFST4_PART(I,J,K) + &
+                                        BBF*NCSDROP*QVAL*FOUR_SIGMA*AVG_DROP_TMP(I,J,K,ARRAY_INDEX)**4
+                                    CALL INTERPOLATE1D(LPC%R50,LPC%WQSCA(:,IBND),AVG_DROP_RAD(I,J,K,ARRAY_INDEX),QVAL)
+                                    SCAEFF(I,J,K) = SCAEFF(I,J,K) + NCSDROP*QVAL
+                                ENDDO
+                            ENDDO
+                        ENDDO
+                    ENDDO GPU_DROPLET_CLASS_LOOP
+                    KAPPA_PART_D = KAPPA_PART
+                    KFST4_PART_D = KFST4_PART
+                    SCAEFF_D     = SCAEFF
+                ENDIF
 
                 ! Set or interpolate gas absorption coefficient KAPPA_GAS.
 
@@ -585,7 +735,7 @@ MODULE G_RADI
                     GM%RADI%KAPPA_GAS_D = KAPPA0
 
                 ELSEIF (N_RADCAL_ARRAY_SIZE>0) THEN
-                    CALL RADIATION_KAPPA_GAS_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                    CALL RADIATION_KAPPA_GAS_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                         GM%RADI%KAPPA_GAS_D,GM%ZZD,GM%TMPD,GM%CELL_INDEXD,GM%CELL_SOLID,RADI_MWR_KC_D, &
                         RADI_Z2RADCAL_SPECIES_D,RADI_RADCAL_SPECIES2KAPPA_D,RADI_RADCAL_SPECIES_INDEX_D, &
                         IBND,N_TRACKED_SPECIES,N_RADCAL_ARRAY_SIZE,N_KAPPA_T,N_KAPPA_X,IBAR,JBAR,KBAR,RTMPMIN,RTMPMAX,TWENTY_EPSILON_EB, &
@@ -595,37 +745,40 @@ MODULE G_RADI
                 ENDIF
 
                 ! Assemble KFST4_GAS and its reduction sums for the gray-gas source.
-                CALL RADIATION_KFST4_SUM_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
-                    KFST4_GAS_D,GM%RADI%KAPPA_GAS_D,GM%TMPD,GM%QD,GM%CHI_RD,GM%RADI%UII_D,GM%CELL_INDEXD, &
+                CALL RADIATION_KFST4_SUM_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                    KFST4_GAS_D,GM%RADI%KAPPA_GAS_D,GM%TMPD,GM%QD,GM%CHI_RD,GM%RADI%UII_D,GM%RADI%UIID_D,GM%CELL_INDEXD, &
                     GM%CELL_SOLID,GM%RD,GM%DXD,GM%DYD,GM%DZD,GM%RADI%RAD_Q_SUM_D,GM%RADI%KFST4_SUM_D, &
-                    IBAR,JBAR,KBAR,FOUR_SIGMA,QR_CLIP)
+                    IBAR,JBAR,KBAR,FOUR_SIGMA,QR_CLIP,WIDE_BAND_MODEL,.NOT.RTE_SOURCE_CORRECTION,IBND,UIIDIM, &
+                    WL1,WL2,LTSTEP,RADI_BBFRAC_D,SIZE(RADI_BBFRAC_D)-1)
 
                 ! Apply the REAC radiative-fraction correction to the RTE source.
-                CALL RADIATION_RTE_SOURCE_CORRECTION_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_RTE_SOURCE_CORRECTION_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     KFST4_GAS_D,GM%QD,GM%CHI_RD,GM%CELL_INDEXD,GM%CELL_SOLID,IBAR,JBAR,KBAR,QR_CLIP, &
                     RTE_SOURCE_CORRECTION_FACTOR)
 
                 IF (INIT_HRRPUV) CALL RADIATION_APPLY_INIT_HRRPUV_GPU(GM%RADI%T,1,KFST4_GAS_D)
 
                 ! Assemble EXTCOE from gas, particle, and scattering coefficients.
-                CALL RADIATION_EXTCOE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_EXTCOE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     EXTCOE_D,GM%RADI%KAPPA_GAS_D,KAPPA_PART_D,SCAEFF_D,SCAEFF_G_D,GM%CELL_INDEXD,GM%CELL_SOLID, &
                     IBAR,JBAR,KBAR,RSA_RAT)
 
                 INTENSITY_UPDATE: IF (UPDATE_INTENSITY) THEN
 
                     ! Preserve UII in UIIOLD and reset the full-mesh UII accumulator.
-                    CALL RADIATION_UIIOLD_ZERO_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
-                        UIIOLD_D,GM%RADI%UII_D,IBP1,JBP1,KBP1)
+                    CALL RADIATION_UIIOLD_ZERO_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                        UIIOLD_D,GM%RADI%UII_D,GM%RADI%UIID_D,IBP1,JBP1,KBP1,BAND_MODEL,IBND,UIIDIM)
 
                     ! Assemble wall and open-boundary outgoing intensity.
                     BBF = 1.0_EB
-                    CALL RADIATION_OUTRAD_W_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
-                        OUTRAD_W_D,GM%WALL_TOPO_AOS,GM%WALL_Q_RAD_OUT, &
-                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS, BBFA, RPI, SIGMA, TMPA, NULL_BOUNDARY, OPEN_BOUNDARY)
+                    CALL RADIATION_OUTRAD_W_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                        OUTRAD_W_D,GM%WALL_TOPO_AOS,GM%WALL_Q_RAD_OUT,GM%WALL_TMP_F, &
+                        N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS, BBFA, RPI, SIGMA, TMPA, NULL_BOUNDARY, OPEN_BOUNDARY, &
+                        WIDE_BAND_MODEL,WL1,WL2,LTSTEP,RADI_BBFRAC_D,SIZE(RADI_BBFRAC_D)-1)
                     ! Initialize the solid-wall incoming-intensity term.
-                    INRAD_W_D = 0._EB
-                    CALL RADIATION_INRAD_W_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                    CALL RADIATION_FILL_GPU<<<(SIZE(INRAD_W_D)+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                        INRAD_W_D,SIZE(INRAD_W_D),0._EB)
+                    CALL RADIATION_INRAD_W_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                         INRAD_W_D,GM%WALL_TOPO_AOS,GM%RADI%WALL_BR_INDEX_D,DLN_D, &
                         GM%RADI%BOUNDARY_RADIA_ILW_D,IBND,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,NUMBER_RADIATION_ANGLES, &
                         SOLID_BOUNDARY,SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,1),SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,2))
@@ -642,10 +795,24 @@ MODULE G_RADI
 
                         IF (ANGLE_INC_COUNTER==ANGLE_INCREMENT) RADIATION_COMPLETED(GM%NM) = .TRUE.
 
+                        ! The launches of one angle group are the same at every update (same arrays and scalars):
+                        ! replay them from a CUDA graph captured at the first update of the group.
+                        GRAPH_STATE = RADI_ANGLE_GRAPH_BEGIN(IBND,ANGLE_INC_COUNTER)
+                        IF (GRAPH_STATE==1) THEN
+                            IF (GM%RADI%N_TARGETS>0) THEN
+                                DO N=NRA-ANGLE_INC_COUNTER+1,1,-ANGLE_INCREMENT
+                                    GM%RADI%TARGET_SWEPT(N,IBND) = .TRUE.
+                                ENDDO
+                            ENDIF
+                            CYCLE UPDATE_LOOP
+                        ENDIF
+
+                        ANGLE_GROUP: DO
+
                         ! Clear current-angle UIID and open-wall ILW values.
-                        CALL RADIATION_ZERO_UIID_ANGLE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
-                            GM%RADI%UIID_D,ANGLE_INC_COUNTER,IBP1,JBP1,KBP1,UIIDIM)
-                        CALL RADIATION_ZERO_OPEN_ILW_ANGLE_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                        CALL RADIATION_ZERO_UIID_ANGLE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                            GM%RADI%UIID_D,MERGE(IBND,ANGLE_INC_COUNTER,BAND_MODEL),IBP1,JBP1,KBP1,UIIDIM)
+                        CALL RADIATION_ZERO_OPEN_ILW_ANGLE_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                             GM%RADI%BOUNDARY_RADIA_ILW_D,GM%WALL_TOPO_AOS,GM%RADI%WALL_BR_INDEX_D, &
                             IBND,ANGLE_INC_COUNTER,N_EXTERNAL_WALL_CELLS,OPEN_BOUNDARY, &
                             SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,1),SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,2))
@@ -656,7 +823,7 @@ MODULE G_RADI
                         NSTEP     = -ANGLE_INCREMENT
 
                         ! Initialize IL to ambient incoming intensity.
-                        CALL RADIATION_INIT_IL_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                        CALL RADIATION_INIT_IL_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                             IL_D,BBFA*RPI_SIGMA*TMPA4,IBP1,JBP1,KBP1)
 
                         ! Sweep the selected discrete directions.
@@ -667,9 +834,11 @@ MODULE G_RADI
                             ! Boundary conditions: Intensities leaving the boundaries.
 
                             IF (.NOT.CYLINDRICAL) THEN
-                                GM%RADI%CELL_ILW_D = -HUGE(EB)
+                                ! A kernel on the mesh stream (an array assignment would not be captured in the graph)
+                                CALL RADIATION_FILL_GPU<<<(SIZE(GM%RADI%CELL_ILW_D)+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D, &
+                                    0,GM%STRM>>>(GM%RADI%CELL_ILW_D,SIZE(GM%RADI%CELL_ILW_D),REAL(-HUGE(EB),EB))
                                 ! Apply wall leaving-boundary intensities for this direction.
-                                CALL RADIATION_WALL_LOOP1_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                                CALL RADIATION_WALL_LOOP1_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                                     IL_D,GM%RADI%CELL_ILW_D,GM%RADI%BOUNDARY_RADIA_ILW_D,OUTRAD_W_D,INRAD_W_D, &
                                     GM%WALL_TOPO_AOS,GM%WALL_EMISSIVITY,GM%RADI%WALL_BR_INDEX_D,GM%CELL_INDEXD, &
                                     DLN_D, DLM_D, N, IBND, N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS, &
@@ -680,7 +849,7 @@ MODULE G_RADI
 
                                 DO NOM=1,NMESHES
                                     IF (.NOT.ALLOCATED(GM%RADI%OMESH(NOM)%IL_R_D)) CYCLE
-                                    CALL RADIATION_INTERPOLATED_WALL_GPU<<<GM%GRDD_EXTERNAL_WALL_1D,GPU_BLKD_1D>>>( &
+                                    CALL RADIATION_INTERPOLATED_WALL_GPU<<<GM%GRDD_EXTERNAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                                         IL_D,GM%WALL_TOPO_AOS,GM%EXTERNAL_WALL_NOMD,DLN_D,GM%RADI%WALL_NIC_MIN_D, &
                                         GM%RADI%WALL_NIC_MAX_D,GM%RADI%OMESH(NOM)%IL_R_D,N,IBND, &
                                         N_EXTERNAL_WALL_CELLS,NOM,SIZE(GM%RADI%OMESH(NOM)%IL_R_D,1),INTERPOLATED_BOUNDARY, &
@@ -741,7 +910,7 @@ MODULE G_RADI
 
                             ! Boundary values: Incoming radiation
                             ! Update solid/interpolated walls and accumulate open-boundary intensity.
-                            CALL RADIATION_WALL_INCOMING_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                            CALL RADIATION_WALL_INCOMING_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                                 INRAD_W_D,GM%RADI%BOUNDARY_RADIA_ILW_D,IL_D,GM%WALL_TOPO_AOS,GM%RADI%WALL_BR_INDEX_D,DLN_D, &
                                 N,IBND,ANGLE_INC_COUNTER,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,TWO_D,CYLINDRICAL, &
                                 NULL_BOUNDARY,OPEN_BOUNDARY,IBP1,JBP1, &
@@ -753,10 +922,10 @@ MODULE G_RADI
 
                             ! Accumulate angle-weighted intensity.
                             IF (WIDE_BAND_MODEL .OR. WSGG_MODEL) THEN
-                                CALL RADIATION_ACCUMULATE_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                                CALL RADIATION_ACCUMULATE_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                                     GM%RADI%UIID_D,IL_D,GM%CELL_INDEXD,GM%CELL_SOLID,IBND,N,IBP1,JBP1,KBP1,UIIDIM,WEIGH_CYL,RSA_D)
                             ELSE
-                                CALL RADIATION_ACCUMULATE_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                                CALL RADIATION_ACCUMULATE_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                                     GM%RADI%UIID_D,IL_D,GM%CELL_INDEXD,GM%CELL_SOLID,ANGLE_INC_COUNTER,N, &
                                     IBP1,JBP1,KBP1,UIIDIM,WEIGH_CYL,RSA_D)
                             ENDIF
@@ -764,98 +933,60 @@ MODULE G_RADI
                             DO NOM=1,NMESHES
                                 IF (.NOT.ALLOCATED(GM%RADI%OMESH(NOM)%IL_S_D)) CYCLE
                                 GRDD_1D = (GM%OMESH(NOM)%NIC_S + GPU_BLKD_1D - 1)/GPU_BLKD_1D
-                                CALL RADIATION_PACK_IL_S_GPU<<<GRDD_1D,GPU_BLKD_1D>>>( &
+                                CALL RADIATION_PACK_IL_S_GPU<<<GRDD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                                     IL_D,GM%RADI%OMESH(NOM)%IL_S_D,GM%OMESH(NOM)%IIO_S_D,GM%OMESH(NOM)%JJO_S_D, &
                                     GM%OMESH(NOM)%KKO_S_D,N,IBND,GM%OMESH(NOM)%NIC_S,IBP1,JBP1,KBP1, &
                                     SIZE(GM%RADI%OMESH(NOM)%IL_S_D,1),SIZE(GM%RADI%OMESH(NOM)%IL_S_D,2))
                             ENDDO
 
-                            ! Projected intensity on particles with a specified ORIENTATION (e.g. DEVC RADIATIVE HEAT FLUX GAS),
-                            ! as in RADIATION_FVM; IL of the particle cell is read from the device.
-                            IF (ORIENTED_PARTICLES) THEN
-                                GPU_PARTICLE_RADIATION_LOOP: DO IP=1,NLP
-                                    LP => LAGRANGIAN_PARTICLE(IP)
-                                    LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
-                                    IF (LPC%N_ORIENTATION==0) CYCLE GPU_PARTICLE_RADIATION_LOOP
-                                    BC => BOUNDARY_COORD(LP%BC_INDEX)
-                                    TEMP_ORIENTATION(1:3) = ORIENTATION_VECTOR(1:3,LP%ORIENTATION_INDEX)
-                                    IF (LP%INIT_INDEX > 0) THEN
-                                        IN => INITIALIZATION(LP%INIT_INDEX)
-                                        IF (ANY(IN%ORIENTATION_RAMP_INDEX > 0)) THEN
-                                            TEMP_ORIENTATION(1) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(1))
-                                            TEMP_ORIENTATION(2) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(2))
-                                            TEMP_ORIENTATION(3) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(3))
-                                            TEMP_ORIENTATION = TEMP_ORIENTATION / &
-                                                (SQRT(TEMP_ORIENTATION(1)**2+TEMP_ORIENTATION(2)**2+TEMP_ORIENTATION(3)**2)+TWO_EPSILON_EB)
-                                        ENDIF
-                                    ENDIF
-                                    COS_DLO = -DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
-                                    IF (COS_DLO > COS_HALF_VIEW_ANGLE(LP%ORIENTATION_INDEX)) THEN
-                                        DLO = -(TEMP_ORIENTATION(1)*DLX(N) + TEMP_ORIENTATION(2)*DLY(N) + TEMP_ORIENTATION(3)*DLZ(N))
-                                        BR => BOUNDARY_RADIA(LP%BR_INDEX)
-                                        IF (LPC%MASSLESS_TARGET) THEN
-                                            QVAL = IL_D(BC%IIG,BC%JJG,BC%KKG)
-                                            BR%BAND(IBND)%ILW(N) = DLO*QVAL*VIEW_ANGLE_FACTOR(LP%ORIENTATION_INDEX)
-                                            IF (N==NEAREST_RADIATION_ANGLE(LP%ORIENTATION_INDEX)) BR%IL(IBND) = QVAL
-                                        ELSE
-                                            QVAL = IL_UP_D(BC%IIG,BC%JJG,BC%KKG)
-                                            BR%BAND(IBND)%ILW(N) = DLO*QVAL*VIEW_ANGLE_FACTOR(LP%ORIENTATION_INDEX)
-                                        ENDIF
-                                    ENDIF
-                                ENDDO GPU_PARTICLE_RADIATION_LOOP
+                            ! Projected intensity on particles with a specified ORIENTATION (e.g. DEVC RADIATIVE HEAT FLUX GAS):
+                            ! gather IL (massless targets) or IL_UP of the target cells; RADIATION_FINISH_TARGETS_GPU applies
+                            ! the RADIATION_FVM logic on the host once all meshes are launched.
+                            IF (GM%RADI%N_TARGETS>0) THEN
+                                CALL RADIATION_GATHER_TARGET_IL_GPU<<<(GM%RADI%N_TARGETS+63)/64,64,0,GM%STRM>>>( &
+                                    GM%RADI%TARGET_IL_D,IL_D,IL_UP_D,GM%RADI%TARGET_IJK_D,GM%RADI%N_TARGETS,N,IBND, &
+                                    NUMBER_RADIATION_ANGLES,IBP1,JBP1)
+                                GM%RADI%TARGET_SWEPT(N,IBND) = .TRUE.
                             ENDIF
 
                         ENDDO ANGLE_LOOP
+
+                        IF (GRAPH_STATE/=2) EXIT ANGLE_GROUP
+                        IF (RADI_ANGLE_GRAPH_END(IBND,ANGLE_INC_COUNTER)) EXIT ANGLE_GROUP
+                        GRAPH_STATE = 0   ! the capture failed (its launches did not run): run the group directly
+                        ENDDO ANGLE_GROUP
 
                     ENDDO UPDATE_LOOP
 
                     ! Compute incoming flux on walls and particles
                     ! Convert the incoming intensity integral to wall heat flux.
-                    CALL RADIATION_SOLID_WALL_Q_RAD_IN_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                    CALL RADIATION_SOLID_WALL_Q_RAD_IN_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                         GM%WALL_Q_RAD_IN,INRAD_W_D,GM%WALL_TOPO_AOS,GM%WALL_SF_INDEX,GM%WALL_EMISSIVITY, &
-                        SF_EXTERNAL_FLUX,SF_RAMP_EFLUX_INDEX,SF_RAMP_EFLUX_TAU,GM%WALL_T_IGN, &
+                        SF_EXTERNAL_FLUX,SF_RAMP_EFLUX_INDEX,SF_RAMP_EFLUX_TAU,GM%WALL_T_IGN,SF_TMP_GAS_FRONT, &
                         RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D,RAMP_NPOINTS_D,RAMP_OFFSET_D,RAMP_INTERP_D, &
                         GM%RADI%T,T_BEGIN,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS,BBFA,SOLID_BOUNDARY)
 
                 ENDIF INTENSITY_UPDATE
 
+                ! Save source term for the energy equation (QR = -DIV Q), summed over the bands
+                IF (BAND_MODEL) THEN
+                    CALL RADIATION_QR_BAND_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                        GM%QRD,GM%RADI%QR_W_D,GM%RADI%EMISSION_D,GM%RADI%ABSORPTION_D,GM%RADI%KAPPA_GAS_D,KFST4_GAS_D, &
+                        KAPPA_PART_D,KFST4_PART_D,GM%RADI%UIID_D,GM%CELL_INDEXD,GM%CELL_SOLID,IBP1,JBP1,KBP1,IBND,UIIDIM, &
+                        STORE_RADIATION_TERMS,N_LP_ARRAY_INDICES>0 .AND. PARTICLES_EXISTED)
+                ENDIF
 
             ENDDO BAND_LOOP
 
-            ! Incoming radiative flux onto oriented particles (massless targets of DEVC RADIATIVE HEAT FLUX GAS),
-            ! as at the end of RADIATION_FVM. Non-oriented particles would need UII on the host and are left as they were.
-            IF (SOLID_PARTICLES .AND. UPDATE_INTENSITY .AND. ORIENTED_PARTICLES) THEN
-                GPU_PARTICLE_FLUX_LOOP: DO IP=1,NLP
-                    LP => LAGRANGIAN_PARTICLE(IP)
-                    LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
-                    IF (.NOT.(LPC%SOLID_PARTICLE .OR. LPC%MASSLESS_TARGET)) CYCLE GPU_PARTICLE_FLUX_LOOP
-                    IF (LP%ORIENTATION_INDEX<=0) CYCLE GPU_PARTICLE_FLUX_LOOP
-                    SF => SURFACE(LPC%SURF_INDEX)
-                    B1 => BOUNDARY_PROP1(LP%B1_INDEX)
-                    IF (SF%EXTERNAL_FLUX > TWO_EPSILON_EB) THEN
-                        IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
-                            TSI = GM%RADI%T
-                        ELSE
-                            TSI = GM%RADI%T - B1%T_IGN
-                        ENDIF
-                        EFLUX = EVALUATE_RAMP(TSI,SF%RAMP(TIME_EFLUX)%INDEX,TAU=SF%RAMP(TIME_EFLUX)%TAU)*SF%EXTERNAL_FLUX
-                    ELSE
-                        EFLUX = 0._EB
-                    ENDIF
-                    BR => BOUNDARY_RADIA(LP%BR_INDEX)
-                    B1%Q_RAD_IN = 0._EB
-                    DO IBND=1,NUMBER_SPECTRAL_BANDS
-                        B1%Q_RAD_IN = B1%Q_RAD_IN + B1%EMISSIVITY * (WEIGH_CYL*SUM(BR%BAND(IBND)%ILW(1:NUMBER_RADIATION_ANGLES)) + EFLUX)
-                    ENDDO
-                ENDDO GPU_PARTICLE_FLUX_LOOP
-            ENDIF
+            ! The incoming flux onto oriented particles (end of RADIATION_FVM) is computed in RADIATION_FINISH_TARGETS_GPU
+            IF (ORIENTED_PARTICLES .AND. UPDATE_INTENSITY) GM%RADI%TARGETS_PENDING = .TRUE.
 
             ! Sum direction groups and update open-boundary incoming heat flux.
 
             IF (UPDATE_INTENSITY) THEN
-                CALL RADIATION_SUM_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_SUM_UIID_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     GM%RADI%UII_D,GM%RADI%UIID_D,IBP1,JBP1,KBP1,UIIDIM)
-                CALL RADIATION_OPEN_Q_RAD_IN_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D>>>( &
+                CALL RADIATION_OPEN_Q_RAD_IN_GPU<<<GM%GRDD_TOTAL_WALL_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                     GM%WALL_Q_RAD_IN,GM%RADI%BOUNDARY_RADIA_ILW_D,GM%WALL_TOPO_AOS,GM%RADI%WALL_BR_INDEX_D, &
                     N_EXTERNAL_WALL_CELLS,NUMBER_SPECTRAL_BANDS, &
                     NUMBER_RADIATION_ANGLES,OPEN_BOUNDARY,SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,1))
@@ -864,7 +995,7 @@ MODULE G_RADI
 
             ! Assemble the gray-gas energy source QR; wide-band QR is handled per band.
             IF (.NOT. (WIDE_BAND_MODEL .OR. WSGG_MODEL)) THEN
-                CALL RADIATION_QR_GRAY_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_QR_GRAY_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     GM%QRD,GM%RADI%QR_W_D,GM%RADI%EMISSION_D,GM%RADI%ABSORPTION_D,GM%RADI%KAPPA_GAS_D,KFST4_GAS_D, &
                     KAPPA_PART_D,KFST4_PART_D,GM%RADI%UII_D,GM%CELL_INDEXD,GM%CELL_SOLID,IBP1,JBP1,KBP1, &
                     STORE_RADIATION_TERMS,N_LP_ARRAY_INDICES>0)
@@ -886,11 +1017,236 @@ MODULE G_RADI
 
             IF (.NOT.GPU_DEBUG_H2D_D2H .AND. UPDATE_INTENSITY .AND. RADI_NEEDS_UII_D2H()) UII = GM%RADI%UII_D
 
-            ! UPDATE_ALL_ANGLES is a one-time only logical. If needed again, it will be reset again.
-
-            UPDATE_ALL_ANGLES = .FALSE.
-
         END SUBROUTINE RADIATION_FVM_GPU
+
+        !> Angle group IAC of band IBND on mesh GM: 0 run it directly, 1 replayed from its graph on the mesh stream
+        !> (skip it), 2 capture started on the mesh stream (run it, then RADI_ANGLE_GRAPH_END).
+
+        INTEGER FUNCTION RADI_ANGLE_GRAPH_BEGIN(IBND,IAC)
+            INTEGER, INTENT(IN) :: IBND,IAC
+            INTEGER :: ISTAT,LEN_ENV
+            CHARACTER(8) :: ENV
+
+            RADI_ANGLE_GRAPH_BEGIN = 0
+            IF (RADI_GRAPH_MODE<0) THEN
+                RADI_GRAPH_MODE = 1
+                CALL GET_ENVIRONMENT_VARIABLE('GFDS_RADI_GRAPH',ENV,LENGTH=LEN_ENV,STATUS=ISTAT)
+                IF (ISTAT==0 .AND. LEN_ENV>0) THEN
+                    IF (ENV(1:1)=='0') RADI_GRAPH_MODE = 0
+                ENDIF
+                IF (GPU_DEBUG_H2D_D2H .OR. RADI_SWEEP_MODE==RADI_SWEEP_CHECK) RADI_GRAPH_MODE = 0
+            ENDIF
+            IF (RADI_GRAPH_MODE==0) RETURN
+            IF (GM%STRM==0) RETURN
+
+            IF (.NOT.ALLOCATED(GM%RADI%ANGLE_GRAPH)) THEN
+                ALLOCATE(GM%RADI%ANGLE_GRAPH(ANGLE_INCREMENT,NUMBER_SPECTRAL_BANDS))
+                ALLOCATE(GM%RADI%ANGLE_GRAPH_READY(ANGLE_INCREMENT,NUMBER_SPECTRAL_BANDS))
+                GM%RADI%ANGLE_GRAPH_READY = .FALSE.
+            ENDIF
+            ! The target gather of the group depends on the oriented-particle list (count and buffers)
+            IF (GM%RADI%ANGLE_GRAPH_NT/=GM%RADI%N_TARGETS) THEN
+                CALL RADI_ANGLE_GRAPHS_RESET
+                GM%RADI%ANGLE_GRAPH_NT = GM%RADI%N_TARGETS
+            ENDIF
+
+            IF (GM%RADI%ANGLE_GRAPH_READY(IAC,IBND)) THEN
+                ISTAT = cudaGraphLaunch(GM%RADI%ANGLE_GRAPH(IAC,IBND),GM%STRM)
+                IF (ISTAT==0) THEN
+                    RADI_ANGLE_GRAPH_BEGIN = 1
+                ELSE
+                    WRITE(LU_ERR,'(A,I0)') ' GFDS: radiation graph launch failed, direct launches are used: ',ISTAT
+                    RADI_GRAPH_MODE = 0
+                ENDIF
+                RETURN
+            ENDIF
+
+            ISTAT = cudaStreamBeginCapture(GM%STRM,cudaStreamCaptureModeRelaxed)
+            IF (ISTAT/=0) THEN
+                WRITE(LU_ERR,'(A,I0)') ' GFDS: radiation graph capture failed, direct launches are used: ',ISTAT
+                RADI_GRAPH_MODE = 0
+                RETURN
+            ENDIF
+            RADI_ANGLE_GRAPH_BEGIN = 2
+
+        END FUNCTION RADI_ANGLE_GRAPH_BEGIN
+
+        !> Drop the angle-group graphs of mesh GM (they are captured again at the next update of each group), e.g. when
+        !> a device array they use was reallocated. Destroying an executable graph that is still running is allowed.
+
+        SUBROUTINE RADI_ANGLE_GRAPHS_RESET
+            INTEGER :: I,J,ISTAT
+
+            IF (.NOT.ALLOCATED(GM%RADI%ANGLE_GRAPH_READY)) RETURN
+            DO J=1,SIZE(GM%RADI%ANGLE_GRAPH_READY,2)
+                DO I=1,SIZE(GM%RADI%ANGLE_GRAPH_READY,1)
+                    IF (GM%RADI%ANGLE_GRAPH_READY(I,J)) ISTAT = cudaGraphExecDestroy(GM%RADI%ANGLE_GRAPH(I,J))
+                ENDDO
+            ENDDO
+            GM%RADI%ANGLE_GRAPH_READY = .FALSE.
+
+        END SUBROUTINE RADI_ANGLE_GRAPHS_RESET
+
+        !> End the capture of angle group IAC of band IBND, keep the graph and launch it; .FALSE. if that failed (the
+        !> captured launches did not run then).
+
+        LOGICAL FUNCTION RADI_ANGLE_GRAPH_END(IBND,IAC)
+            INTEGER, INTENT(IN) :: IBND,IAC
+            INTEGER :: ISTAT,ISTAT2
+            TYPE(cudaGraph) :: GRAPH
+
+            RADI_ANGLE_GRAPH_END = .FALSE.
+            ISTAT = cudaStreamEndCapture(GM%STRM,GRAPH)
+            IF (ISTAT==0) THEN
+                ISTAT = cudaGraphInstantiate(GM%RADI%ANGLE_GRAPH(IAC,IBND),GRAPH,0)
+                ISTAT2 = cudaGraphDestroy(GRAPH)
+            ENDIF
+            IF (ISTAT==0) ISTAT = cudaGraphLaunch(GM%RADI%ANGLE_GRAPH(IAC,IBND),GM%STRM)
+            IF (ISTAT/=0) THEN
+                WRITE(LU_ERR,'(A,I0)') ' GFDS: radiation graph capture failed, direct launches are used: ',ISTAT
+                RADI_GRAPH_MODE = 0
+                RETURN
+            ENDIF
+            GM%RADI%ANGLE_GRAPH_READY(IAC,IBND) = .TRUE.
+            RADI_ANGLE_GRAPH_END = .TRUE.
+
+        END FUNCTION RADI_ANGLE_GRAPH_END
+
+        !> List the oriented particles of the current mesh (GM) and size the device buffer of their gathered intensities.
+
+        SUBROUTINE RADIATION_SETUP_TARGETS_GPU(NRA)
+            INTEGER, INTENT(IN) :: NRA
+            INTEGER :: IP,NT,ISTAT
+            INTEGER, ALLOCATABLE :: IJK_H(:,:)
+            TYPE(LAGRANGIAN_PARTICLE_TYPE), POINTER :: LP
+            TYPE(LAGRANGIAN_PARTICLE_CLASS_TYPE), POINTER :: LPC
+            TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
+
+            NT = 0
+            DO IP=1,NLP
+                LP => LAGRANGIAN_PARTICLE(IP)
+                IF (LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)%N_ORIENTATION/=0) NT = NT + 1
+            ENDDO
+            GM%RADI%N_TARGETS = NT
+            IF (NT==0) RETURN
+
+            IF (ALLOCATED(GM%RADI%TARGET_IP)) THEN
+                IF (SIZE(GM%RADI%TARGET_IP)/=NT) DEALLOCATE(GM%RADI%TARGET_IP,GM%RADI%TARGET_IJK_D,GM%RADI%TARGET_IL_D, &
+                                                            GM%RADI%TARGET_IL_H,GM%RADI%TARGET_SWEPT)
+            ENDIF
+            IF (.NOT.ALLOCATED(GM%RADI%TARGET_IP)) THEN
+                ALLOCATE(GM%RADI%TARGET_IP(NT),GM%RADI%TARGET_IJK_D(4,NT))
+                ALLOCATE(GM%RADI%TARGET_IL_D(NT,NRA,NUMBER_SPECTRAL_BANDS),GM%RADI%TARGET_IL_H(NT,NRA,NUMBER_SPECTRAL_BANDS))
+                ALLOCATE(GM%RADI%TARGET_SWEPT(NRA,NUMBER_SPECTRAL_BANDS))
+            ENDIF
+
+            ALLOCATE(IJK_H(4,NT))
+            NT = 0
+            DO IP=1,NLP
+                LP => LAGRANGIAN_PARTICLE(IP)
+                LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
+                IF (LPC%N_ORIENTATION==0) CYCLE
+                NT = NT + 1
+                BC => BOUNDARY_COORD(LP%BC_INDEX)
+                GM%RADI%TARGET_IP(NT) = IP
+                IJK_H(1:3,NT) = (/BC%IIG,BC%JJG,BC%KKG/)
+                IJK_H(4,NT) = MERGE(1,0,LPC%MASSLESS_TARGET)
+            ENDDO
+            ! Copy on the mesh stream: an assignment would copy on the legacy default stream, which waits for the radiation
+            ! of all meshes launched before and so serializes the meshes. A pageable source is staged before the call
+            ! returns, so IJK_H may be freed at once.
+            ISTAT = cudaMemcpyAsync(GM%RADI%TARGET_IJK_D,IJK_H,4*NT,GM%STRM)
+            DEALLOCATE(IJK_H)
+            GM%RADI%TARGET_SWEPT = .FALSE.
+
+        END SUBROUTINE RADIATION_SETUP_TARGETS_GPU
+
+        !> After the radiation of all meshes was launched: read back the gathered target intensities and apply, per mesh,
+        !> the oriented-particle logic of RADIATION_FVM (projected intensity per angle, then the incoming flux).
+
+        SUBROUTINE RADIATION_FINISH_TARGETS_GPU
+            USE MATH_FUNCTIONS, ONLY : EVALUATE_RAMP
+            INTEGER :: NM,K,IP,N,IBND
+            REAL(EB) :: TEMP_ORIENTATION(3),COS_DLO,DLO,QVAL,TSI,EFLUX
+            TYPE(LAGRANGIAN_PARTICLE_TYPE), POINTER :: LP
+            TYPE(LAGRANGIAN_PARTICLE_CLASS_TYPE), POINTER :: LPC
+            TYPE(INITIALIZATION_TYPE), POINTER :: IN
+            TYPE(BOUNDARY_RADIA_TYPE), POINTER :: BR
+            TYPE(BOUNDARY_PROP1_TYPE), POINTER :: B1
+            TYPE(SURFACE_TYPE), POINTER :: SF
+
+            ! Device-side barrier: an (empty) kernel on the legacy default stream waits for the radiation work of all mesh
+            ! streams and every later launch on a mesh stream waits for it, as when the radiation ran on the default stream.
+            CALL GPU_STREAM_BARRIER
+
+            DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                IF (.NOT.ALLOCATED(GPU_MESHES(NM)%RADI)) CYCLE
+                IF (.NOT.GPU_MESHES(NM)%RADI%TARGETS_PENDING) CYCLE
+                CALL POINT_TO_MESH(NM)
+                GM => GPU_MESHES(NM)
+                GM%RADI%TARGETS_PENDING = .FALSE.
+                IF (GM%RADI%N_TARGETS>0) GM%RADI%TARGET_IL_H = GM%RADI%TARGET_IL_D
+
+                DO IBND=1,NUMBER_SPECTRAL_BANDS
+                    IF (GM%RADI%N_TARGETS==0) EXIT
+                    DO N=1,NUMBER_RADIATION_ANGLES
+                        IF (.NOT.GM%RADI%TARGET_SWEPT(N,IBND)) CYCLE
+                        DO K=1,GM%RADI%N_TARGETS
+                            IP = GM%RADI%TARGET_IP(K)
+                            LP => LAGRANGIAN_PARTICLE(IP)
+                            LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
+                            TEMP_ORIENTATION(1:3) = ORIENTATION_VECTOR(1:3,LP%ORIENTATION_INDEX)
+                            IF (LP%INIT_INDEX > 0) THEN
+                                IN => INITIALIZATION(LP%INIT_INDEX)
+                                IF (ANY(IN%ORIENTATION_RAMP_INDEX > 0)) THEN
+                                    TEMP_ORIENTATION(1) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(1))
+                                    TEMP_ORIENTATION(2) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(2))
+                                    TEMP_ORIENTATION(3) = EVALUATE_RAMP(GM%RADI%T,IN%ORIENTATION_RAMP_INDEX(3))
+                                    TEMP_ORIENTATION = TEMP_ORIENTATION / &
+                                        (SQRT(TEMP_ORIENTATION(1)**2+TEMP_ORIENTATION(2)**2+TEMP_ORIENTATION(3)**2)+TWENTY_EPSILON_EB)
+                                ENDIF
+                            ENDIF
+                            COS_DLO = -DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
+                            IF (COS_DLO > COS_HALF_VIEW_ANGLE(LP%ORIENTATION_INDEX)) THEN
+                                DLO = -(TEMP_ORIENTATION(1)*DLX(N) + TEMP_ORIENTATION(2)*DLY(N) + TEMP_ORIENTATION(3)*DLZ(N))
+                                BR => BOUNDARY_RADIA(LP%BR_INDEX)
+                                QVAL = GM%RADI%TARGET_IL_H(K,N,IBND)
+                                BR%BAND(IBND)%ILW(N) = DLO*QVAL*VIEW_ANGLE_FACTOR(LP%ORIENTATION_INDEX)
+                                IF (LPC%MASSLESS_TARGET .AND. N==NEAREST_RADIATION_ANGLE(LP%ORIENTATION_INDEX)) BR%IL(IBND) = QVAL
+                            ENDIF
+                        ENDDO
+                    ENDDO
+                ENDDO
+
+                ! Incoming radiative flux onto oriented particles (massless targets of DEVC RADIATIVE HEAT FLUX GAS),
+                ! as at the end of RADIATION_FVM. Non-oriented particles would need UII on the host and are left as they were.
+                IF (.NOT.SOLID_PARTICLES) CYCLE
+                DO IP=1,NLP
+                    LP => LAGRANGIAN_PARTICLE(IP)
+                    LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
+                    IF (.NOT.(LPC%SOLID_PARTICLE .OR. LPC%MASSLESS_TARGET)) CYCLE
+                    IF (LP%ORIENTATION_INDEX<=0) CYCLE
+                    SF => SURFACE(LPC%SURF_INDEX)
+                    B1 => BOUNDARY_PROP1(LP%B1_INDEX)
+                    IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
+                        IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
+                            TSI = GM%RADI%T
+                        ELSE
+                            TSI = GM%RADI%T - B1%T_IGN
+                        ENDIF
+                        EFLUX = EVALUATE_RAMP(TSI,SF%RAMP(TIME_EFLUX)%INDEX,TAU=SF%RAMP(TIME_EFLUX)%TAU)*SF%EXTERNAL_FLUX
+                    ELSE
+                        EFLUX = 0._EB
+                    ENDIF
+                    BR => BOUNDARY_RADIA(LP%BR_INDEX)
+                    B1%Q_RAD_IN = 0._EB
+                    DO IBND=1,NUMBER_SPECTRAL_BANDS
+                        B1%Q_RAD_IN = B1%Q_RAD_IN + B1%EMISSIVITY * (WEIGH_CYL*SUM(BR%BAND(IBND)%ILW(1:NUMBER_RADIATION_ANGLES)) + EFLUX)
+                    ENDDO
+                ENDDO
+            ENDDO
+
+        END SUBROUTINE RADIATION_FINISH_TARGETS_GPU
 
         SUBROUTINE RADI_RUN_SWEEP(IL_D,IL_UP_D,CELL_ILW_D,EXTCOE_D,KFST4_GAS_D,KFST4_PART_D, &
             SCAEFF_D,SCAEFF_G_D,UIIOLD_D,N_IN,ISTEP_IN,JSTEP_IN,KSTEP_IN,RSA_RAT_IN)
@@ -913,7 +1269,7 @@ MODULE G_RADI
                     CALL RADI_RUN_SWEEP_SLICES(GM%RADI%SWEEP_CHECK_IL_D,GM%RADI%SWEEP_CHECK_IL_UP_D)
                     CALL RADI_RUN_SWEEP_RECORDS(IL_D,IL_UP_D)
                     GM%RADI%SWEEP_CHECK_COUNT_D = 0
-                    CALL RADIATION_SWEEP_COMPARE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                    CALL RADIATION_SWEEP_COMPARE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                         IL_D,IL_UP_D,GM%RADI%SWEEP_CHECK_IL_D,GM%RADI%SWEEP_CHECK_IL_UP_D,GM%RADI%SWEEP_CHECK_COUNT_D, &
                         IBP1,JBP1,KBP1,SOLID_PARTICLES)
                     N_DIFF = GM%RADI%SWEEP_CHECK_COUNT_D
@@ -934,7 +1290,7 @@ MODULE G_RADI
                 M_IJK = GM%RADI%SLICE_OFFSET_H(SID+1) - BASE
                 IF (M_IJK <= 0) CYCLE
                 GRDD_1D = (M_IJK + GPU_BLKD_1D - 1) / GPU_BLKD_1D
-                CALL RADIATION_SWEEP_3D_SLICE_GPU<<<GRDD_1D,GPU_BLKD_1D>>>( &
+                CALL RADIATION_SWEEP_3D_SLICE_GPU<<<GRDD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                     IL_D,IL_UP_D,CELL_ILW_D,EXTCOE_D,KFST4_GAS_D,KFST4_PART_D,SCAEFF_D,SCAEFF_G_D,UIIOLD_D, &
                     GM%CELL_INDEXD,GM%CELL_SOLID,GM%RADI%IJK_SLICE_MAP_D,GM%DXD,GM%DYD,GM%DZD,DLX_D,DLY_D,DLZ_D,RSA_D, &
                     N_IN,BASE,M_IJK,ISTEP_IN,JSTEP_IN,KSTEP_IN,RSA_RAT_IN,RFPI,SOLID_PARTICLES, &
@@ -955,15 +1311,15 @@ MODULE G_RADI
             DYU = JSTEP_IN*SY
             DZU = KSTEP_IN*SZ
 
-            CALL RADIATION_SWEEP_PREPARE_GPU<<<(NCELL+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D>>>( &
+            CALL RADIATION_SWEEP_PREPARE_GPU<<<(NCELL+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                 GM%RADI%SWEEP_COEF_D,GM%RADI%SWEEP_LIN_D,GM%RADI%SWEEP_FLAG_D, &
                 CELL_ILW_D,EXTCOE_D,KFST4_GAS_D,KFST4_PART_D,SCAEFF_D,SCAEFF_G_D,UIIOLD_D, &
                 GM%CELL_INDEXD,GM%CELL_SOLID,GM%RADI%IJK_SLICE_MAP_D,GM%DXD,GM%DYD,GM%DZD,DLX_D,DLY_D,DLZ_D,RSA_D, &
                 N_IN,ISTEP_IN,JSTEP_IN,KSTEP_IN,RSA_RAT_IN,RFPI,SY,SZ, &
                 IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB,SIZE(CELL_ILW_D,1),NCELL,RADI_SWEEP_N_COEF)
 
-            IF (GM%RADI%MAX_SLICE<=RADI_SWEEP_BLOCK_THREADS) THEN
-                CALL RADIATION_SWEEP_BLOCK_GPU<<<1,RADI_SWEEP_BLOCK_THREADS>>>( &
+            IF (GM%RADI%MAX_SLICE<=RADI_SWEEP_BLOCK_MAX_SLICE) THEN
+                CALL RADIATION_SWEEP_BLOCK_GPU<<<1,RADI_SWEEP_BLOCK_THREADS,0,GM%STRM>>>( &
                     IL_D,IL_UP_D,GM%RADI%SWEEP_COEF_D,GM%RADI%SWEEP_LIN_D,GM%RADI%SWEEP_FLAG_D,GM%RADI%SLICE_OFFSET_D, &
                     GM%RADI%NSLICES,DXU,DYU,DZU,SOLID_PARTICLES,NCELL,RADI_SWEEP_N_COEF)
             ELSE
@@ -972,7 +1328,7 @@ MODULE G_RADI
                     M_IJK = GM%RADI%SLICE_OFFSET_H(SID+1) - BASE
                     IF (M_IJK <= 0) CYCLE
                     GRDD_1D = (M_IJK + GPU_BLKD_1D - 1) / GPU_BLKD_1D
-                    CALL RADIATION_SWEEP_RECORD_SLICE_GPU<<<GRDD_1D,GPU_BLKD_1D>>>( &
+                    CALL RADIATION_SWEEP_RECORD_SLICE_GPU<<<GRDD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
                         IL_D,IL_UP_D,GM%RADI%SWEEP_COEF_D,GM%RADI%SWEEP_LIN_D,GM%RADI%SWEEP_FLAG_D, &
                         BASE,M_IJK,DXU,DYU,DZU,SOLID_PARTICLES,NCELL,RADI_SWEEP_N_COEF)
                 ENDDO
@@ -1032,11 +1388,11 @@ MODULE G_RADI
             GM%WORK11D = HRRPUV_SOURCE
             IF (MODE==1) THEN
                 GM%WORK12D = HRRPUV_RADI_SOURCE
-                CALL RADIATION_APPLY_INIT_HRRPUV_KERNEL<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_APPLY_INIT_HRRPUV_KERNEL<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     GM%QD,GM%WORK11D,KFST4_GAS_D,GM%WORK12D,MODE,IBP1,JBP1,KBP1)
                 DEALLOCATE(HRRPUV_RADI_SOURCE)
             ELSE
-                CALL RADIATION_APPLY_INIT_HRRPUV_KERNEL<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1>>>( &
+                CALL RADIATION_APPLY_INIT_HRRPUV_KERNEL<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                     GM%QD,GM%WORK11D,GM%WORK12D,GM%WORK12D,MODE,IBP1,JBP1,KBP1)
             ENDIF
             DEALLOCATE(HRRPUV_SOURCE)
@@ -1081,7 +1437,7 @@ MODULE G_RADI
             IMPLICIT NONE
             INTEGER, VALUE :: I,J,K,IBAR_IN,JBAR_IN,KBAR_IN,IBND,N_TRACKED_SPECIES_IN,N_RADCAL_ARRAY_SIZE_IN,N_KAPPA_T_IN,N_KAPPA_X_IN
             REAL(EB), VALUE :: TMP_IN,RTMPMIN_IN,RTMPMAX_IN,TWO_EPS_IN,KX_MIN,KC_MIN,LOG_KX_FAC,LOG_KC_FAC
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: ZZ_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:KBAR_IN+2,1:*) :: ZZ_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: MWR_Z_D
             REAL(EB), DEVICE, DIMENSION(1:N_RADCAL_ARRAY_SIZE_IN,1:*) :: Z2RADCAL_SPECIES_D
             REAL(EB), DEVICE, DIMENSION(1:N_RADCAL_ARRAY_SIZE_IN,0:N_KAPPA_X_IN,0:N_KAPPA_T_IN,1:*) :: RADCAL_SPECIES2KAPPA_D
@@ -1152,8 +1508,9 @@ MODULE G_RADI
             INTEGER, VALUE :: IBND,N_TRACKED_SPECIES_IN,N_RADCAL_ARRAY_SIZE_IN,N_KAPPA_T_IN,N_KAPPA_X_IN
             INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN
             REAL(EB), VALUE :: RTMPMIN_IN,RTMPMAX_IN,TWO_EPS_IN,KX_MIN,KC_MIN,LOG_KX_FAC,LOG_KC_FAC
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: KAPPA_GAS_D,TMP_D
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: ZZ_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: KAPPA_GAS_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:*) :: TMP_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:KBAR_IN+2,1:*) :: ZZ_D
             INTEGER, DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: CELL_INDEX_D
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: MWR_Z_D
@@ -1181,21 +1538,26 @@ MODULE G_RADI
 
         END SUBROUTINE RADIATION_KAPPA_GAS_GPU
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_KFST4_SUM_GPU(KFST4_GAS_D,KAPPA_GAS_D,TMP_D,Q_D,CHI_R_D,UII_D, &
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_KFST4_SUM_GPU(KFST4_GAS_D,KAPPA_GAS_D,TMP_D,Q_D,CHI_R_D,UII_D,UIID_D, &
             CELL_INDEX_D,CELL_SOLID_D,R_D,DX_D,DY_D,DZ_D, &
             RAD_Q_SUM_D,KFST4_SUM_D,IBAR_IN,JBAR_IN,KBAR_IN, &
-            FOUR_SIGMA_IN,QR_CLIP_IN)
+            FOUR_SIGMA_IN,QR_CLIP_IN,WIDE_BAND_IN,OPTICALLY_THIN_IN,IBND_IN,UIIDIM_IN, &
+            WL_LOW_IN,WL_HIGH_IN,LTSTEP_IN,BBFRAC_D,NLAMBDAT_IN)
 
             IMPLICIT NONE
-            INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN
-            REAL(EB), VALUE :: FOUR_SIGMA_IN,QR_CLIP_IN
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: KFST4_GAS_D,KAPPA_GAS_D,TMP_D,Q_D,CHI_R_D,UII_D
+            INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN,IBND_IN,UIIDIM_IN,NLAMBDAT_IN
+            REAL(EB), VALUE :: FOUR_SIGMA_IN,QR_CLIP_IN,WL_LOW_IN,WL_HIGH_IN,LTSTEP_IN
+            LOGICAL, VALUE :: WIDE_BAND_IN,OPTICALLY_THIN_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: KFST4_GAS_D, KAPPA_GAS_D, Q_D, CHI_R_D, UII_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: UIID_D
+            REAL(EB), DEVICE, DIMENSION(0:*) :: BBFRAC_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:*) :: TMP_D
             INTEGER, DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: CELL_INDEX_D
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_D
             REAL(EB), DEVICE, DIMENSION(0:*) :: R_D,DX_D,DY_D,DZ_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: RAD_Q_SUM_D,KFST4_SUM_D
             INTEGER :: I,J,K,IC,IERR
-            REAL(EB) :: VOL,Q_RAD_CELL,KFST4_CELL
+            REAL(EB) :: VOL,Q_RAD_CELL,KFST4_CELL,BBF
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
             J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
@@ -1207,6 +1569,26 @@ MODULE G_RADI
 
             IC = CELL_INDEX_D(I,J,K)
             IF (CELL_SOLID_D(IC)) RETURN
+
+            ! Wide-band model: band fraction of the black body emission, RTE sums with the band intensity
+            IF (WIDE_BAND_IN) THEN
+                BBF = BLACKBODY_FRACTION_DEVICE(WL_LOW_IN,WL_HIGH_IN,TMP_D(I,J,K),LTSTEP_IN,BBFRAC_D,NLAMBDAT_IN)
+                KFST4_CELL = BBF*KAPPA_GAS_D(I,J,K)*FOUR_SIGMA_IN*TMP_D(I,J,K)**4
+                KFST4_GAS_D(I,J,K) = KFST4_CELL
+                Q_RAD_CELL = CHI_R_D(I,J,K)*Q_D(I,J,K)
+                IF (Q_RAD_CELL > QR_CLIP_IN) THEN
+                    VOL = R_D(I)*DX_D(I)*DY_D(J)*DZ_D(K)
+                    IERR = atomicAdd(RAD_Q_SUM_D(1),(BBF*CHI_R_D(I,J,K)*Q_D(I,J,K)+KAPPA_GAS_D(I,J,K)*UIID_D(I,J,K,IBND_IN))*VOL)
+                    IERR = atomicAdd(KFST4_SUM_D(1),KFST4_CELL*VOL)
+                ENDIF
+                RETURN
+            ENDIF
+
+            ! Gray gas without RTE_SOURCE_CORRECTION (OPTICALLY_THIN): use the specified radiative fraction
+            IF (OPTICALLY_THIN_IN) THEN
+                KFST4_GAS_D(I,J,K) = CHI_R_D(I,J,K)*Q_D(I,J,K)+KAPPA_GAS_D(I,J,K)*UII_D(I,J,K)
+                RETURN
+            ENDIF
 
             KFST4_CELL = KAPPA_GAS_D(I,J,K)*FOUR_SIGMA_IN*TMP_D(I,J,K)**4
             KFST4_GAS_D(I,J,K) = KFST4_CELL
@@ -1275,11 +1657,14 @@ MODULE G_RADI
 
         END SUBROUTINE RADIATION_EXTCOE_GPU
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_UIIOLD_ZERO_GPU(UIIOLD_D,UII_D,IBP1_IN,JBP1_IN,KBP1_IN)
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_UIIOLD_ZERO_GPU(UIIOLD_D,UII_D,UIID_D,IBP1_IN,JBP1_IN,KBP1_IN, &
+            BAND_MODEL_IN,IBND_IN,UIIDIM_IN)
 
             IMPLICIT NONE
-            INTEGER, VALUE :: IBP1_IN,JBP1_IN,KBP1_IN
+            INTEGER, VALUE :: IBP1_IN,JBP1_IN,KBP1_IN,IBND_IN,UIIDIM_IN
+            LOGICAL, VALUE :: BAND_MODEL_IN
             REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: UIIOLD_D,UII_D
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:KBP1_IN,1:*) :: UIID_D
             INTEGER :: I,J,K
 
             I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
@@ -1290,20 +1675,27 @@ MODULE G_RADI
             IF (J < 0 .OR. J > JBP1_IN) RETURN
             IF (K < 0 .OR. K > KBP1_IN) RETURN
 
-            UIIOLD_D(I,J,K) = UII_D(I,J,K)
+            IF (BAND_MODEL_IN) THEN
+                UIIOLD_D(I,J,K) = UIID_D(I,J,K,IBND_IN)
+            ELSE
+                UIIOLD_D(I,J,K) = UII_D(I,J,K)
+            ENDIF
             UII_D(I,J,K) = 0._EB
 
         END SUBROUTINE RADIATION_UIIOLD_ZERO_GPU
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_OUTRAD_W_GPU(OUTRAD_W_D, WALL_TOPO, WALL_Q_RAD_OUT_D, N_WALL_TOTAL, BBFA_IN, &
-            RPI_IN, SIGMA_IN, TMPA_IN, NULL_BOUNDARY_IN, OPEN_BOUNDARY_IN)
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_OUTRAD_W_GPU(OUTRAD_W_D, WALL_TOPO, WALL_Q_RAD_OUT_D, WALL_TMP_F_D, &
+            N_WALL_TOTAL, BBFA_IN, RPI_IN, SIGMA_IN, TMPA_IN, NULL_BOUNDARY_IN, OPEN_BOUNDARY_IN, &
+            WIDE_BAND_IN, WL_LOW_IN, WL_HIGH_IN, LTSTEP_IN, BBFRAC_D, NLAMBDAT_IN)
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
-            INTEGER, VALUE :: N_WALL_TOTAL,NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN
-            REAL(EB), VALUE :: BBFA_IN,RPI_IN,SIGMA_IN,TMPA_IN
+            INTEGER, VALUE :: N_WALL_TOTAL,NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN,NLAMBDAT_IN
+            REAL(EB), VALUE :: BBFA_IN,RPI_IN,SIGMA_IN,TMPA_IN,WL_LOW_IN,WL_HIGH_IN,LTSTEP_IN
+            LOGICAL, VALUE :: WIDE_BAND_IN
             REAL(EB), DEVICE, DIMENSION(*) :: OUTRAD_W_D
-            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_Q_RAD_OUT_D
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_Q_RAD_OUT_D,WALL_TMP_F_D,BBFRAC_D
             INTEGER :: IW
+            REAL(EB) :: BBF
 
             IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
 
@@ -1313,7 +1705,10 @@ MODULE G_RADI
             IF (WALL_TOPO(IW)%BOUNDARY_TYPE==OPEN_BOUNDARY_IN) THEN
                 OUTRAD_W_D(IW) = BBFA_IN*RPI_IN*SIGMA_IN*TMPA_IN**4
             ELSE
-                OUTRAD_W_D(IW) = RPI_IN*WALL_Q_RAD_OUT_D(IW)
+                BBF = 1._EB
+                IF (WIDE_BAND_IN) BBF = BLACKBODY_FRACTION_DEVICE(WL_LOW_IN,WL_HIGH_IN,WALL_TMP_F_D(IW),LTSTEP_IN, &
+                                                                   BBFRAC_D,NLAMBDAT_IN)
+                OUTRAD_W_D(IW) = BBF*RPI_IN*WALL_Q_RAD_OUT_D(IW)
             ENDIF
 
         END SUBROUTINE RADIATION_OUTRAD_W_GPU
@@ -1402,6 +1797,26 @@ MODULE G_RADI
 
         END SUBROUTINE RADIATION_PACK_IL_S_GPU
 
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_GATHER_TARGET_IL_GPU(TARGET_IL_D,IL_D,IL_UP_D,TARGET_IJK_D,NT,N_IN,IBND_IN, &
+            NRA_IN,IBP1_IN,JBP1_IN)
+            IMPLICIT NONE
+            INTEGER, VALUE :: NT,N_IN,IBND_IN,NRA_IN,IBP1_IN,JBP1_IN
+            REAL(EB), DEVICE, DIMENSION(1:NT,1:NRA_IN,1:*) :: TARGET_IL_D
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: IL_D,IL_UP_D
+            INTEGER, DEVICE, DIMENSION(1:4,1:NT) :: TARGET_IJK_D
+            INTEGER :: K,I,J,KK
+
+            K = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (K>NT) RETURN
+            I = TARGET_IJK_D(1,K) ; J = TARGET_IJK_D(2,K) ; KK = TARGET_IJK_D(3,K)
+            IF (TARGET_IJK_D(4,K)==1) THEN
+                TARGET_IL_D(K,N_IN,IBND_IN) = IL_D(I,J,KK)
+            ELSE
+                TARGET_IL_D(K,N_IN,IBND_IN) = IL_UP_D(I,J,KK)
+            ENDIF
+
+        END SUBROUTINE RADIATION_GATHER_TARGET_IL_GPU
+
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_ZERO_UIID_ANGLE_GPU(UIID_D,ANGLE_INC_COUNTER_IN,IBP1_IN,JBP1_IN,KBP1_IN,UIIDIM_IN)
 
             IMPLICIT NONE
@@ -1442,6 +1857,31 @@ MODULE G_RADI
             BOUNDARY_RADIA_ILW_D(IBR,IBND_IN,ANGLE_INC_COUNTER_IN) = 0._EB
 
         END SUBROUTINE RADIATION_ZERO_OPEN_ILW_ANGLE_GPU
+
+        !> Copy the received intensities of the angles that MESH_EXCHANGE(2) unpacks: the group NRA-AIC+1,..,1 step
+        !> -ANGLE_INCREMENT (all angles when ALL_GROUPS/=0, as in the first time step), with DLN(IOR_R,N)>0
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_UNPACK_IL_R_GPU(IL_R_D,BUF_D,IOR_R_D,DLN_IN,NIC,NRA,NBAND,AIC,AINC,ALL_GROUPS)
+            IMPLICIT NONE
+            INTEGER, VALUE :: NIC,NRA,NBAND,AIC,AINC,ALL_GROUPS
+            REAL(EB), DEVICE :: IL_R_D(NIC,NRA,*),BUF_D(NIC,NRA,*)
+            INTEGER, DEVICE :: IOR_R_D(*)
+            REAL(EB), DEVICE :: DLN_IN(-3:3,*)
+            INTEGER :: IDX,LL,NN1,NN2,IOR
+
+            IDX = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (IDX<1 .OR. IDX>NIC*NRA*NBAND) RETURN
+            LL  = MOD(IDX-1,NIC) + 1
+            NN1 = MOD((IDX-1)/NIC,NRA) + 1
+            NN2 = (IDX-1)/(NIC*NRA) + 1
+            IF (ALL_GROUPS==0) THEN
+                IF (NN1>NRA-AIC+1) RETURN
+                IF (MOD(NRA-AIC+1-NN1,AINC)/=0) RETURN
+            ENDIF
+            IOR = IOR_R_D(LL)
+            IF (IOR<-3 .OR. IOR>3) RETURN
+            IF (DLN_IN(IOR,NN1)<=0._EB) RETURN
+            IL_R_D(LL,NN1,NN2) = BUF_D(LL,NN1,NN2)
+        END SUBROUTINE RADIATION_UNPACK_IL_R_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_INIT_IL_GPU(IL_D,IL_INIT,IBP1_IN,JBP1_IN,KBP1_IN)
 
@@ -1841,17 +2281,15 @@ MODULE G_RADI
             IF (K < 0 .OR. K > KBP1_IN) RETURN
             IF (UIID_INDEX_IN < 1 .OR. UIID_INDEX_IN > UIIDIM_IN) RETURN
 
-            IC = CELL_INDEX_D(I,J,K)
-            IF (IC /= 0) THEN
-                IF (CELL_SOLID_D(IC)) RETURN
-            ENDIF
+            ! radi.f90 RADIATION_FVM sums the whole IL array, solid and ghost cells included: a solid cell keeps the
+            ! ambient intensity of the sweep initialization, so its INTEGRATED INTENSITY is 4*SIGMA*TMPA**4 as in 6.11.1.
 
             UIID_D(I,J,K,UIID_INDEX_IN) = UIID_D(I,J,K,UIID_INDEX_IN) + WEIGH_CYL_IN*RSA_D(N_IN)*IL_D(I,J,K)
 
         END SUBROUTINE RADIATION_ACCUMULATE_UIID_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_SOLID_WALL_Q_RAD_IN_GPU(WALL_Q_RAD_IN_D, INRAD_W_D, WALL_TOPO, WALL_SF_INDEX_D, &
-            WALL_EMISSIVITY_D,SF_EXTERNAL_FLUX_D,SF_RAMP_EFLUX_INDEX_D,SF_RAMP_EFLUX_TAU_D,WALL_T_IGN_D, &
+            WALL_EMISSIVITY_D,SF_EXTERNAL_FLUX_D,SF_RAMP_EFLUX_INDEX_D,SF_RAMP_EFLUX_TAU_D,WALL_T_IGN_D,SF_TMP_GAS_FRONT_D, &
             RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D,RAMP_NPOINTS_D,RAMP_OFFSET_D,RAMP_INTERP_D,T_IN,T_BEGIN_IN, &
             N_WALL_TOTAL, BBFA_IN, SOLID_BOUNDARY_IN)
             IMPLICIT NONE
@@ -1860,7 +2298,7 @@ MODULE G_RADI
             REAL(EB), VALUE :: BBFA_IN,T_IN,T_BEGIN_IN
             INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEX_D,SF_RAMP_EFLUX_INDEX_D
             REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_Q_RAD_IN_D,WALL_EMISSIVITY_D,SF_EXTERNAL_FLUX_D, &
-                SF_RAMP_EFLUX_TAU_D,WALL_T_IGN_D
+                SF_RAMP_EFLUX_TAU_D,WALL_T_IGN_D,SF_TMP_GAS_FRONT_D
             REAL(EB), DEVICE, DIMENSION(0:*) :: RAMP_T_MIN_D,RAMP_SPAN_D,RAMP_RDT_D
             INTEGER, DEVICE, DIMENSION(0:*) :: RAMP_NPOINTS_D,RAMP_OFFSET_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: RAMP_INTERP_D
@@ -1874,6 +2312,7 @@ MODULE G_RADI
             IF (WALL_TOPO(IW)%BOUNDARY_TYPE/=SOLID_BOUNDARY_IN) RETURN
 
             SF_IDX = WALL_SF_INDEX_D(IW)
+            IF (SF_TMP_GAS_FRONT_D(SF_IDX)>0._EB) RETURN
             IF (ABS(T_BEGIN_IN) <= SPACING(WALL_T_IGN_D(IW))) THEN
                 TSI = T_IN
             ELSE
@@ -1885,6 +2324,25 @@ MODULE G_RADI
             WALL_Q_RAD_IN_D(IW) = WALL_Q_RAD_IN_D(IW) + WALL_EMISSIVITY_D(IW)*(INRAD_W_D(IW)+BBFA_IN*EFLUX)
 
         END SUBROUTINE RADIATION_SOLID_WALL_Q_RAD_IN_GPU
+
+        !> Zero Q_RAD_IN before the intensity update except on walls of a SURF with TMP_GAS_FRONT (radi.f90).
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_ZERO_WALL_Q_RAD_IN_GPU(WALL_Q_RAD_IN_D,WALL_TOPO,WALL_SF_INDEX_D, &
+            SF_TMP_GAS_FRONT_D,N_WALL_TOTAL)
+            IMPLICIT NONE
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            INTEGER, VALUE :: N_WALL_TOTAL
+            INTEGER, DEVICE, DIMENSION(0:*) :: WALL_SF_INDEX_D
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_Q_RAD_IN_D,SF_TMP_GAS_FRONT_D
+            INTEGER :: IW
+
+            IW = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X
+            IF (IW < 1 .OR. IW > N_WALL_TOTAL) RETURN
+            IF (WALL_TOPO(IW)%BOUNDARY_TYPE/=0) THEN
+                IF (SF_TMP_GAS_FRONT_D(WALL_SF_INDEX_D(IW))>0._EB) RETURN
+            ENDIF
+            WALL_Q_RAD_IN_D(IW) = 0._EB
+
+        END SUBROUTINE RADIATION_ZERO_WALL_Q_RAD_IN_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_SUM_UIID_GPU(UII_D,UIID_D,IBP1_IN,JBP1_IN,KBP1_IN,UIIDIM_IN)
 
@@ -2011,13 +2469,100 @@ MODULE G_RADI
 
             ABS_TERM = KAPPA_GAS_D(I,J,K)*UII_D(I,J,K)
             QR_D(I,J,K) = ABS_TERM - KFST4_GAS_D(I,J,K)
-            IF (DO_QR_W_IN) QR_W_D(I,J,K) = QR_W_D(I,J,K) + KAPPA_PART_D(I,J,K)*UII_D(I,J,K) - KFST4_PART_D(I,J,K)
+            ! One band: RADIATION_FVM sets QR_W = 0 before adding the droplet term
+            IF (DO_QR_W_IN) QR_W_D(I,J,K) = KAPPA_PART_D(I,J,K)*UII_D(I,J,K) - KFST4_PART_D(I,J,K)
             IF (STORE_RADIATION_TERMS_IN) THEN
                 RADIATION_EMISSION_D(I,J,K) = KFST4_GAS_D(I,J,K)
                 RADIATION_ABSORPTION_D(I,J,K) = ABS_TERM
             ENDIF
 
         END SUBROUTINE RADIATION_QR_GRAY_GPU
+
+        !> Fraction of black body radiation between wavelengths L1 and L2 (micron) at TEMP, as BLACKBODY_FRACTION
+        !> with INTERPOLATE1D_UNIFORM on BBFRAC(0:NLAMBDAT).
+        ATTRIBUTES(DEVICE) REAL(EB) FUNCTION BLACKBODY_FRACTION_DEVICE(L1,L2,TEMP,LTSTEP_IN,BBFRAC_D,NLAMBDAT_IN)
+            IMPLICIT NONE
+            REAL(EB), VALUE :: L1,L2,TEMP,LTSTEP_IN
+            INTEGER, VALUE :: NLAMBDAT_IN
+            REAL(EB), DEVICE, DIMENSION(0:*) :: BBFRAC_D
+            REAL(EB) :: LT,BBFLOW,BBFHIGH,FRAC
+            INTEGER :: I
+
+            LT = L1*TEMP/LTSTEP_IN
+            IF (LT <= 0) THEN
+                BBFLOW = BBFRAC_D(0)
+            ELSEIF (LT >= NLAMBDAT_IN) THEN
+                BBFLOW = BBFRAC_D(NLAMBDAT_IN)
+            ELSE
+                I = INT(LT)
+                FRAC = LT - REAL(I,EB)
+                BBFLOW = BBFRAC_D(I) + FRAC*(BBFRAC_D(I+1)-BBFRAC_D(I))
+            ENDIF
+            LT = L2*TEMP/LTSTEP_IN
+            IF (LT <= 0) THEN
+                BBFHIGH = BBFRAC_D(0)
+            ELSEIF (LT >= NLAMBDAT_IN) THEN
+                BBFHIGH = BBFRAC_D(NLAMBDAT_IN)
+            ELSE
+                I = INT(LT)
+                FRAC = LT - REAL(I,EB)
+                BBFHIGH = BBFRAC_D(I) + FRAC*(BBFRAC_D(I+1)-BBFRAC_D(I))
+            ENDIF
+            BLACKBODY_FRACTION_DEVICE = BBFHIGH - BBFLOW
+
+        END FUNCTION BLACKBODY_FRACTION_DEVICE
+
+        !> Wide-band model: add the band contribution to QR (and the stored terms), as at the end of the band loop
+        !> of RADIATION_FVM.
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_QR_BAND_GPU(QR_D,QR_W_D,RADIATION_EMISSION_D,RADIATION_ABSORPTION_D, &
+            KAPPA_GAS_D,KFST4_GAS_D,KAPPA_PART_D,KFST4_PART_D,UIID_D, &
+            CELL_INDEX_D,CELL_SOLID_D,IBP1_IN,JBP1_IN,KBP1_IN,IBND_IN,UIIDIM_IN, &
+            STORE_RADIATION_TERMS_IN,DO_QR_W_IN)
+
+            IMPLICIT NONE
+            INTEGER, VALUE :: IBP1_IN,JBP1_IN,KBP1_IN,IBND_IN,UIIDIM_IN
+            LOGICAL, VALUE :: STORE_RADIATION_TERMS_IN,DO_QR_W_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: QR_D,QR_W_D,RADIATION_EMISSION_D,RADIATION_ABSORPTION_D
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: KAPPA_GAS_D,KFST4_GAS_D,KAPPA_PART_D,KFST4_PART_D
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:KBP1_IN,1:*) :: UIID_D
+            INTEGER, DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: CELL_INDEX_D
+            LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_D
+            INTEGER :: I,J,K,IC
+            REAL(EB) :: ABS_TERM
+
+            I = (BLOCKIDX%X - 1) * BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y - 1) * BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z - 1) * BLOCKDIM%Z + THREADIDX%Z - 1
+
+            IF (I < 0 .OR. I > IBP1_IN) RETURN
+            IF (J < 0 .OR. J > JBP1_IN) RETURN
+            IF (K < 0 .OR. K > KBP1_IN) RETURN
+
+            IC = CELL_INDEX_D(I,J,K)
+            IF (IC /= 0) THEN
+                IF (CELL_SOLID_D(IC)) RETURN
+            ENDIF
+
+            ABS_TERM = KAPPA_GAS_D(I,J,K)*UIID_D(I,J,K,IBND_IN)
+            QR_D(I,J,K) = QR_D(I,J,K) + ABS_TERM - KFST4_GAS_D(I,J,K)
+            IF (STORE_RADIATION_TERMS_IN) THEN
+                RADIATION_EMISSION_D(I,J,K) = RADIATION_EMISSION_D(I,J,K) + KFST4_GAS_D(I,J,K)
+                RADIATION_ABSORPTION_D(I,J,K) = RADIATION_ABSORPTION_D(I,J,K) + ABS_TERM
+            ENDIF
+            IF (DO_QR_W_IN) QR_W_D(I,J,K) = QR_W_D(I,J,K) + KAPPA_PART_D(I,J,K)*UIID_D(I,J,K,IBND_IN) - KFST4_PART_D(I,J,K)
+
+        END SUBROUTINE RADIATION_QR_BAND_GPU
+
+        !> A(1:N) = VAL
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_FILL_GPU(A,N,VAL)
+            IMPLICIT NONE
+            REAL(EB), DEVICE :: A(*)
+            INTEGER, VALUE :: N
+            REAL(EB), VALUE :: VAL
+            INTEGER :: I
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (I<=N) A(I) = VAL
+        END SUBROUTINE RADIATION_FILL_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_OFF_GPU(QR_D,CHI_R_D,Q_D,IBP1_IN,JBP1_IN,KBP1_IN)
 

@@ -185,9 +185,12 @@ END TYPE BAND_TYPE
 
 TYPE BOUNDARY_COORD_TYPE
 
-   INTEGER :: II             !< Ghost cell x index
-   INTEGER :: JJ             !< Ghost cell y index
-   INTEGER :: KK             !< Ghost cell z index
+   INTEGER :: II             !< First ghost cell inside wall in the x direction
+   INTEGER :: JJ             !< First ghost cell inside wall in the y direction
+   INTEGER :: KK             !< First ghost cell inside wall in the z direction
+   INTEGER :: II2            !< Second ghost cell, x direction
+   INTEGER :: JJ2            !< Second ghost cell, y direction
+   INTEGER :: KK2            !< Second ghost cell, z direction
    INTEGER :: IIG            !< Gas cell x index
    INTEGER :: JJG            !< Gas cell y index
    INTEGER :: KKG            !< Gas cell z index
@@ -1009,7 +1012,8 @@ END TYPE SURFACE_TYPE
 TYPE (SURFACE_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: SURFACE
 
 TYPE OMESH_TYPE
-   REAL(EB), ALLOCATABLE, DIMENSION(:,:,:) :: MU,RHO,RHOS,TMP,U,V,W,US,VS,WS,H,HS,FVX,FVY,FVZ,D,DS,KRES,IL_S,IL_R,Q
+   REAL(EB), ALLOCATABLE, DIMENSION(:,:,:) ::&
+         MU,RHO,RHOS,TMP,U,V,W,US,VS,WS,H,HS,FVX,FVY,FVZ,FVX_D,FVY_D,FVZ_D,D,DS,KRES,IL_S,IL_R,Q
    REAL(EB), ALLOCATABLE, DIMENSION(:,:,:,:) :: ZZ,ZZS
    INTEGER, ALLOCATABLE, DIMENSION(:) :: IIO_R,JJO_R,KKO_R,IOR_R,IIO_S,JJO_S,KKO_S,IOR_S
    INTEGER :: I_MIN_R=-10,I_MAX_R=-10,J_MIN_R=-10,J_MAX_R=-10,K_MIN_R=-10,K_MAX_R=-10,NIC_R=0, &
@@ -1483,7 +1487,7 @@ END TYPE CSVF_TYPE
 TYPE(CSVF_TYPE), ALLOCATABLE, DIMENSION(:) :: CSVFINFO
 
 TYPE VENTS_TYPE
-   INTEGER :: I1=-1,I2=-1,J1=-1,J2=-1,K1=-1,K2=-1,BOUNDARY_TYPE=0,IOR=0,SURF_INDEX=0,DEVC_INDEX=-1,CTRL_INDEX=-1, &
+   INTEGER :: I1=-1,I2=-1,J1=-1,J2=-1,K1=-1,K2=-1,BOUNDARY_TYPE=0,IOR=0,IOR_INPUT=0,SURF_INDEX=0,DEVC_INDEX=-1,CTRL_INDEX=-1, &
               COLOR_INDICATOR=99,TYPE_INDICATOR=0,ORDINAL=0,PRESSURE_RAMP_INDEX=0,TMP_EXTERIOR_RAMP_INDEX=0,NODE_INDEX=-1, &
               OBST_INDEX=0,TOTAL_INDEX=-1
    INTEGER, DIMENSION(3) :: RGB=-1

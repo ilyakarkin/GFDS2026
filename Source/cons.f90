@@ -239,7 +239,8 @@ LOGICAL :: TMP_RESTART=.FALSE.              !< Initialize temperature field with
 LOGICAL :: SPEC_RESTART=.FALSE.             !< Initialize tracked species field with values from a file
 LOGICAL :: PARTICLE_CFL=.FALSE.             !< Include particle velocity as a constraint on time step
 LOGICAL :: RTE_SOURCE_CORRECTION=.TRUE.     !< Apply a correction to the radiation source term to achieve desired rad fraction
-LOGICAL :: OBST_CREATED_OR_REMOVED=.TRUE.   !< An obstruction has just been created or removed and wall cells must be reassigned
+LOGICAL :: OBST_CREATED_OR_REMOVED=.FALSE.  !< An obstruction has just been created or removed and wall cells must be reassigned
+INTEGER :: GEOMETRY_VERSION=0               !< Changed whenever the solid or gas state of grid cells may have changed
 LOGICAL :: CHECK_REALIZABILITY=.FALSE.
 LOGICAL :: MIN_DEVICES_EXIST=.FALSE.
 LOGICAL :: MAX_DEVICES_EXIST=.FALSE.
@@ -291,6 +292,7 @@ CHARACTER(FORMULA_LENGTH) :: UVW_FILE='null'                              !< Vel
 INTEGER :: N_TERRAIN_IMAGES=0                                             !< Number of terrain images
 CHARACTER(FORMULA_LENGTH), DIMENSION(MAX_TERRAIN_IMAGES) :: TERRAIN_IMAGE !< Name of external terrain image
 CHARACTER(CHID_LENGTH) :: CHID                                            !< Job ID
+CHARACTER(80) :: REVISION_LABEL=''      !< Revision in .out, .smv, _git.txt on the GPU ('FDS-6.11.1 (GPU)'); empty: GITHASH_PP
 CHARACTER(CHID_LENGTH) :: RESTART_CHID                                    !< Job ID for a restarted case
 CHARACTER(FILE_LENGTH) :: RESULTS_DIR                                     !< Custom directory for output
 CHARACTER(FILE_LENGTH) :: BINGEOM_DIR                                     !< Custom directory for writing binary geometry files
@@ -340,7 +342,8 @@ REAL(EB) :: GROUND_LEVEL=0._EB                 !< Height of the ground, used for
 REAL(EB) :: LIMITING_DT_RATIO=1.E-4_EB         !< Ratio of current to initial time step when code is stopped
 REAL(EB) :: NOISE_VELOCITY=0.005_EB            !< Velocity of random noise vectors (m/s)
 REAL(EB) :: TAU_DEFAULT=1._EB                  !< Default ramp-up time (s)
-REAL(EB) :: TAU_CHEM=1.E-10_EB                 !< Smallest reaction mixing time scale (s)
+REAL(EB) :: TAU_CHEM=1.E-5_EB                  !< Smallest reaction mixing time scale (s) (FDS 90e98698dc)
+REAL(EB) :: TURBULENT_FLAME_SPEED=100._EB      !< Flame speed used to set minimum reaction mixing time (m/s) (FDS f7d333397b)
 REAL(EB) :: TAU_FLAME=1.E10_EB                 !< Largest reaction mixing time scale (s)
 REAL(EB) :: SMOKE_ALBEDO=0.3_EB                !< Parmeter used by Smokeview
 REAL(EB) :: Y_WERNER_WENGLE=11.81_EB           !< Limit of y+ in Werner-Wengle model
@@ -394,7 +397,7 @@ REAL(EB) :: T_END                                           !< Ending time of si
 REAL(EB) :: TIME_SHRINK_FACTOR                              !< Factor to reduce specific heat and total run time
 REAL(EB) :: RELAXATION_FACTOR=1._EB                         !< Factor used to relax normal velocity nudging at immersed boundaries
 REAL(EB) :: MPI_TIMEOUT=600._EB                             !< Time to wait for MPI messages to be received (s)
-REAL(EB) :: DT_END_MINIMUM=TWO_EPSILON_EB                   !< Smallest possible final time step (s)
+REAL(EB) :: DT_END_MINIMUM=TWENTY_EPSILON_EB                   !< Smallest possible final time step (s)
 REAL(EB) :: DT_END_FILL=1.E-6_EB
 INTEGER  :: DIAGNOSTICS_INTERVAL                            !< Number of time steps between diagnostic outputs
 REAL(EB) :: UNFREEZE_TIME                                   !< Time to unfreeze a simulation
@@ -672,6 +675,7 @@ REAL(EB) :: WALL_CLOCK_START                        !< MPI_WTIME i.e. wall clock
 REAL(EB) :: WALL_CLOCK_START_ITERATIONS=0._EB       !< MPI_WTIME i.e. wall clock time when main iteration loop starts
 REAL(EB) :: CPU_TIME_START                          !< CPU_TIME when FDS starts
 REAL(EB) :: MESH_EXCHANGE_WALL_TIME=0._EB           !< Maximum-rank wall time spent in primary mesh exchanges
+LOGICAL, ALLOCATABLE, DIMENSION(:) :: GPU_MIX_TIME_PULLED !< MIX_TIME copied from the GPU for output this step (per mesh)
 REAL(EB) :: GPU_IO_WALL_TIME=0._EB                  !< Maximum-rank wall time spent copying output fields from GPU
 REAL(EB) :: DUMP_WALL_TIME=0._EB                    !< Maximum-rank wall time spent preparing and writing output
 

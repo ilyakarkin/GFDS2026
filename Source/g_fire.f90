@@ -16,6 +16,21 @@ MODULE G_FIRE
     LOGICAL, ALLOCATABLE :: AIT_ZONE_ACTIVE_H(:,:),AIT_ZONE_PREVIOUS_H(:,:)
     LOGICAL :: AIT_HAS_DEVICES = .FALSE.
 
+    ! Finite-rate chemistry data for FIRE:REACTION_RATE (FINITE_RATE) and the RK2-Richardson integrator
+    INTEGER, PARAMETER :: FR_MAX_PRIMITIVE = 40
+    LOGICAL :: FR_READY = .FALSE., FR_ANY_CHI_R_RAMP = .FALSE.
+    REAL(EB), DEVICE, ALLOCATABLE :: FR_N_T_D(:),FR_E_D(:),FR_A_LOW_PR_D(:),FR_E_LOW_PR_D(:),FR_N_T_LOW_PR_D(:)
+    REAL(EB), DEVICE, ALLOCATABLE :: FR_A_TROE_D(:),FR_RT1_TROE_D(:),FR_T2_TROE_D(:),FR_RT3_TROE_D(:),FR_C0_EXP_D(:)
+    REAL(EB), DEVICE, ALLOCATABLE :: FR_THIRD_EFF_D(:,:),FR_DELTA_G_D(:,:),FR_NU_MW_O_MW_F_FR_D(:,:),FR_N_S_D(:,:)
+    INTEGER, DEVICE, ALLOCATABLE :: FR_N_THIRD_D(:),FR_REACTYPE_D(:),FR_N_SMIX_FR_D(:),FR_NU_INDEX_D(:,:)
+    INTEGER, DEVICE, ALLOCATABLE :: FR_N_SPEC_D(:),FR_N_S_INDEX_D(:,:),FR_N_S_INT_D(:,:)
+    LOGICAL, DEVICE, ALLOCATABLE :: FR_THIRD_BODY_D(:),FR_REVERSE_D(:),FR_N_S_FLAG_D(:,:)
+    REAL(EB), DEVICE, ALLOCATABLE :: FR_MW_PRIM_D(:),FR_ODE_REL_ERROR_D(:),FR_CHI_R_RAMP_D(:)
+    REAL(EB), ALLOCATABLE :: FR_CHI_R_RAMP_H(:)
+    REAL(EB), DEVICE :: FR_ODE_MIN_ATOL_D,FR_FIXED_MIX_TIME_D,FR_MIN_TEMP_D
+    INTEGER, DEVICE :: FR_N_FIXED_SUBSTEPS_D,FR_N_SPECIES_D
+    LOGICAL, DEVICE :: FR_DNS_D,FR_ALL_FAST_D,FR_ANY_FAST_D
+
     CONTAINS
 
         SUBROUTINE UPDATE_GPU_AIT_ZONES
@@ -71,6 +86,158 @@ MODULE G_FIRE
         !--------------------------------------------------------------------------
         ! Combustion host orchestration
         !--------------------------------------------------------------------------
+        SUBROUTINE INIT_GPU_FINITE_RATE
+            ! Device copies of the REACTION data used by FIRE:REACTION_RATE (finite rate) and FIRE:COMBUSTION_MODEL.
+            USE CHEMCONS, ONLY: ODE_MIN_ATOL
+            USE COMP_FUNCTIONS, ONLY: SHUTDOWN
+            INTEGER :: NR,NS,NRM,NSP
+            REAL(EB), ALLOCATABLE :: R1(:),R2(:,:)
+            INTEGER, ALLOCATABLE :: I1(:),I2(:,:)
+            LOGICAL, ALLOCATABLE :: L1(:),L2(:,:)
+            TYPE(REACTION_TYPE), POINTER :: RN
+
+            IF (FR_READY) RETURN
+            FR_READY = .TRUE.
+            NRM = MAX(1,N_REACTIONS)
+            NSP = MAX(1,N_SPECIES)
+            IF (N_SPECIES > FR_MAX_PRIMITIVE) THEN
+                CALL SHUTDOWN('ERROR: GPU combustion supports at most 40 primitive species.',PROCESS_0_ONLY=.FALSE.)
+                RETURN
+            ENDIF
+
+            ALLOCATE(R1(NRM),I1(NRM),L1(NRM))
+            ALLOCATE(FR_N_T_D(NRM),FR_E_D(NRM),FR_A_LOW_PR_D(NRM),FR_E_LOW_PR_D(NRM),FR_N_T_LOW_PR_D(NRM))
+            ALLOCATE(FR_A_TROE_D(NRM),FR_RT1_TROE_D(NRM),FR_T2_TROE_D(NRM),FR_RT3_TROE_D(NRM),FR_C0_EXP_D(NRM))
+            ALLOCATE(FR_N_THIRD_D(NRM),FR_REACTYPE_D(NRM),FR_N_SMIX_FR_D(NRM),FR_N_SPEC_D(NRM))
+            ALLOCATE(FR_THIRD_BODY_D(NRM),FR_REVERSE_D(NRM),FR_CHI_R_RAMP_D(NRM),FR_CHI_R_RAMP_H(NRM))
+            DO NR=1,N_REACTIONS ; R1(NR)=REACTION(NR)%N_T ; ENDDO ; FR_N_T_D = R1
+            DO NR=1,N_REACTIONS ; R1(NR)=REACTION(NR)%E ; ENDDO ; FR_E_D = R1
+            R1 = 0._EB
+            DO NR=1,N_REACTIONS
+                RN => REACTION(NR)
+                IF (RN%REACTYPE==FALLOFF_LINDEMANN_TYPE .OR. RN%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=RN%A_LOW_PR
+            ENDDO
+            FR_A_LOW_PR_D = R1 ; R1 = 0._EB
+            DO NR=1,N_REACTIONS
+                RN => REACTION(NR)
+                IF (RN%REACTYPE==FALLOFF_LINDEMANN_TYPE .OR. RN%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=RN%E_LOW_PR
+            ENDDO
+            FR_E_LOW_PR_D = R1
+            DO NR=1,N_REACTIONS ; R1(NR)=REACTION(NR)%N_T_LOW_PR ; ENDDO ; FR_N_T_LOW_PR_D = R1
+            R1 = 0._EB
+            DO NR=1,N_REACTIONS ; IF (REACTION(NR)%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=REACTION(NR)%A_TROE ; ENDDO
+            FR_A_TROE_D = R1 ; R1 = 0._EB
+            DO NR=1,N_REACTIONS ; IF (REACTION(NR)%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=REACTION(NR)%RT1_TROE ; ENDDO
+            FR_RT1_TROE_D = R1 ; R1 = 0._EB
+            DO NR=1,N_REACTIONS ; IF (REACTION(NR)%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=REACTION(NR)%T2_TROE ; ENDDO
+            FR_T2_TROE_D = R1 ; R1 = 0._EB
+            DO NR=1,N_REACTIONS ; IF (REACTION(NR)%REACTYPE==FALLOFF_TROE_TYPE) R1(NR)=REACTION(NR)%RT3_TROE ; ENDDO
+            FR_RT3_TROE_D = R1
+            DO NR=1,N_REACTIONS ; R1(NR)=REACTION(NR)%C0_EXP ; ENDDO ; FR_C0_EXP_D = R1
+            I1 = 0
+            DO NR=1,N_REACTIONS ; I1(NR)=REACTION(NR)%N_THIRD ; ENDDO ; FR_N_THIRD_D = I1
+            I1 = 0
+            DO NR=1,N_REACTIONS ; I1(NR)=REACTION(NR)%REACTYPE ; ENDDO ; FR_REACTYPE_D = I1
+            I1 = 0
+            DO NR=1,N_REACTIONS ; I1(NR)=REACTION(NR)%N_SMIX_FR ; ENDDO ; FR_N_SMIX_FR_D = I1
+            I1 = 0
+            DO NR=1,N_REACTIONS ; I1(NR)=REACTION(NR)%N_SPEC ; ENDDO ; FR_N_SPEC_D = I1
+            L1 = .FALSE.
+            DO NR=1,N_REACTIONS ; L1(NR)=REACTION(NR)%THIRD_BODY ; ENDDO ; FR_THIRD_BODY_D = L1
+            L1 = .FALSE.
+            DO NR=1,N_REACTIONS ; L1(NR)=REACTION(NR)%REVERSE ; ENDDO ; FR_REVERSE_D = L1
+
+            ALLOCATE(R2(NSP,NRM)) ; R2 = 1._EB
+            DO NR=1,N_REACTIONS
+                IF (ALLOCATED(REACTION(NR)%THIRD_EFF)) R2(1:N_SPECIES,NR) = REACTION(NR)%THIRD_EFF(1:N_SPECIES)
+            ENDDO
+            ALLOCATE(FR_THIRD_EFF_D(NSP,NRM)) ; FR_THIRD_EFF_D = R2 ; DEALLOCATE(R2)
+            ALLOCATE(R2(0:I_MAX_TEMP,NRM)) ; R2 = 0._EB
+            DO NR=1,N_REACTIONS
+                IF (ALLOCATED(REACTION(NR)%DELTA_G)) R2(0:I_MAX_TEMP,NR) = REACTION(NR)%DELTA_G(0:I_MAX_TEMP)
+            ENDDO
+            ALLOCATE(FR_DELTA_G_D(0:I_MAX_TEMP,NRM)) ; FR_DELTA_G_D = R2 ; DEALLOCATE(R2)
+            ALLOCATE(R2(MAX(1,N_TRACKED_SPECIES),NRM),I2(MAX(1,N_TRACKED_SPECIES),NRM)) ; R2 = 0._EB ; I2 = 1
+            DO NR=1,N_REACTIONS
+                RN => REACTION(NR)
+                IF (RN%N_SMIX_FR > N_TRACKED_SPECIES) THEN
+                    CALL SHUTDOWN('ERROR: GPU finite-rate chemistry: N_SMIX_FR exceeds the number of tracked species.', &
+                                  PROCESS_0_ONLY=.FALSE.)
+                    RETURN
+                ENDIF
+                DO NS=1,RN%N_SMIX_FR
+                    R2(NS,NR) = RN%NU_MW_O_MW_F_FR(NS)
+                    I2(NS,NR) = RN%NU_INDEX(NS)
+                ENDDO
+            ENDDO
+            ALLOCATE(FR_NU_MW_O_MW_F_FR_D(MAX(1,N_TRACKED_SPECIES),NRM),FR_NU_INDEX_D(MAX(1,N_TRACKED_SPECIES),NRM))
+            FR_NU_MW_O_MW_F_FR_D = R2 ; FR_NU_INDEX_D = I2
+            DEALLOCATE(R2,I2)
+            ALLOCATE(R2(NSP,NRM),I2(NSP,NRM),L2(NSP,NRM)) ; R2 = 0._EB ; I2 = 1 ; L2 = .FALSE.
+            ALLOCATE(FR_N_S_D(NSP,NRM),FR_N_S_INDEX_D(NSP,NRM),FR_N_S_FLAG_D(NSP,NRM),FR_N_S_INT_D(NSP,NRM))
+            DO NR=1,N_REACTIONS
+                RN => REACTION(NR)
+                IF (RN%N_SPEC > N_SPECIES) THEN
+                    CALL SHUTDOWN('ERROR: GPU finite-rate chemistry: N_SPEC exceeds the number of primitive species.', &
+                                  PROCESS_0_ONLY=.FALSE.)
+                    RETURN
+                ENDIF
+                DO NS=1,RN%N_SPEC
+                    R2(NS,NR) = RN%N_S(NS)
+                    I2(NS,NR) = RN%N_S_INDEX(NS)
+                    L2(NS,NR) = RN%N_S_FLAG(NS)
+                ENDDO
+            ENDDO
+            FR_N_S_D = R2 ; FR_N_S_INDEX_D = I2 ; FR_N_S_FLAG_D = L2
+            I2 = 0
+            DO NR=1,N_REACTIONS
+                DO NS=1,REACTION(NR)%N_SPEC
+                    I2(NS,NR) = REACTION(NR)%N_S_INT(NS)
+                ENDDO
+            ENDDO
+            FR_N_S_INT_D = I2
+            DEALLOCATE(R2,I2,L2)
+
+            ALLOCATE(FR_MW_PRIM_D(NSP),FR_ODE_REL_ERROR_D(MAX(1,N_TRACKED_SPECIES)))
+            DEALLOCATE(R1) ; ALLOCATE(R1(NSP)) ; R1 = 1._EB
+            DO NS=1,N_SPECIES ; R1(NS) = SPECIES(NS)%MW ; ENDDO
+            FR_MW_PRIM_D = R1
+            DEALLOCATE(R1) ; ALLOCATE(R1(MAX(1,N_TRACKED_SPECIES))) ; R1 = 0._EB
+            DO NS=1,N_TRACKED_SPECIES ; R1(NS) = SPECIES_MIXTURE(NS)%ODE_REL_ERROR ; ENDDO
+            FR_ODE_REL_ERROR_D = R1
+
+            FR_CHI_R_RAMP_H = 1._EB
+            FR_ANY_CHI_R_RAMP = .FALSE.
+            DO NR=1,N_REACTIONS
+                IF (REACTION(NR)%RAMP_CHI_R_INDEX/=0) FR_ANY_CHI_R_RAMP = .TRUE.
+            ENDDO
+            FR_CHI_R_RAMP_D = FR_CHI_R_RAMP_H
+
+            FR_ODE_MIN_ATOL_D = ODE_MIN_ATOL
+            FR_FIXED_MIX_TIME_D = FIXED_MIX_TIME
+            FR_MIN_TEMP_D = FINITE_RATE_MIN_TEMP
+            FR_N_FIXED_SUBSTEPS_D = N_FIXED_CHEMISTRY_SUBSTEPS
+            FR_N_SPECIES_D = N_SPECIES
+            FR_DNS_D = (SIM_MODE==DNS_MODE)
+            FR_ALL_FAST_D = ALL(REACTION(1:N_REACTIONS)%FAST_CHEMISTRY)
+            FR_ANY_FAST_D = ANY(REACTION(1:N_REACTIONS)%FAST_CHEMISTRY)
+
+            DEALLOCATE(R1,I1,L1)
+        END SUBROUTINE INIT_GPU_FINITE_RATE
+
+        SUBROUTINE UPDATE_GPU_CHI_R_RAMP(T)
+            ! FIRE:COMBUSTION_MODEL evaluates EVALUATE_RAMP(T,RN%RAMP_CHI_R_INDEX) for every cell at the same T.
+            USE MATH_FUNCTIONS, ONLY: EVALUATE_RAMP
+            REAL(EB), INTENT(IN) :: T
+            INTEGER :: NR
+            IF (.NOT.FR_ANY_CHI_R_RAMP) RETURN
+            DO NR=1,N_REACTIONS
+                FR_CHI_R_RAMP_H(NR) = EVALUATE_RAMP(T,REACTION(NR)%RAMP_CHI_R_INDEX)
+            ENDDO
+            CALL GPU_WAIT_ALL
+            FR_CHI_R_RAMP_D = FR_CHI_R_RAMP_H
+        END SUBROUTINE UPDATE_GPU_CHI_R_RAMP
+
         SUBROUTINE COMBUSTION_LOAD_BALANCED_GPU(T,DT)
 
             REAL(EB), INTENT(IN) :: T,DT
@@ -99,6 +266,8 @@ MODULE G_FIRE
             INTEGER,DEVICE,POINTER,CONTIGUOUS,DIMENSION(:) :: CHEM_SUBIT_MODEL_D
 
             CALL UPDATE_GPU_AIT_ZONES
+            CALL INIT_GPU_FINITE_RATE
+            CALL UPDATE_GPU_CHI_R_RAMP(T)
 
             MESH_LOOP_SERIAL : DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
                 CALL POINT_TO_MESH(NM)
@@ -146,8 +315,17 @@ MODULE G_FIRE
                     GM%FIRE%ACTIVE_CELLS_D,GM%FIRE%N_ACTIVE_CELLS_D,GM%FIRE%N_ACTIVE_CC_D, &
                     CHEM_CELL_MAX,ACTIVE_CELL_MAX,N_TRACKED_SPECIES,N_REACTIONS)
 
+                IF (.NOT.ALLOCATED(GM%FIRE%CHEM_SUBIT_D)) THEN
+                    IF (OUTPUT_CHEM_IT) THEN
+                        ALLOCATE(GM%FIRE%CHEM_SUBIT_D(0:IBP1,0:JBP1,0:KBP1))
+                    ELSE
+                        ALLOCATE(GM%FIRE%CHEM_SUBIT_D(0:0,0:0,0:0))
+                    ENDIF
+                    GM%FIRE%CHEM_SUBIT_D = 0._EB
+                ENDIF
+
                 CALL COMBUSTION_ACTIVE_CELL_LIST_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
-                    GM%ZZD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%FIRE%ACTIVE_CELLS_D, &
+                    GM%ZZD,GM%TMPD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%FIRE%ACTIVE_CELLS_D, &
                     GM%FIRE%N_ACTIVE_CELLS_D(1),GM%FIRE%N_ACTIVE_CC_D(1), &
                     REAC_N_SMIX_RD,REAC_REACTANT_INDEXD,IBAR,JBAR,KBAR,N_TRACKED_SPECIES,N_REACTIONS,ZZ_MIN_GLOBAL)
 
@@ -156,13 +334,13 @@ MODULE G_FIRE
                     REAC_SOURCE_TERM_MODEL_D,Q_REAC_MODEL_D,GM%PBARD,GM%PRESSURE_ZONED, &
                     GM%RHOD,GM%HD,GM%KRESD,GM%TMPD,GM%MUD,GM%LES_FILTER_WIDTHD,GM%DXD,GM%DYD,GM%DZD, &
                     GM%XCD,GM%YCD,GM%ZCD, &
-                    GM%QD,GM%MIX_TIMED,GM%CHI_RD, &
+                    GM%QD,GM%MIX_TIMED,GM%CHI_RD,GM%FIRE%CHEM_SUBIT_D, &
                     D_Z_TABLED,SPECIES_H_FD,SPECIES_Z2Y_O2D,REAC_FUEL_SMIX_INDEXD,REAC_AIR_SMIX_INDEXD, &
                     REAC_AUTO_IGNITION_TEMPERATURED,REAC_CHI_RD,REAC_NU_MW_O_MW_FD, &
                     REAC_CRITICAL_FLAME_TEMPERATURED,REAC_Y_O2_MIND, &
                     REAC_A_PRIMED,REAC_RHO_EXPONENTD,REAC_HEAT_OF_COMBUSTIOND,REAC_PRIORITYD,REAC_FAST_CHEMISTRYD, &
-                    T,DT,TAU_CHEM,TAU_FLAME,C_DEARDORFF,GRAV,INITIAL_UNMIXED_FRACTION,ZZ_MIN_GLOBAL, &
-                    CHI_R_MIN,CHI_R_MAX,TWO_EPSILON_EB,TINY_EB,HUGE(1._EB),FREE_BURN_TEMPERATURE,TMPA, &
+                    T,DT,TAU_CHEM,TAU_FLAME,TURBULENT_FLAME_SPEED,C_DEARDORFF,GRAV,INITIAL_UNMIXED_FRACTION,ZZ_MIN_GLOBAL, &
+                    CHI_R_MIN,CHI_R_MAX,TWENTY_EPSILON_EB,TINY_EB,HUGE(1._EB),FREE_BURN_TEMPERATURE,TMPA, &
                     IBAR,JBAR,KBAR,N_TRACKED_SPECIES,N_REACTIONS,I_MAX_TEMP,MAX_CHEMISTRY_SUBSTEPS, &
                     COMBUSTION_ODE_SOLVER,EXPLICIT_EULER,EXTINCT_MOD,EXTINCTION_1,MAX_PRIORITY,SUPPRESSION, &
                     OUTPUT_CHEM_IT,REAC_SOURCE_CHECK)
@@ -173,6 +351,19 @@ MODULE G_FIRE
                     GM%FIRE%N_ACTIVE_CELLS_D(1),GM%FIRE%ACTIVE_CELLS_D,ZZ_GET_MODEL_D,DZZ_MODEL_D, &
                     GM%D_SOURCED,GM%M_DOT_PPPD,GM%TMPD,GM%RHOD,CP_ZD,H_SENS_ZD,MWR_ZD,SPECIES_RCOND, &
                     DT,DZZ_CLIP,R0,IBAR,JBAR,KBAR,N_TRACKED_SPECIES,I_MAX_TEMP)
+
+                ! fire.f90: with REAC_SOURCE_CHECK, REAC_SOURCE_TERM and Q_REAC are zeroed and then set in active cells
+                IF (REAC_SOURCE_CHECK) THEN
+                    IF (.NOT.ALLOCATED(GM%FIRE%REAC_SOURCE_TERM_D)) THEN
+                        ALLOCATE(GM%FIRE%REAC_SOURCE_TERM_D(0:IBP1,0:JBP1,0:KBP1,1:N_TRACKED_SPECIES))
+                        ALLOCATE(GM%FIRE%Q_REAC_D(0:IBP1,0:JBP1,0:KBP1,1:N_REACTIONS))
+                    ENDIF
+                    CALL REAC_SOURCE_ZERO_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
+                        GM%FIRE%REAC_SOURCE_TERM_D,GM%FIRE%Q_REAC_D,IBP1,JBP1,KBP1,N_TRACKED_SPECIES,N_REACTIONS)
+                    CALL REAC_SOURCE_SCATTER_GPU<<<SOURCE_BLOCKS,SOURCE_THREADS,0,GM%STRM>>>( &
+                        GM%FIRE%N_ACTIVE_CELLS_D(1),GM%FIRE%ACTIVE_CELLS_D,REAC_SOURCE_TERM_MODEL_D,Q_REAC_MODEL_D, &
+                        GM%FIRE%REAC_SOURCE_TERM_D,GM%FIRE%Q_REAC_D,IBAR,JBAR,KBAR,N_TRACKED_SPECIES,N_REACTIONS)
+                ENDIF
 
                 IF (GPU_DEBUG_H2D_D2H) THEN
                     CALL GPU_WAIT(GM%STRM)
@@ -205,6 +396,48 @@ MODULE G_FIRE
             QD(I,J,K) = 0._EB
             CHI_RD(I,J,K) = 0._EB
         END SUBROUTINE COMBUSTION_ZERO_CELL_FIELDS_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE REAC_SOURCE_ZERO_GPU(RST_D,QR_D,IBP1_IN,JBP1_IN,KBP1_IN,NTS_IN,NR_IN)
+            INTEGER, VALUE :: IBP1_IN,JBP1_IN,KBP1_IN,NTS_IN,NR_IN
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:KBP1_IN,1:NTS_IN) :: RST_D
+            REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:KBP1_IN,1:NR_IN) :: QR_D
+            INTEGER :: I,J,K,N
+            I = (BLOCKIDX%X - 1)*BLOCKDIM%X + THREADIDX%X - 1
+            J = (BLOCKIDX%Y - 1)*BLOCKDIM%Y + THREADIDX%Y - 1
+            K = (BLOCKIDX%Z - 1)*BLOCKDIM%Z + THREADIDX%Z - 1
+            IF (I<0 .OR. I>IBP1_IN .OR. J<0 .OR. J>JBP1_IN .OR. K<0 .OR. K>KBP1_IN) RETURN
+            DO N=1,NTS_IN
+                RST_D(I,J,K,N) = 0._EB
+            ENDDO
+            DO N=1,NR_IN
+                QR_D(I,J,K,N) = 0._EB
+            ENDDO
+        END SUBROUTINE REAC_SOURCE_ZERO_GPU
+
+        ! fire.f90 SET_SPECIES_SOURCE_TERM_CELL: REAC_SOURCE_TERM(I,J,K,:) = REAC_SOURCE_TERM_TMP; Q_REAC(I,J,K,:) = Q_REAC_TMP
+        ATTRIBUTES(GLOBAL) SUBROUTINE REAC_SOURCE_SCATTER_GPU(NCHEM_ACTIVE_CELLS_IN,CHEM_ACTIVE_CELLS_IN, &
+            RST_MODEL_D,QR_MODEL_D,RST_D,QR_D,IBAR_IN,JBAR_IN,KBAR_IN,NTS_IN,NR_IN)
+            INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN,NTS_IN,NR_IN
+            INTEGER, DEVICE :: NCHEM_ACTIVE_CELLS_IN
+            INTEGER, DEVICE, DIMENSION(1:(IBAR_IN+1)*(JBAR_IN+1)*(KBAR_IN+1),1:*) :: CHEM_ACTIVE_CELLS_IN
+            REAL(EB), DEVICE, DIMENSION(1:NTS_IN,1:*) :: RST_MODEL_D
+            REAL(EB), DEVICE, DIMENSION(1:NR_IN,1:*) :: QR_MODEL_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:NTS_IN) :: RST_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:NR_IN) :: QR_D
+            INTEGER :: NC,I,J,K,N
+            NC = (BLOCKIDX%X - 1)*BLOCKDIM%X + THREADIDX%X
+            IF (NC < 1 .OR. NC > NCHEM_ACTIVE_CELLS_IN) RETURN
+            I = CHEM_ACTIVE_CELLS_IN(NC,1)
+            J = CHEM_ACTIVE_CELLS_IN(NC,2)
+            K = CHEM_ACTIVE_CELLS_IN(NC,3)
+            IF (I < 1 .OR. I > IBAR_IN .OR. J < 1 .OR. J > JBAR_IN .OR. K < 1 .OR. K > KBAR_IN) RETURN
+            DO N=1,NTS_IN
+                RST_D(I,J,K,N) = RST_MODEL_D(N,NC)
+            ENDDO
+            DO N=1,NR_IN
+                QR_D(I,J,K,N) = QR_MODEL_D(N,NC)
+            ENDDO
+        END SUBROUTINE REAC_SOURCE_SCATTER_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMBUSTION_ZERO_MODEL_WORK_GPU( &
             ZZ_GET_MODEL_D,DZZ_MODEL_D,REAC_SOURCE_TERM_MODEL_D,Q_REAC_MODEL_D,CHEM_SUBIT_MODEL_D, &
@@ -242,13 +475,14 @@ MODULE G_FIRE
         END SUBROUTINE COMBUSTION_ZERO_MODEL_WORK_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE COMBUSTION_ACTIVE_CELL_LIST_GPU( &
-            ZZPD,CELL_INDEXD_IN,CELL_SOLID_IN,CHEM_ACTIVE_CELLS_OUT, &
+            ZZPD,TMPD_IN,CELL_INDEXD_IN,CELL_SOLID_IN,CHEM_ACTIVE_CELLS_OUT, &
             NCHEM_ACTIVE_CELLS_OUT,NCHEM_ACTIVE_CC_OUT,REAC_N_SMIX_R_IN,REAC_REACTANT_INDEX_IN, &
             IBAR_IN,JBAR_IN,KBAR_IN,N_TRACKED_SPECIES_IN,N_REACTIONS_IN,ZZ_MIN_IN)
 
             INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN,N_TRACKED_SPECIES_IN,N_REACTIONS_IN
             REAL(EB), VALUE :: ZZ_MIN_IN
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:KBAR_IN+2,1:*) :: ZZPD
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:*) :: TMPD_IN
             INTEGER, DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: CELL_INDEXD_IN
             LOGICAL, DEVICE, DIMENSION(0:*) :: CELL_SOLID_IN
             INTEGER, DEVICE, DIMENSION(1:(IBAR_IN+1)*(JBAR_IN+1)*(KBAR_IN+1),1:*) :: CHEM_ACTIVE_CELLS_OUT
@@ -269,6 +503,8 @@ MODULE G_FIRE
 
             IC = CELL_INDEXD_IN(I,J,K)
             IF (CELL_SOLID_IN(IC)) RETURN
+            ! FIRE:CHECK_CHEMICALLY_ACTIVE_STATE
+            IF (.NOT.FR_ALL_FAST_D .AND. TMPD_IN(I,J,K) < FR_MIN_TEMP_D) RETURN
 
             DO NR=1,N_REACTIONS_IN
                 REACTANTS_PRESENT = .TRUE.
@@ -298,11 +534,11 @@ MODULE G_FIRE
             NCHEM_ACTIVE_CELLS_IN,CHEM_ACTIVE_CELLS_IN,ZZ_D,ZZ_GET_WORKD,DZZ_WORKD,CHEM_SUBIT_WORKD, &
             REAC_SOURCE_TERM_WORKD,Q_REAC_WORKD,PBAR_D,PRESSURE_ZONE_D, &
             RHO_D,H_D,KRES_D,TMP_D,MU_D,LES_FILTER_WIDTH_D,DX_D,DY_D,DZ_D,XC_D,YC_D,ZC_D,Q_D,MIX_TIME_D,CHI_R_D, &
-            D_Z_D,SPECIES_H_F_D,SPECIES_Z2Y_O2_D,REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D, &
+            CHEM_SUBIT_CELL_D,D_Z_D,SPECIES_H_F_D,SPECIES_Z2Y_O2_D,REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D, &
             REAC_AUTO_IGNITION_TEMPERATURE_D,REAC_CHI_R_D,REAC_NU_MW_O_MW_F_D, &
             REAC_CRITICAL_FLAME_TEMPERATURE_D,REAC_Y_O2_MIN_D, &
             REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
-            T_IN,DT_IN,TAU_CHEM_IN,TAU_FLAME_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
+            T_IN,DT_IN,TAU_CHEM_IN,TAU_FLAME_IN,TURBULENT_FLAME_SPEED_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
             CHI_R_MIN_IN,CHI_R_MAX_IN,TWO_EPS_IN,TINY_IN,HUGE_IN,FREE_BURN_TEMPERATURE_IN,TMPA_IN, &
             IBAR_IN,JBAR_IN,KBAR_IN,N_TRACKED_SPECIES_IN,N_REACTIONS_IN,I_MAX_TEMP_IN,MAX_CHEMISTRY_SUBSTEPS_IN, &
             COMBUSTION_ODE_SOLVER_IN,EXPLICIT_EULER_IN,EXTINCT_MOD_IN,EXTINCTION_1_IN,MAX_PRIORITY_IN,SUPPRESSION_IN, &
@@ -311,20 +547,22 @@ MODULE G_FIRE
             INTEGER, VALUE :: IBAR_IN,JBAR_IN,KBAR_IN,N_TRACKED_SPECIES_IN,N_REACTIONS_IN
             INTEGER, VALUE :: I_MAX_TEMP_IN,MAX_CHEMISTRY_SUBSTEPS_IN,COMBUSTION_ODE_SOLVER_IN,EXPLICIT_EULER_IN
             INTEGER, VALUE :: EXTINCT_MOD_IN,EXTINCTION_1_IN,MAX_PRIORITY_IN
-            REAL(EB), VALUE :: T_IN,DT_IN,TAU_CHEM_IN,TAU_FLAME_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN
+            REAL(EB), VALUE :: T_IN,DT_IN,TAU_CHEM_IN,TAU_FLAME_IN,TURBULENT_FLAME_SPEED_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN
             REAL(EB), VALUE :: ZZ_MIN_IN,CHI_R_MIN_IN,CHI_R_MAX_IN,TWO_EPS_IN,TINY_IN,HUGE_IN,FREE_BURN_TEMPERATURE_IN,TMPA_IN
             LOGICAL, VALUE :: SUPPRESSION_IN,OUTPUT_CHEM_IT_IN,REAC_SOURCE_CHECK_IN
             INTEGER, DEVICE :: NCHEM_ACTIVE_CELLS_IN
             INTEGER, DEVICE, DIMENSION(1:(IBAR_IN+1)*(JBAR_IN+1)*(KBAR_IN+1),1:*) :: CHEM_ACTIVE_CELLS_IN
             INTEGER, DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: PRESSURE_ZONE_D
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: ZZ_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:KBAR_IN+2,1:*) :: ZZ_D
             REAL(EB), DEVICE, DIMENSION(1:N_TRACKED_SPECIES_IN,1:*) :: ZZ_GET_WORKD,DZZ_WORKD
             INTEGER, DEVICE, DIMENSION(1:*) :: CHEM_SUBIT_WORKD
             REAL(EB), DEVICE, DIMENSION(1:N_TRACKED_SPECIES_IN,1:*) :: REAC_SOURCE_TERM_WORKD
             REAL(EB), DEVICE, DIMENSION(1:N_REACTIONS_IN,1:*) :: Q_REAC_WORKD
             REAL(EB), DEVICE, DIMENSION(0:KBAR_IN+1,0:*) :: PBAR_D
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: &
-                RHO_D,H_D,KRES_D,TMP_D,MU_D,LES_FILTER_WIDTH_D,Q_D,MIX_TIME_D,CHI_R_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: H_D, KRES_D, MU_D, LES_FILTER_WIDTH_D, Q_D, &
+                MIX_TIME_D, CHI_R_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:*) :: RHO_D,TMP_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: CHEM_SUBIT_CELL_D
             REAL(EB), DEVICE, DIMENSION(0:*) :: DX_D,DY_D,DZ_D
             REAL(EB), DEVICE, DIMENSION(0:*) :: XC_D,YC_D,ZC_D
             REAL(EB), DEVICE, DIMENSION(0:I_MAX_TEMP_IN,1:*) :: D_Z_D
@@ -369,11 +607,14 @@ MODULE G_FIRE
                   REAC_AUTO_IGNITION_TEMPERATURE_D,REAC_CHI_R_D,REAC_NU_MW_O_MW_F_D, &
                   REAC_CRITICAL_FLAME_TEMPERATURE_D,REAC_Y_O2_MIN_D, &
                   REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
-                  TAU_CHEM_IN,TAU_FLAME_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
+                  TAU_CHEM_IN,TAU_FLAME_IN,TURBULENT_FLAME_SPEED_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
                   CHI_R_MIN_IN,CHI_R_MAX_IN,TWO_EPS_IN,TINY_IN,HUGE_IN,FREE_BURN_TEMPERATURE_IN,TMPA_IN, &
                   N_TRACKED_SPECIES_IN,N_REACTIONS_IN,I_MAX_TEMP_IN,MAX_CHEMISTRY_SUBSTEPS_IN, &
                   COMBUSTION_ODE_SOLVER_IN,EXPLICIT_EULER_IN,EXTINCT_MOD_IN,EXTINCTION_1_IN,MAX_PRIORITY_IN,SUPPRESSION_IN, &
                   OUTPUT_CHEM_IT_IN,REAC_SOURCE_CHECK_IN)
+
+            ! FIRE:COMBUSTION_GENERAL_LOAD_BALANCED: CHEM_SUBIT(I,J,K) = CHEM_SUBIT_TMP for active cells
+            IF (OUTPUT_CHEM_IT_IN) CHEM_SUBIT_CELL_D(I,J,K) = REAL(CHEM_SUBIT_WORKD(NC),EB)
 
         END SUBROUTINE COMBUSTION_MODEL_GPU_KERNEL
 
@@ -385,7 +626,7 @@ MODULE G_FIRE
             REAC_AUTO_IGNITION_TEMPERATURE_D,REAC_CHI_R_D,REAC_NU_MW_O_MW_F_D, &
             REAC_CRITICAL_FLAME_TEMPERATURE_D,REAC_Y_O2_MIN_D, &
             REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
-            TAU_CHEM_IN,TAU_FLAME_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
+            TAU_CHEM_IN,TAU_FLAME_IN,TURBULENT_FLAME_SPEED_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN,ZZ_MIN_IN, &
             CHI_R_MIN_IN,CHI_R_MAX_IN,TWO_EPS_IN,TINY_IN,HUGE_IN,FREE_BURN_TEMPERATURE_IN,TMPA_IN, &
             N_TRACKED_SPECIES_IN,N_REACTIONS_IN,I_MAX_TEMP_IN,MAX_CHEMISTRY_SUBSTEPS_IN, &
             COMBUSTION_ODE_SOLVER_IN,EXPLICIT_EULER_IN,EXTINCT_MOD_IN,EXTINCTION_1_IN,MAX_PRIORITY_IN,SUPPRESSION_IN, &
@@ -395,7 +636,7 @@ MODULE G_FIRE
             INTEGER, VALUE :: COMBUSTION_ODE_SOLVER_IN,EXPLICIT_EULER_IN,EXTINCT_MOD_IN,EXTINCTION_1_IN,MAX_PRIORITY_IN
             REAL(EB), VALUE :: T_IN,DT_IN,TMP_IN,RHO_IN,PRES_IN,MU_IN,DELTA_IN,CELL_VOLUME_IN
             REAL(EB), VALUE :: X_IN,Y_IN,Z_IN
-            REAL(EB), VALUE :: TAU_CHEM_IN,TAU_FLAME_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN
+            REAL(EB), VALUE :: TAU_CHEM_IN,TAU_FLAME_IN,TURBULENT_FLAME_SPEED_IN,C_DEARDORFF_IN,GRAV_IN,INITIAL_UNMIXED_FRACTION_IN
             REAL(EB), VALUE :: ZZ_MIN_IN,CHI_R_MIN_IN,CHI_R_MAX_IN,TWO_EPS_IN,TINY_IN,HUGE_IN,FREE_BURN_TEMPERATURE_IN,TMPA_IN
             LOGICAL, VALUE :: SUPPRESSION_IN,OUTPUT_CHEM_IT_IN,REAC_SOURCE_CHECK_IN
             REAL(EB), DEVICE, DIMENSION(1:N_TRACKED_SPECIES_IN,1:*) :: ZZ_GET_WORKD,DZZ_WORKD
@@ -412,17 +653,25 @@ MODULE G_FIRE
             REAL(EB) :: Q_OUT,MIX_TIME_OUT,CHI_R_OUT
 
             REAL(EB) :: A1(MAX_SPECIES),A2(MAX_SPECIES),A4(MAX_SPECIES)
-            REAL(EB) :: ZZ_0(MAX_SPECIES),ZZ_MIXED(MAX_SPECIES),ZZ_MIXED_NEW(MAX_SPECIES)
-            REAL(EB) :: ZZ_HAT_MIX(MAX_SPECIES),REACTION_DZZ(MAX_SPECIES)
+            REAL(EB) :: ZZ_0(MAX_SPECIES),ZZ_MIXED(MAX_SPECIES),ZZ_MIXED_NEW(MAX_SPECIES),ZZ_TEMP(MAX_SPECIES)
+            REAL(EB) :: ZZ_HAT_MIX(MAX_SPECIES),REACTION_DZZ(MAX_SPECIES),ERR_EST(MAX_SPECIES),ERR_TOL(MAX_SPECIES)
+            REAL(EB) :: ZZ_STORE(MAX_SPECIES,4),TV(3),ZZ_DIFF(3)
             REAL(EB) :: Q_REAC_SUB(MAX_REACTIONS),Q_REAC_SUM(MAX_REACTIONS),Q_REAC_OUT(MAX_REACTIONS)
+            REAL(EB) :: Q_REAC_1(MAX_REACTIONS),Q_REAC_2(MAX_REACTIONS),Q_REAC_4(MAX_REACTIONS),DZ_F0(MAX_REACTIONS)
             REAL(EB) :: REAC_SOURCE_TERM_OUT(MAX_SPECIES)
-            REAL(EB) :: ZETA,ZETA_0,DT_SUB,DT_SUB_NEW,DT_ITER,DT_SUB_MIN,CELL_MASS,RHO_HAT,TAU_MIX
-            REAL(EB) :: D_F,TAU_D,TAU_U,TAU_G,C_U,ERR_TINY,Q_SUM_CHI_R,CHI_R_SUM,TOTAL_MIXED_MASS
-            INTEGER :: NR,N,TIME_ITER,ITER,CHEM_SUBIT_OUT,RICH_ITER_MAX,ITMP_DZ
-            LOGICAL :: EXTINCT,NO_REACTIONS
+            REAL(EB) :: ZETA,ZETA_0,ZETA_1,ZETA_2,ZETA_4,DT_SUB,DT_SUB_NEW,DT_SUB_OLD,DT_ITER,DT_SUB_MIN,CELL_MASS,RHO_HAT,TAU_MIX
+            REAL(EB) :: D_F,TAU_D,TAU_U,TAU_G,K_SGS,ERR_TINY,Q_SUM_CHI_R,CHI_R_SUM,TOTAL_MIXED_MASS,MOLPCM3,RATIO_MIN
+            REAL(EB) :: TOTAL_MIXED_MASS_1,TOTAL_MIXED_MASS_2,TOTAL_MIXED_MASS_4,TMP_LOC
+            REAL(EB), PARAMETER :: C_U=0.4_EB,TAU_EPS=1.E-10_EB
+            INTEGER, PARAMETER :: TV_ITER_MIN=5
+            INTEGER :: NR,N,TIME_ITER,ITER,CHEM_SUBIT_OUT,RICH_ITER,RICH_ITER_MAX,ITMP_DZ,TVI,N_FIXED
+            LOGICAL :: EXTINCT,NO_REACTIONS,NO_REAC_2,NO_REAC_4,ALL_TV,ALL_ERR_OK,ANY_NEG,ANY_Q
 
             IF (N_TRACKED_SPECIES_IN > MAX_SPECIES) RETURN
             IF (N_REACTIONS_IN > MAX_REACTIONS) RETURN
+
+            TMP_LOC = TMP_IN
+            N_FIXED = FR_N_FIXED_SUBSTEPS_D
 
             DO N=1,N_TRACKED_SPECIES_IN
                 ZZ_0(N) = ZZ_GET_WORKD(N,NC)
@@ -430,23 +679,38 @@ MODULE G_FIRE
             EXTINCT = .FALSE.
             NO_REACTIONS = .FALSE.
 
-            D_F = 0._EB
-            ITMP_DZ = MAX(0,MIN(I_MAX_TEMP_IN-1,NINT(TMP_IN)))
-            DO NR=1,N_REACTIONS_IN
-                D_F = MAX(D_F,D_Z_D(ITMP_DZ,REAC_FUEL_SMIX_INDEX_D(NR)))
-            ENDDO
-            TAU_D = DELTA_IN**2/MAX(D_F,TWO_EPS_IN)
-
-            C_U = 0.4_EB*C_DEARDORFF_IN*SQRT(1.5_EB)
-            TAU_U = C_U*RHO_IN*DELTA_IN**2/MAX(MU_IN,TWO_EPS_IN)
-            TAU_G = SQRT(2._EB*DELTA_IN/(GRAV_IN+1.E-10_EB))
-            MIX_TIME_OUT = MAX(TAU_CHEM_IN,MIN(TAU_D,TAU_U,TAU_G,TAU_FLAME_IN))
+            ! Determine the mixing time for this cell (FIRE:COMBUSTION_MODEL)
+            IF (FR_FIXED_MIX_TIME_D>0._EB) THEN
+                MIX_TIME_OUT = FR_FIXED_MIX_TIME_D
+            ELSE
+                D_F = 0._EB
+                ITMP_DZ = MAX(0,MIN(I_MAX_TEMP_IN-1,NINT(TMP_IN)))
+                DO NR=1,N_REACTIONS_IN
+                    D_F = MAX(D_F,D_Z_D(ITMP_DZ,REAC_FUEL_SMIX_INDEX_D(NR)))
+                ENDDO
+                TAU_D = DELTA_IN**2/MAX(D_F,TWO_EPS_IN)
+                IF (FR_DNS_D) THEN
+                    MIX_TIME_OUT = MAX(TAU_CHEM_IN,TAU_D)
+                ELSE
+                    ! As FIRE: TAU_U from the subgrid kinetic energy (FDS b7ffe4929c)
+                    K_SGS = (MU_IN/(RHO_IN*C_DEARDORFF_IN*DELTA_IN))**2
+                    TAU_U = C_U*DELTA_IN/SQRT(TWTH*(K_SGS+TAU_EPS))
+                    TAU_G = SQRT(2._EB*DELTA_IN/(GRAV_IN+TAU_EPS))
+                    ! Lower bound for mixing time (FDS 2dc63a2182, f7d333397b)
+                    MIX_TIME_OUT = MAX(MAX(TAU_CHEM_IN,DELTA_IN/TURBULENT_FLAME_SPEED_IN),MIN(TAU_D,TAU_U,TAU_G,TAU_FLAME_IN))
+                ENDIF
+            ENDIF
 
             ZETA_0 = INITIAL_UNMIXED_FRACTION_IN
             CELL_MASS = RHO_IN*CELL_VOLUME_IN
 
             DT_SUB_MIN = DT_IN/REAL(MAX_CHEMISTRY_SUBSTEPS_IN,EB)
 
+            DO N=1,N_TRACKED_SPECIES_IN
+                ZZ_STORE(N,1:4) = 0._EB
+                ERR_TOL(N) = 0._EB
+                ZZ_TEMP(N) = 0._EB
+            ENDDO
             Q_OUT = 0._EB
             ITER = 0
             DT_ITER = 0._EB
@@ -459,11 +723,21 @@ MODULE G_FIRE
                 Q_REAC_OUT(NR) = 0._EB
                 Q_REAC_SUM(NR) = 0._EB
                 Q_REAC_SUB(NR) = 0._EB
+                Q_REAC_1(NR) = 0._EB
+                Q_REAC_2(NR) = 0._EB
+                Q_REAC_4(NR) = 0._EB
+                DZ_F0(NR) = -1._EB
             ENDDO
-
-            DT_SUB = DT_IN
-            DT_SUB_NEW = DT_IN
-            RICH_ITER_MAX = 5
+            MOLPCM3 = -1._EB
+            IF (N_FIXED>0) THEN
+                DT_SUB = DT_IN/REAL(N_FIXED,EB)
+                DT_SUB_NEW = DT_SUB
+                RICH_ITER_MAX = 1
+            ELSE
+                DT_SUB = DT_IN
+                DT_SUB_NEW = DT_IN
+                RICH_ITER_MAX = 5
+            ENDIF
 
             DO N=1,N_TRACKED_SPECIES_IN
                 ZZ_MIXED(N) = ZZ_GET_WORKD(N,NC)
@@ -474,19 +748,28 @@ MODULE G_FIRE
             ENDDO
 
             ZETA = ZETA_0
+            ZETA_1 = ZETA_0
+            ZETA_2 = ZETA_0
+            ZETA_4 = ZETA_0
             RHO_HAT = RHO_IN
             TAU_MIX = MIX_TIME_OUT
+            TOTAL_MIXED_MASS_1 = (1._EB-ZETA_0)*CELL_MASS
+            TOTAL_MIXED_MASS_2 = TOTAL_MIXED_MASS_1
+            TOTAL_MIXED_MASS_4 = TOTAL_MIXED_MASS_1
 
-            ERR_TINY = TINY_IN
+            ERR_TINY = TINY_IN/FR_ODE_MIN_ATOL_D
 
             INTEGRATION_LOOP_GPU: DO TIME_ITER=1,MAX_CHEMISTRY_SUBSTEPS_IN
 
                 IF (SUPPRESSION_IN) THEN
                     DO NR=1,N_REACTIONS_IN
-                        IF (ZZ_0(REAC_FUEL_SMIX_INDEX_D(NR))>ZZ_MIN_IN .AND. ZZ_0(REAC_AIR_SMIX_INDEX_D(NR))>ZZ_MIN_IN) THEN
-                            CALL CHECK_AUTO_IGNITION_DEVICE(EXTINCT,TMP_IN,REAC_AUTO_IGNITION_TEMPERATURE_D(NR), &
-                                                           X_IN,Y_IN,Z_IN,NR)
-                            IF (.NOT. EXTINCT) EXIT
+                        ! note: AIR_SMIX_INDEX = -1 for a decomposition reaction, A => B+C (FDS 6.11.1)
+                        IF (REAC_AIR_SMIX_INDEX_D(NR) > 0) THEN
+                            IF (ZZ_0(REAC_FUEL_SMIX_INDEX_D(NR))>ZZ_MIN_IN .AND. ZZ_0(REAC_AIR_SMIX_INDEX_D(NR))>ZZ_MIN_IN) THEN
+                                CALL CHECK_AUTO_IGNITION_DEVICE(EXTINCT,TMP_IN,REAC_AUTO_IGNITION_TEMPERATURE_D(NR), &
+                                                               X_IN,Y_IN,Z_IN,NR)
+                                IF (.NOT. EXTINCT) EXIT
+                            ENDIF
                         ENDIF
                     ENDDO
                 ENDIF
@@ -494,22 +777,97 @@ MODULE G_FIRE
                 IF (EXTINCT) EXIT INTEGRATION_LOOP_GPU
 
                 IF (COMBUSTION_ODE_SOLVER_IN == EXPLICIT_EULER_IN) THEN
-                    CALL FIRE_FORWARD_EULER_DEVICE(ZZ_MIXED_NEW,ZZ_MIXED,ZZ_0,ZETA,ZETA_0,DT_SUB,TMP_IN,RHO_HAT, &
+                    CALL FIRE_FORWARD_EULER_DEVICE(ZZ_MIXED_NEW,ZZ_MIXED,ZZ_0,ZETA,ZETA_0,DT_SUB,TMP_LOC,RHO_HAT, &
                                                              CELL_MASS,TAU_MIX,Q_REAC_SUB,TOTAL_MIXED_MASS,NO_REACTIONS, &
                                                              ZZ_HAT_MIX,REACTION_DZZ, &
                                                              REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
                                                              REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
-                                                             N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN)
+                                                             N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN, &
+                                                             DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
                     ZETA_0 = ZETA
                     DO N=1,N_TRACKED_SPECIES_IN
                         ZZ_MIXED(N) = ZZ_MIXED_NEW(N)
                     ENDDO
+                ELSEIF (COMBUSTION_ODE_SOLVER_IN == RK2_RICHARDSON) THEN
+                    ! Finite-rate (or mixed finite-rate/fast) chemistry, FDS Tech Guide (E.3)-(E.9)
+                    RICH_EX_LOOP_GPU: DO RICH_ITER=1,RICH_ITER_MAX
+                        DT_SUB = MIN(DT_SUB_NEW,DT_IN-DT_ITER)
+                        CALL FIRE_RK2_DEVICE(A1,ZZ_MIXED,ZZ_0,ZETA_1,ZETA_0,DT_SUB,1,TMP_LOC,RHO_HAT,CELL_MASS,TAU_MIX, &
+                            Q_REAC_1,TOTAL_MIXED_MASS_1,NO_REACTIONS, &
+                            REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+                            REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+                            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN, &
+                            DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+                        IF (NO_REACTIONS) EXIT RICH_EX_LOOP_GPU
+                        CALL FIRE_RK2_DEVICE(A2,ZZ_MIXED,ZZ_0,ZETA_2,ZETA_0,DT_SUB,2,TMP_LOC,RHO_HAT,CELL_MASS,TAU_MIX, &
+                            Q_REAC_2,TOTAL_MIXED_MASS_2,NO_REAC_2, &
+                            REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+                            REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+                            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN, &
+                            DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+                        CALL FIRE_RK2_DEVICE(A4,ZZ_MIXED,ZZ_0,ZETA_4,ZETA_0,DT_SUB,4,TMP_LOC,RHO_HAT,CELL_MASS,TAU_MIX, &
+                            Q_REAC_4,TOTAL_MIXED_MASS_4,NO_REAC_4, &
+                            REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+                            REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+                            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN, &
+                            DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+                        ! Species Error Analysis, FDS Tech Guide (E.7), (E.8)
+                        ALL_ERR_OK = .TRUE.
+                        RATIO_MIN = HUGE_IN
+                        DO N=1,N_TRACKED_SPECIES_IN
+                            ERR_EST(N) = ABS((4._EB*A4(N)-5._EB*A2(N)+A1(N)))/45._EB
+                            ZZ_TEMP(N) = (4._EB*A4(N)-A2(N))*ONTH
+                            ERR_TOL(N) = MAX(0.1_EB*ZZ_MIN_IN,FR_ODE_REL_ERROR_D(N)*ZZ_TEMP(N),FR_ODE_MIN_ATOL_D)
+                            IF (ERR_EST(N)>ERR_TOL(N)) ALL_ERR_OK = .FALSE.
+                            RATIO_MIN = MIN(RATIO_MIN,ERR_TOL(N)/(ERR_EST(N)+ERR_TINY))
+                        ENDDO
+                        IF (N_FIXED<0) THEN
+                            DT_SUB_OLD = DT_SUB_NEW
+                            DT_SUB_NEW = MIN(MAX(DT_SUB*RATIO_MIN**(0.25_EB),DT_SUB_MIN),DT_IN-DT_ITER) ! (E.9)
+                            IF (ALL_ERR_OK .OR. ABS(DT_SUB_OLD/DT_SUB_NEW-1._EB) <= 0.1_EB) EXIT RICH_EX_LOOP_GPU
+                        ENDIF
+                    ENDDO RICH_EX_LOOP_GPU
+
+                    IF (NO_REACTIONS) THEN
+                        DO N=1,N_TRACKED_SPECIES_IN
+                            ZZ_MIXED(N) = A1(N)
+                        ENDDO
+                        DO NR=1,N_REACTIONS_IN
+                            Q_REAC_SUB(NR) = Q_REAC_1(NR)
+                        ENDDO
+                        ZETA = ZETA_1
+                    ELSE
+                        ANY_NEG = .FALSE.
+                        DO N=1,N_TRACKED_SPECIES_IN
+                            IF (ZZ_TEMP(N) < -TWO_EPS_IN) ANY_NEG = .TRUE.
+                        ENDDO
+                        IF (ANY_NEG) THEN
+                            DO N=1,N_TRACKED_SPECIES_IN
+                                ZZ_TEMP(N) = A4(N)
+                                ZZ_MIXED(N) = ZZ_TEMP(N)
+                            ENDDO
+                            DO NR=1,N_REACTIONS_IN
+                                Q_REAC_SUB(NR) = Q_REAC_4(NR)
+                            ENDDO
+                            ZETA = ZETA_4
+                        ELSE
+                            DO N=1,N_TRACKED_SPECIES_IN
+                                ZZ_MIXED(N) = ZZ_TEMP(N)
+                            ENDDO
+                            DO NR=1,N_REACTIONS_IN
+                                Q_REAC_SUB(NR) = (4._EB*Q_REAC_4(NR)-Q_REAC_2(NR))*ONTH
+                            ENDDO
+                            ZETA = (4._EB*ZETA_4-ZETA_2)*ONTH
+                        ENDIF
+                    ENDIF
+                    ZETA_0 = ZETA
                 ENDIF
 
                 CALL GET_REALIZABLE_MF_DEVICE(ZZ_MIXED,N_TRACKED_SPECIES_IN)
                 DO N=1,N_TRACKED_SPECIES_IN
                     ZZ_GET_WORKD(N,NC) = ZETA*ZZ_0(N) + (1._EB-ZETA)*ZZ_MIXED(N)
                 ENDDO
+                IF (NO_REACTIONS) DT_ITER = DT_IN
                 DT_ITER = DT_ITER + DT_SUB
                 ITER = ITER + 1
                 IF (OUTPUT_CHEM_IT_IN) CHEM_SUBIT_OUT = ITER
@@ -517,6 +875,27 @@ MODULE G_FIRE
                 DO NR=1,N_REACTIONS_IN
                     Q_REAC_SUM(NR) = Q_REAC_SUM(NR) + Q_REAC_SUB(NR)
                 ENDDO
+
+                ! Total Variation (TV) scheme, FDS Tech Guide Appendix E
+                IF (COMBUSTION_ODE_SOLVER_IN==RK2_RICHARDSON .AND. N_REACTIONS_IN>1) THEN
+                    DO N=1,N_TRACKED_SPECIES_IN
+                        DO TVI=1,3
+                            ZZ_STORE(N,TVI) = ZZ_STORE(N,TVI+1)
+                        ENDDO
+                        ZZ_STORE(N,4) = ZZ_GET_WORKD(N,NC)
+                    ENDDO
+                    IF (ITER >= TV_ITER_MIN) THEN
+                        ALL_TV = .TRUE.
+                        DO N=1,N_TRACKED_SPECIES_IN
+                            DO TVI=1,3
+                                TV(TVI) = ABS(ZZ_STORE(N,TVI+1)-ZZ_STORE(N,TVI))
+                                ZZ_DIFF(TVI) = ZZ_STORE(N,TVI+1)-ZZ_STORE(N,TVI)
+                            ENDDO
+                            IF (.NOT.(SUM(TV) < ERR_TOL(N) .OR. SUM(TV) >= ABS(2.9_EB*SUM(ZZ_DIFF)))) ALL_TV = .FALSE.
+                        ENDDO
+                        IF (ALL_TV) EXIT INTEGRATION_LOOP_GPU
+                    ENDIF
+                ENDIF
 
                 IF (DT_ITER > (DT_IN-TWO_EPS_IN)) EXIT INTEGRATION_LOOP_GPU
             ENDDO INTEGRATION_LOOP_GPU
@@ -554,15 +933,24 @@ MODULE G_FIRE
                 ENDDO
             ENDIF
 
-            Q_SUM_CHI_R = 0._EB
-            CHI_R_SUM = 0._EB
+            ! Reaction rate-weighted radiative fraction, with RAMP_CHI_R (FIRE:COMBUSTION_MODEL)
+            ANY_Q = .FALSE.
             DO NR=1,N_REACTIONS_IN
-                IF (Q_REAC_SUM(NR) > TWO_EPS_IN) THEN
-                    CHI_R_SUM = CHI_R_SUM + Q_REAC_SUM(NR)*REAC_CHI_R_D(NR)
-                    Q_SUM_CHI_R = Q_SUM_CHI_R + Q_REAC_SUM(NR)
-                ENDIF
+                IF (Q_REAC_SUM(NR) > TWO_EPS_IN) ANY_Q = .TRUE.
             ENDDO
-            IF (Q_SUM_CHI_R > TWO_EPS_IN) CHI_R_OUT = CHI_R_SUM/Q_SUM_CHI_R
+            IF (ANY_Q) THEN
+                Q_SUM_CHI_R = 0._EB
+                CHI_R_SUM = 0._EB
+                DO NR=1,N_REACTIONS_IN
+                    IF (Q_REAC_SUM(NR) > TWO_EPS_IN) THEN
+                        CHI_R_SUM = CHI_R_SUM + Q_REAC_SUM(NR)*REAC_CHI_R_D(NR)*FR_CHI_R_RAMP_D(NR)
+                        Q_SUM_CHI_R = Q_SUM_CHI_R + Q_REAC_SUM(NR)
+                    ENDIF
+                ENDDO
+                CHI_R_OUT = CHI_R_SUM/Q_SUM_CHI_R
+            ELSE
+                CHI_R_OUT = REAC_CHI_R_D(1)*FR_CHI_R_RAMP_D(1)
+            ENDIF
             CHI_R_OUT = MAX(CHI_R_MIN_IN,MIN(CHI_R_MAX_IN,CHI_R_OUT))
 
             CHEM_SUBIT_WORKD(NC) = CHEM_SUBIT_OUT
@@ -591,9 +979,11 @@ MODULE G_FIRE
             Q_REAC_LOC,TOTAL_MIXED_MASS,NO_REACTIONS,ZZ_HAT_MIX_OUT,REACTION_DZZ_OUT, &
             REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
             REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
-            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN)
+            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN,DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
 
-            INTEGER, VALUE :: N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN
+            INTEGER, VALUE :: N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,I_MAX_TEMP_IN
+            REAL(EB), VALUE :: ZZ_MIN_IN
+            REAL(EB) :: DZ_F0(MAX_REACTIONS),MOLPCM3
             REAL(EB), VALUE :: DT_LOC,TMP_IN,RHO_HAT,CELL_MASS,TAU_MIX,TWO_EPS_IN,HUGE_IN
             REAL(EB) :: ZZ_OUT(MAX_SPECIES),ZZ_IN(MAX_SPECIES),ZZ_0(MAX_SPECIES)
             REAL(EB) :: ZETA_OUT,ZETA_IN,Q_REAC_LOC(MAX_REACTIONS),TOTAL_MIXED_MASS
@@ -607,7 +997,7 @@ MODULE G_FIRE
             REAL(EB) :: ZZ_HAT(MAX_SPECIES),DZZ(MAX_SPECIES),MIXED_MASS(MAX_SPECIES),MIXED_MASS_0(MAX_SPECIES)
             REAL(EB) :: Q_REAC_OUT(MAX_REACTIONS),TOTAL_MIXED_MASS_0
             INTEGER :: N,NR,PTY
-            LOGICAL :: ANY_FAST
+            LOGICAL :: ANY_FAST,ALL_FAST
 
             TOTAL_MIXED_MASS_0  = (1._EB-ZETA_IN)*CELL_MASS
             DO N=1,N_TRACKED_SPECIES_IN
@@ -632,8 +1022,13 @@ MODULE G_FIRE
             ENDDO
 
             ANY_FAST = .FALSE.
+            ALL_FAST = .TRUE.
             DO NR=1,N_REACTIONS_IN
-                IF (REAC_FAST_CHEMISTRY_D(NR)) ANY_FAST = .TRUE.
+                IF (REAC_FAST_CHEMISTRY_D(NR)) THEN
+                    ANY_FAST = .TRUE.
+                ELSE
+                    ALL_FAST = .FALSE.
+                ENDIF
             ENDDO
 
             IF (ANY_FAST) THEN
@@ -650,6 +1045,20 @@ MODULE G_FIRE
                     DO NR=1,N_REACTIONS_IN
                         Q_REAC_LOC(NR) = Q_REAC_LOC(NR) + Q_REAC_OUT(NR)*TOTAL_MIXED_MASS
                     ENDDO
+                ENDDO
+            ENDIF
+
+            ! Do all finite rate reactions in parallel (FIRE:FIRE_FORWARD_EULER)
+            IF (.NOT.ALL_FAST) THEN
+                CALL REACTION_RATE_FINITE_DEVICE(DZZ,ZZ_HAT,DT_LOC,RHO_HAT,TMP_IN,Q_REAC_OUT,NO_REACTIONS, &
+                                                 DZ_F0,MOLPCM3,N_TRACKED_SPECIES_IN,N_REACTIONS_IN,TWO_EPS_IN,HUGE_IN, &
+                                                 ZZ_MIN_IN,I_MAX_TEMP_IN)
+                DO N=1,N_TRACKED_SPECIES_IN
+                    ZZ_HAT(N) = ZZ_HAT(N) + DZZ(N)
+                    REACTION_DZZ_OUT(N) = REACTION_DZZ_OUT(N) + DZZ(N)
+                ENDDO
+                DO NR=1,N_REACTIONS_IN
+                    Q_REAC_LOC(NR) = Q_REAC_LOC(NR) + Q_REAC_OUT(NR)*TOTAL_MIXED_MASS
                 ENDDO
             ENDIF
 
@@ -677,7 +1086,7 @@ MODULE G_FIRE
             REAL(EB), DEVICE, DIMENSION(1:*) :: REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D
 
             REAL(EB) :: ZZ_TMP(MAX_SPECIES),ZZ_NEW(MAX_SPECIES),Q_REAC_TMP(MAX_REACTIONS),DT_MIN,DZ_F,AA
-            INTEGER :: I,N,NS,OUTER_IT,FUEL_INDEX,AIR_INDEX
+            INTEGER :: I,N,NS,NS_MIN,OUTER_IT,FUEL_INDEX,AIR_INDEX
             LOGICAL :: REACTANTS_PRESENT
 
             DO N=1,N_TRACKED_SPECIES_IN
@@ -721,12 +1130,20 @@ MODULE G_FIRE
 
                 IF (REACTANTS_PRESENT) THEN
                     DT_MIN = HUGE_IN
+                    NS_MIN = 0
                     DO NS=1,N_TRACKED_SPECIES_IN
-                        IF (DZZ(NS) < 0._EB) DT_MIN = MIN(DT_MIN,-ZZ_TMP(NS)/DZZ(NS))
+                        IF (DZZ(NS) < 0._EB) THEN
+                            IF (-ZZ_TMP(NS)/DZZ(NS) < DT_MIN) THEN
+                                DT_MIN = -ZZ_TMP(NS)/DZZ(NS)
+                                NS_MIN = NS
+                            ENDIF
+                        ENDIF
                     ENDDO
                     DO N=1,N_TRACKED_SPECIES_IN
                         ZZ_NEW(N) = ZZ_TMP(N) + DZZ(N)*DT_MIN
                     ENDDO
+                    ! As FIRE:REACTION_RATE: the limiting species is used up exactly (no FMA rounding residual)
+                    IF (NS_MIN > 0) ZZ_NEW(NS_MIN) = 0._EB
                     DO I=1,N_REACTIONS_IN
                         Q_REAC_OUT(I) = Q_REAC_OUT(I) + Q_REAC_TMP(I)*DT_MIN
                     ENDDO
@@ -740,6 +1157,250 @@ MODULE G_FIRE
             ENDDO
 
         END SUBROUTINE REACTION_RATE_FAST_DEVICE
+
+        ATTRIBUTES(DEVICE) SUBROUTINE FIRE_RK2_DEVICE(ZZ_OUT,ZZ_IN,ZZ_0,ZETA_OUT,ZETA_IN,DT_SUB,N_INC,TMP_IN,RHO_HAT, &
+            CELL_MASS,TAU_MIX,Q_REAC_OUT,TOTAL_MIXED_MASS_OUT,NO_REACTIONS, &
+            REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+            REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+            N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN,DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+
+            ! FIRE:FIRE_RK2 -- RK2 integration of ZZ_IN from 0 to DT_SUB in N_INC increments
+
+            INTEGER, VALUE :: N_INC,N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,I_MAX_TEMP_IN
+            REAL(EB), VALUE :: DT_SUB,TMP_IN,RHO_HAT,CELL_MASS,TAU_MIX,TWO_EPS_IN,HUGE_IN,ZZ_MIN_IN
+            REAL(EB) :: ZZ_OUT(MAX_SPECIES),ZZ_IN(MAX_SPECIES),ZZ_0(MAX_SPECIES),ZETA_OUT,ZETA_IN
+            REAL(EB) :: Q_REAC_OUT(MAX_REACTIONS),TOTAL_MIXED_MASS_OUT,DZ_F0(MAX_REACTIONS),MOLPCM3
+            LOGICAL :: NO_REACTIONS
+            INTEGER, DEVICE, DIMENSION(1:*) :: REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D
+            LOGICAL, DEVICE, DIMENSION(1:*) :: REAC_FAST_CHEMISTRY_D
+            REAL(EB), DEVICE, DIMENSION(1:N_TRACKED_SPECIES_IN,1:*) :: REAC_NU_MW_O_MW_F_D
+            REAL(EB), DEVICE, DIMENSION(1:*) :: REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D
+
+            REAL(EB) :: DT_LOC,ZZ_TMP_0(MAX_SPECIES),ZZ_TMP_1(MAX_SPECIES),ZZ_TMP_2(MAX_SPECIES)
+            REAL(EB) :: ZETA_TMP_0,ZETA_TMP_1,ZETA_TMP_2,Q_REAC_1(MAX_REACTIONS),Q_REAC_2(MAX_REACTIONS)
+            REAL(EB) :: TOTAL_MIXED_MASS_0,TOTAL_MIXED_MASS_1,TOTAL_MIXED_MASS_2,ZZ_HAT_MIX(MAX_SPECIES),REACTION_DZZ(MAX_SPECIES)
+            INTEGER :: N,NS,NR
+
+            DT_LOC = DT_SUB/REAL(N_INC,EB)
+            DO NS=1,N_TRACKED_SPECIES_IN
+                ZZ_TMP_0(NS) = ZZ_IN(NS)
+            ENDDO
+            ZETA_TMP_0 = ZETA_IN
+            DO NR=1,N_REACTIONS_IN
+                Q_REAC_OUT(NR) = 0._EB
+            ENDDO
+            TOTAL_MIXED_MASS_0 = (1._EB-ZETA_TMP_0)*CELL_MASS
+            TOTAL_MIXED_MASS_OUT = TOTAL_MIXED_MASS_0
+
+            DO N=1,N_INC
+                CALL FIRE_FORWARD_EULER_DEVICE(ZZ_TMP_1,ZZ_TMP_0,ZZ_0,ZETA_TMP_1,ZETA_TMP_0,DT_LOC,TMP_IN,RHO_HAT,CELL_MASS, &
+                    TAU_MIX,Q_REAC_1,TOTAL_MIXED_MASS_1,NO_REACTIONS,ZZ_HAT_MIX,REACTION_DZZ, &
+                    REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+                    REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+                    N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN,DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+                CALL FIRE_FORWARD_EULER_DEVICE(ZZ_TMP_2,ZZ_TMP_1,ZZ_0,ZETA_TMP_2,ZETA_TMP_1,DT_LOC,TMP_IN,RHO_HAT,CELL_MASS, &
+                    TAU_MIX,Q_REAC_2,TOTAL_MIXED_MASS_2,NO_REACTIONS,ZZ_HAT_MIX,REACTION_DZZ, &
+                    REAC_FUEL_SMIX_INDEX_D,REAC_AIR_SMIX_INDEX_D,REAC_PRIORITY_D,REAC_FAST_CHEMISTRY_D, &
+                    REAC_NU_MW_O_MW_F_D,REAC_A_PRIME_D,REAC_RHO_EXPONENT_D,REAC_HEAT_OF_COMBUSTION_D, &
+                    N_TRACKED_SPECIES_IN,N_REACTIONS_IN,MAX_PRIORITY_IN,TWO_EPS_IN,HUGE_IN,DZ_F0,MOLPCM3,ZZ_MIN_IN,I_MAX_TEMP_IN)
+
+                IF (TOTAL_MIXED_MASS_2>TWO_EPS_IN) THEN
+                    TOTAL_MIXED_MASS_OUT = 0._EB
+                    DO NS=1,N_TRACKED_SPECIES_IN
+                        ZZ_OUT(NS) = 0.5_EB*(ZZ_TMP_0(NS)*TOTAL_MIXED_MASS_0 + ZZ_TMP_2(NS)*TOTAL_MIXED_MASS_2)
+                        TOTAL_MIXED_MASS_OUT = TOTAL_MIXED_MASS_OUT + ZZ_OUT(NS)
+                    ENDDO
+                    DO NS=1,N_TRACKED_SPECIES_IN
+                        ZZ_OUT(NS) = ZZ_OUT(NS)/TOTAL_MIXED_MASS_OUT
+                    ENDDO
+                ELSE
+                    DO NS=1,N_TRACKED_SPECIES_IN
+                        ZZ_OUT(NS) = ZZ_TMP_0(NS)
+                    ENDDO
+                ENDIF
+
+                ZETA_OUT = MAX(0._EB,1._EB-TOTAL_MIXED_MASS_OUT/CELL_MASS)
+
+                DO NR=1,N_REACTIONS_IN
+                    Q_REAC_OUT(NR) = Q_REAC_OUT(NR) + 0.5_EB*(Q_REAC_1(NR)+Q_REAC_2(NR))
+                ENDDO
+
+                DO NS=1,N_TRACKED_SPECIES_IN
+                    ZZ_TMP_0(NS) = ZZ_OUT(NS)
+                ENDDO
+                ZETA_TMP_0 = ZETA_OUT
+                TOTAL_MIXED_MASS_0 = TOTAL_MIXED_MASS_OUT
+                IF (NO_REACTIONS) RETURN
+            ENDDO
+
+        END SUBROUTINE FIRE_RK2_DEVICE
+
+        ATTRIBUTES(DEVICE) REAL(EB) FUNCTION CALC_FCENT_DEVICE(TMP,P_RI,I)
+            ! FIRE:CALC_FCENT
+            REAL(EB), VALUE :: TMP,P_RI
+            INTEGER, VALUE :: I
+            REAL(EB) :: LOGFCENT,C,N,LOGPRC
+            REAL(EB), PARAMETER :: D=0.14_EB
+
+            IF (FR_REACTYPE_D(I)==FALLOFF_TROE_TYPE) THEN
+                IF (FR_T2_TROE_D(I) <-1.E20_EB) THEN
+                    LOGFCENT = LOG10(MAX((1 - FR_A_TROE_D(I))*EXP(-TMP*FR_RT3_TROE_D(I)) + &
+                               FR_A_TROE_D(I)*EXP(-TMP*FR_RT1_TROE_D(I)),TWENTY_EPSILON_EB))
+                ELSE
+                    LOGFCENT = LOG10(MAX((1 - FR_A_TROE_D(I))*EXP(-TMP*FR_RT3_TROE_D(I)) + &
+                               FR_A_TROE_D(I)*EXP(-TMP*FR_RT1_TROE_D(I)) + EXP(-FR_T2_TROE_D(I)/TMP),TWENTY_EPSILON_EB))
+                ENDIF
+                C = -0.4_EB - 0.67_EB*LOGFCENT
+                N = 0.75_EB - 1.27_EB*LOGFCENT
+                LOGPRC = LOG10(MAX(P_RI, TWENTY_EPSILON_EB)) + C
+                CALC_FCENT_DEVICE = 10._EB**(LOGFCENT/(1._EB + (LOGPRC/(N - D*LOGPRC))**2))
+            ELSE
+                CALC_FCENT_DEVICE = 1._EB  !FALLOFF-LINDEMANNN
+            ENDIF
+        END FUNCTION CALC_FCENT_DEVICE
+
+        ATTRIBUTES(DEVICE) SUBROUTINE REACTION_RATE_FINITE_DEVICE(DZZ,ZZ_OLD,DT_SUB,RHO_0,TMP_0,Q_REAC_OUT,NO_REACTIONS, &
+            DZ_F0,MOLPCM3,N_TRACKED_SPECIES_IN,N_REACTIONS_IN,TWO_EPS_IN,HUGE_IN,ZZ_MIN_IN,I_MAX_TEMP_IN)
+
+            ! FIRE:REACTION_RATE, KINETICS=FINITE_RATE. DZ_F0 and MOLPCM3 are the per-cell constants of FIRE (reset to -1
+            ! at the start of COMBUSTION_MODEL for each cell).
+
+            INTEGER, VALUE :: N_TRACKED_SPECIES_IN,N_REACTIONS_IN,I_MAX_TEMP_IN
+            REAL(EB), VALUE :: DT_SUB,RHO_0,TMP_0,TWO_EPS_IN,HUGE_IN,ZZ_MIN_IN
+            REAL(EB) :: DZZ(MAX_SPECIES),ZZ_OLD(MAX_SPECIES),Q_REAC_OUT(MAX_REACTIONS),DZ_F0(MAX_REACTIONS),MOLPCM3
+            LOGICAL :: NO_REACTIONS
+
+            REAL(EB) :: ZZ_TMP(MAX_SPECIES),ZZ_NEW(MAX_SPECIES),Q_REAC_TMP(MAX_REACTIONS),YY_PRIMITIVE(FR_MAX_PRIMITIVE)
+            REAL(EB) :: DZ_F,DT_MIN,DT_LOC,RRTMP0,K_INF,K_0,P_RI,FCENT,C_I,X_Y_SUM,X_Y_EFF,X_Y_NS,MW,YSUM
+            INTEGER :: I,N,NS,OUTER_IT,N_SPEC_PRIM
+            LOGICAL :: REACTANTS_PRESENT
+
+            N_SPEC_PRIM = FR_N_SPECIES_D
+            DO N=1,N_TRACKED_SPECIES_IN
+                ZZ_NEW(N) = ZZ_OLD(N)
+                DZZ(N) = 0._EB
+            ENDDO
+            DO I=1,N_REACTIONS_IN
+                Q_REAC_OUT(I) = 0._EB
+                Q_REAC_TMP(I) = 0._EB
+            ENDDO
+            RRTMP0 = 1._EB/(R0*TMP_0)
+
+            DT_LOC = DT_SUB
+            NO_REACTIONS = .TRUE.
+            SLOW_REAC_LOOP_GPU: DO OUTER_IT=1,N_REACTIONS_IN
+                DO N=1,N_TRACKED_SPECIES_IN
+                    ZZ_TMP(N) = ZZ_NEW(N)
+                    DZZ(N) = 0._EB
+                ENDDO
+                ! PHYSICAL_FUNCTIONS:GET_MASS_FRACTION_ALL
+                DO NS=1,N_SPEC_PRIM
+                    YSUM = 0._EB
+                    DO N=1,N_TRACKED_SPECIES_IN
+                        YSUM = YSUM + SPECIES_Z2YD(NS,N)*ZZ_TMP(N)
+                    ENDDO
+                    YY_PRIMITIVE(NS) = MIN(1._EB,MAX(0._EB,YSUM))
+                ENDDO
+                REACTANTS_PRESENT = .FALSE.
+                REACTION_LOOP_2_GPU: DO I=1,N_REACTIONS_IN
+                    IF (REAC_FAST_CHEMISTRYD(I)) CYCLE REACTION_LOOP_2_GPU
+                    ! Check for consumed species
+                    DO NS=1,FR_N_SMIX_FR_D(I)
+                        IF (FR_NU_MW_O_MW_F_FR_D(NS,I) < 0._EB .AND. ZZ_TMP(FR_NU_INDEX_D(NS,I)) < ZZ_MIN_IN) &
+                            CYCLE REACTION_LOOP_2_GPU
+                    ENDDO
+                    ! Check for species with concentration exponents
+                    DO NS=1,FR_N_SPEC_D(I)
+                        IF (YY_PRIMITIVE(FR_N_S_INDEX_D(NS,I)) < ZZ_MIN_IN) CYCLE REACTION_LOOP_2_GPU
+                    ENDDO
+                    NO_REACTIONS = .FALSE.
+                    IF (DZ_F0(I) < 0._EB) THEN
+                        K_INF = REAC_A_PRIMED(I)*RHO_0**REAC_RHO_EXPONENTD(I)*TMP_0**FR_N_T_D(I)*EXP(-FR_E_D(I)*RRTMP0)
+                        DZ_F0(I) = K_INF
+                        IF (FR_THIRD_BODY_D(I)) THEN
+                            IF (FR_N_THIRD_D(I) <= 0) THEN
+                                IF (MOLPCM3 < 0._EB) THEN
+                                    MW = 0._EB
+                                    DO N=1,N_TRACKED_SPECIES_IN
+                                        MW = MW + MWR_ZD(N)*ZZ_TMP(N)
+                                    ENDDO
+                                    MW = 1._EB/MW
+                                    MOLPCM3 = RHO_0/MW*0.001_EB ! mol/cm^3
+                                ENDIF
+                                DZ_F0(I) = DZ_F0(I)*MOLPCM3
+                            ENDIF
+                            IF (FR_REACTYPE_D(I)==FALLOFF_LINDEMANN_TYPE .OR. FR_REACTYPE_D(I)==FALLOFF_TROE_TYPE) THEN
+                                K_0 = FR_A_LOW_PR_D(I)*TMP_0**(FR_N_T_LOW_PR_D(I))*EXP(-FR_E_LOW_PR_D(I)*RRTMP0)
+                                P_RI = K_0/K_INF
+                                FCENT = CALC_FCENT_DEVICE(TMP_0,P_RI,I)
+                                C_I = P_RI/(1._EB+P_RI)*FCENT
+                                DZ_F0(I) = DZ_F0(I)*C_I
+                            ENDIF
+                        ENDIF
+                        IF (FR_REVERSE_D(I)) THEN ! compute equilibrium constant
+                            IF (MOLPCM3 < 0._EB) THEN
+                                MW = 0._EB
+                                DO N=1,N_TRACKED_SPECIES_IN
+                                    MW = MW + MWR_ZD(N)*ZZ_TMP(N)
+                                ENDDO
+                                MW = 1._EB/MW
+                                MOLPCM3 = RHO_0/MW*0.001_EB ! mol/cm^3
+                            ENDIF
+                            DZ_F0(I) = DZ_F0(I)*EXP(FR_DELTA_G_D(MIN(I_MAX_TEMP_IN,NINT(TMP_0)),I)/TMP_0)*MOLPCM3**FR_C0_EXP_D(I)
+                        ENDIF
+                    ENDIF
+                    DZ_F = DZ_F0(I)
+                    IF (FR_THIRD_BODY_D(I)) THEN
+                        IF (FR_N_THIRD_D(I) > 0) THEN
+                            X_Y_SUM = 0._EB
+                            X_Y_EFF = 0._EB
+                            DO NS=1,N_SPEC_PRIM
+                                X_Y_NS = YY_PRIMITIVE(NS)/FR_MW_PRIM_D(NS)
+                                X_Y_SUM = X_Y_SUM + X_Y_NS
+                                X_Y_EFF = X_Y_EFF + X_Y_NS*FR_THIRD_EFF_D(NS,I)
+                            ENDDO
+                            DZ_F = DZ_F * MOLPCM3 * X_Y_EFF/X_Y_SUM
+                        ENDIF
+                    ENDIF
+                    DO NS=1,FR_N_SPEC_D(I)
+                        IF (FR_N_S_FLAG_D(NS,I)) THEN
+                            DZ_F = YY_PRIMITIVE(FR_N_S_INDEX_D(NS,I))**FR_N_S_INT_D(NS,I)*DZ_F
+                        ELSE
+                            DZ_F = DZ_F*YY_PRIMITIVE(FR_N_S_INDEX_D(NS,I))**FR_N_S_D(NS,I)
+                        ENDIF
+                    ENDDO
+                    IF (DZ_F > TWO_EPS_IN) REACTANTS_PRESENT = .TRUE.
+                    Q_REAC_TMP(I) = REAC_HEAT_OF_COMBUSTIOND(I) * DZ_F * DT_LOC ! Note: here DZ_F=dZ/dt, hence need DT_LOC
+                    DZ_F = DZ_F*DT_LOC
+                    DO NS=1,FR_N_SMIX_FR_D(I)
+                        DZZ(FR_NU_INDEX_D(NS,I)) = DZZ(FR_NU_INDEX_D(NS,I)) + FR_NU_MW_O_MW_F_FR_D(NS,I)*DZ_F
+                    ENDDO
+                ENDDO REACTION_LOOP_2_GPU
+                IF (NO_REACTIONS) RETURN
+                IF (REACTANTS_PRESENT) THEN
+                    ! Think of DT_MIN as the fraction of DT_LOC we can take and remain bounded.
+                    DT_MIN = HUGE_IN
+                    DO NS=1,N_TRACKED_SPECIES_IN
+                        IF (DZZ(NS) < 0._EB) DT_MIN = MIN(DT_MIN,-ZZ_TMP(NS)/DZZ(NS))
+                    ENDDO
+                    DT_MIN = MIN(1._EB,DT_MIN)
+                    DT_LOC = DT_LOC*(1._EB-DT_MIN)
+                    DO N=1,N_TRACKED_SPECIES_IN
+                        ZZ_NEW(N) = ZZ_TMP(N) + DZZ(N)*DT_MIN
+                    ENDDO
+                    DO I=1,N_REACTIONS_IN
+                        Q_REAC_OUT(I) = Q_REAC_OUT(I) + Q_REAC_TMP(I)*DT_MIN
+                    ENDDO
+                    IF (DT_LOC<TWO_EPS_IN) EXIT SLOW_REAC_LOOP_GPU
+                ELSE
+                    EXIT SLOW_REAC_LOOP_GPU
+                ENDIF
+            ENDDO SLOW_REAC_LOOP_GPU
+            DO N=1,N_TRACKED_SPECIES_IN
+                DZZ(N) = ZZ_NEW(N) - ZZ_OLD(N)
+            ENDDO
+
+        END SUBROUTINE REACTION_RATE_FINITE_DEVICE
 
         ATTRIBUTES(DEVICE) SUBROUTINE GET_REALIZABLE_MF_DEVICE(ZZ_IN,N_TRACKED_SPECIES_IN)
 
@@ -912,7 +1573,8 @@ MODULE G_FIRE
             INTEGER, DEVICE :: NCHEM_ACTIVE_CELLS_IN
             INTEGER, DEVICE, DIMENSION(1:(IBAR_IN+1)*(JBAR_IN+1)*(KBAR_IN+1),1:*) :: CHEM_ACTIVE_CELLS_IN
             REAL(EB), DEVICE, DIMENSION(1:N_TRACKED_SPECIES_IN,1:*) :: ZZ_NEW_WORKD,ZZ_OLD_WORKD
-            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: D_SOURCE_D,TMP_D,RHO_D
+            REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:*) :: D_SOURCE_D
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR_IN+2,-1:JBAR_IN+2,-1:*) :: TMP_D,RHO_D
             REAL(EB), DEVICE, DIMENSION(0:IBAR_IN+1,0:JBAR_IN+1,0:KBAR_IN+1,1:*) :: M_DOT_PPP_D
             REAL(EB), DEVICE, DIMENSION(0:I_MAX_TEMP_IN,1:*) :: CP_Z_D,H_SENS_Z_D
             REAL(EB), DEVICE, DIMENSION(1:*) :: MWR_Z_D,SPECIES_RCON_D
