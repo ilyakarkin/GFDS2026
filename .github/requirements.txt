@@ -11,3 +11,10 @@ pygments
 ipython
 cantera
 pyfdstools
+bibtexautocomplete
+PySide6
+
+# Local utility packages (imports fdsplotlib)
+-e ../Utilities/Python
+
+

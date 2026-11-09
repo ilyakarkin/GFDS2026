@@ -594,8 +594,8 @@ Oxygen concentration measurements were made across the coflow section of the bur
 \begin{figure}[!h]
 \centering
 \begin{tabular}{c}
-\includegraphics[height=4in]{SCRIPT_FIGURES/ScatterPlots/FDS_Carbon_Dioxide_Concentration} \\
-\includegraphics[height=4in]{SCRIPT_FIGURES/ScatterPlots/FDS_Oxygen_Concentration}
+\includegraphics[height=4in]{SCRIPT_FIGURES/Scatterplots/FDS_Carbon_Dioxide_Concentration} \\
+\includegraphics[height=4in]{SCRIPT_FIGURES/Scatterplots/FDS_Oxygen_Concentration}
 \end{tabular}
 \caption[Summary of major gas species predictions]
 {Summary of major gas species predictions.}
@@ -792,9 +792,7 @@ Mean and rms soot volume fraction measurements were made above a 13.7~cm (inner)
 \end{sidewaysfigure}
 
 
-
 \clearpage
-
 
 \subsection{FM/FPRF Data Center Experiments}
 \label{FM Smoke Concentration}
@@ -814,12 +812,12 @@ Results of the low exhaust rate (78 ACH) and high exhaust rate (265 ACH) tests f
 \label{FM_FPRF_Datacenter_Smoke}
 \end{figure}
 
+
 \clearpage
 
 \subsection{NIST/NRC Experiments}
-\label{Smoke Concentration}
 
-The figures on the following pages contain comparisons of measured and predicted smoke concentration at one measuring station in the upper layer. The experiments are divided into two. Figure~\ref{smoke_closed} displays the results of the experiments in which the compartment door was closed. Figure~\ref{smoke_open} displays the results of the experiments in which the compartment door was open. The results are significantly different---the simulations of the closed door experiments predict smoke concentrations that are more than twice that of the experiments. The reason for this is that FDS has not accounted for the agglomeration and deposition of the smoke on the walls, something that is far more important when the compartment is not well-ventilated.
+The figures on the following pages contain comparisons of measured and predicted smoke transmission along an 80~cm path in an upper corner of the test compartment. The experiments are divided into two. Figure~\ref{smoke_closed} displays the results of the experiments in which the compartment door was closed. Figure~\ref{smoke_open} displays the results of the experiments in which the compartment door was open. The results are significantly different---the simulations of the closed door experiments predict significantly less transmission. The most likely reason for this is that FDS has not accounted for the agglomeration and deposition of the smoke on the walls, something that is far more important when the compartment is not well-ventilated.
 
 \newpage
 
@@ -834,7 +832,7 @@ The figures on the following pages contain comparisons of measured and predicted
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_NRC/NIST_NRC_13_Smoke} &
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_NRC/NIST_NRC_16_Smoke}
 \end{tabular*}
-\caption[NIST/NRC experiments, smoke concentration, closed door experiments]{NIST/NRC experiments, smoke concentration, closed door experiments.}
+\caption[NIST/NRC experiments, smoke transmission, closed door experiments]{NIST/NRC experiments, smoke transmission, closed door experiments.}
 \label{smoke_closed}
 \end{figure}
 
@@ -847,24 +845,14 @@ The figures on the following pages contain comparisons of measured and predicted
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_NRC/NIST_NRC_15_Smoke} &
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_NRC/NIST_NRC_18_Smoke}
 \end{tabular*}
-\caption[NIST/NRC experiments, smoke concentration, open door experiments]{NIST/NRC experiments, smoke concentration, open door experiments.}
+\caption[NIST/NRC experiments, smoke transmission, open door experiments]{NIST/NRC experiments, smoke transmission, open door experiments.}
 \label{smoke_open}
 \end{figure}
 
 
-\begin{figure}[p]
-\begin{center}
-\begin{tabular}{c}
-\includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Smoke_Concentration}
-\end{tabular}
-\end{center}
-\caption[Summary of smoke concentration predictions]{Summary of smoke concentration predictions.}
-\end{figure}
-
 \clearpage
 
 \subsection{FAA Cargo Compartments}
-\label{Smoke Obscuration}
 
 Beam obscuration measurements were made at different locations within the compartment (see Fig.~\ref{FAA_Cargo_probe_locations}). The data is presented below in terms of percent transmission per meter, $100(I/I_0)^{1/L}$, where $I$ is the light intensity and $L$ is the beam pathlength in units of meters.
 
@@ -880,14 +868,21 @@ Beam obscuration measurements were made at different locations within the compar
 \caption[FAA Cargo Compartments experiments, smoke obscuration]{FAA Cargo Compartments experiments, smoke obscuration.}
 \end{figure}
 
-\newpage
+\clearpage
 
-\begin{figure}[p]
-\begin{center}
-\begin{tabular}{c}
-\includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Smoke_Obscuration}
-\end{tabular}
-\end{center}
+\subsection{Summary, Smoke Concentration and Obscuration}
+\label{Smoke Concentration}
+\label{Smoke Obscuration}
+
+\begin{figure}[!h]
+\centering
+\includegraphics[height=3.5in]{SCRIPT_FIGURES/Scatterplots/FDS_Smoke_Concentration}
+\caption[Summary of smoke concentration predictions]{Summary of smoke concentration predictions.}
+\end{figure}
+
+\begin{figure}[!h]
+\centering
+\includegraphics[height=3.5in]{SCRIPT_FIGURES/Scatterplots/FDS_Smoke_Obscuration}
 \caption[Summary of smoke obscuration predictions]{Summary of smoke obscuration predictions.}
 \end{figure}
 
@@ -902,29 +897,24 @@ Beam obscuration measurements were made at different locations within the compar
 Figure~\ref{Sippola_Aerosol_Deposition_Velocity} compares the measured and predicted aerosol deposition velocities in the Sippola experiments, and Figure~\ref{Summary_Aerosol_Deposition_Velocity} shows a summary of the results. Details of the experiment and simulation are found in Sec.~\ref{Sippola_Aerosol_Deposition_Description}
 
 \begin{figure}[!ht]
-\begin{center}
-\begin{tabular}{c}
+\centering
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/Sippola_Aerosol_Deposition/Sippola_Aerosol_Ceiling_Deposition} \\
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/Sippola_Aerosol_Deposition/Sippola_Aerosol_Wall_Deposition} \\
 \includegraphics[height=2.15in]{SCRIPT_FIGURES/Sippola_Aerosol_Deposition/Sippola_Aerosol_Floor_Deposition}
-\end{tabular}
-\end{center}
 \caption[Predicted and measured aerosol deposition velocities, Sippola experiments]
 {Predicted and measured aerosol deposition velocities, Sippola experiments.}
 \label{Sippola_Aerosol_Deposition_Velocity}
 \end{figure}
 
 \begin{figure}[!ht]
-\begin{center}
-\begin{tabular}{c}
-\includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Aerosol_Deposition_Velocity} \\
-\vspace{0.25in} \\
-\end{tabular}
-\end{center}
-\caption[Summary of aerosol deposition velocity predictions]
-{Summary of aerosol deposition velocity predictions.}
+\centering
+\includegraphics[height=4.0in]{SCRIPT_FIGURES/Scatterplots/FDS_Aerosol_Deposition_Velocity}
+\caption[Summary of aerosol deposition velocity predictions]{Summary of aerosol deposition velocity predictions.}
 \label{Summary_Aerosol_Deposition_Velocity}
 \end{figure}
+
+
+\clearpage
 
 \subsection{NIST Soot Deposition Gauge Experiments}
 \label{Aerosol Deposition}
@@ -932,32 +922,25 @@ Figure~\ref{Sippola_Aerosol_Deposition_Velocity} compares the measured and predi
 Figure~\ref{NIST Soot Deposition Gauge deposited mass} compares the measured and predicted aerosol mass deposition velocities in the NIST Soot Deposition Gauge experiments, and Figure~\ref{Summary_NIST_SDG} shows a summary of the results. Details of the experiment and simulation are found in Sec.~\ref{NIST_SDG_Description}
 
 \begin{figure}[!ht]
-   \begin{center}
-      \begin{tabular}{c}
-         \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Deposition_Gauge/NIST_SDG_100} \\
-         \includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Deposition_Gauge/NIST_SDG_200}
-      \end{tabular}
-   \end{center}
-   \caption[Predicted and measured aerosol deposited mass, NIST Soot Deposition Gauge exp]
-   {Predicted and measured aerosol deposited mass, NIST Soot Deposition Gauge experiments.}
-   \label{NIST Soot Deposition Gauge deposited mass}
+\centering
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Deposition_Gauge/NIST_SDG_100} \\
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Deposition_Gauge/NIST_SDG_200}
+\caption[Predicted and measured aerosol deposited mass, NIST Soot Deposition Gauge exp]
+{Predicted and measured aerosol deposited mass, NIST Soot Deposition Gauge experiments.}
+\label{NIST Soot Deposition Gauge deposited mass}
 \end{figure}
 
 \begin{figure}[!ht]
-   \begin{center}
-      \begin{tabular}{c}
-         \includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Aerosol_Deposition} \\
-         \vspace{0.25in} \\
-      \end{tabular}
-   \end{center}
-   \caption[Summary of aerosol deposited mass predictions]
-   {Summary of aerosol deposited mass predictions.}
-   \label{Summary_NIST_SDG}
+\centering
+\includegraphics[height=4.0in]{SCRIPT_FIGURES/Scatterplots/FDS_Aerosol_Deposition} \\
+\caption[Summary of aerosol deposited mass predictions]{Summary of aerosol deposited mass predictions.}
+\label{Summary_NIST_SDG}
 \end{figure}
 
 \clearpage
 
 \section{Droplet Evaporation}
+\label{Evaporation Rate}
 
 This section presents the results of simulations of liquid droplet evaporation experiments. The titles of the sections below are named for the experimentalists.
 
@@ -966,11 +949,11 @@ This section presents the results of simulations of liquid droplet evaporation e
 A description of the experiments is included in Sec.~\ref{Ranz_Marshall_Description}. Figure~\ref{RM_Fig_8} shows the results of predicting the drop diameter of a single droplet evaporating in dry air.
 
 \begin{figure}[!h]
-    \centering
-    \includegraphics[height=2.15in]{SCRIPT_FIGURES/Ranz_Marshall/Ranz_Marshall_Time_Dep}
-    \caption[Droplet diameter for the Ranz and Marshall experiment]
-    {Measured and predicted droplet diameter for the Ranz and Marshall experiment shown in Fig.~8 of \cite{Ranz}.}
-    \label{RM_Fig_8}
+\centering
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/Ranz_Marshall/Ranz_Marshall_Time_Dep}
+\caption[Droplet diameter for the Ranz and Marshall experiment]
+{Measured and predicted droplet diameter for the Ranz and Marshall experiment shown in Fig.~8 of \cite{Ranz}.}
+\label{RM_Fig_8}
 \end{figure}
 
 Figure~\ref{RM_Tables} compares the measured and predicted evaporation rates for Table 1 through Table 4 in \cite{Ranz}. The Table 1 experiments were water droplets in ambient air, the Table 2 experiments were water droplets at in warm air (less than boiling), the Table 3 experiments were water droplets in hot air (greater than boiling), and the Table 4 experiments were benzene droplets in ambient air.  A summary of the results is shown in Fig.~\ref{RM_Summary}.
@@ -987,14 +970,10 @@ Figure~\ref{RM_Tables} compares the measured and predicted evaporation rates for
 \end{figure}
 
 \begin{figure}[!ht]
-   \begin{center}
-      \begin{tabular}{c}
-         \includegraphics[height=3.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Evaporation_Rate} \\
-         \vspace{0.25in} \\
-      \end{tabular}
-   \end{center}
-   \caption[Summary of evaporation rates for the Ranz and Marshall experiments]{Summary of evaporation rates for the Ranz and Marshall experiments~\cite{Ranz}.}
-   \label{RM_Summary}
+\centering
+\includegraphics[height=3.0in]{SCRIPT_FIGURES/Scatterplots/FDS_Evaporation_Rate}
+\caption[Summary of evaporation rates for the Ranz and Marshall experiments]{Summary of evaporation rates for the Ranz and Marshall experiments~\cite{Ranz}.}
+\label{RM_Summary}
 \end{figure}
 
 \FloatBarrier
@@ -1874,47 +1853,31 @@ The mean centerline temperature profiles are found in Sec.~\ref{NIST_Pool_Fires_
 \caption[NIST Pool Fires, centerline product species, propane, 34 kW]{NIST Pool Fires, centerline product species, propane, 34 kW.}
 \label{NIST_Pool_Fires_Propane_34kW}
 \end{figure}
+
+\begin{figure}[p]
+\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_O2_CL} &
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_Fuel_CL} \\
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_CO2_CL} &
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_CO_CL}    \\
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_H2O_CL} &
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_H2_CL} \\
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_N2_CL} &
+\includegraphics[height=2.15in]{SCRIPT_FIGURES/NIST_Pool_Fires/NIST_Propane_50kW_Soot_CL}
+\end{tabular*}
+\caption[NIST Pool Fires, centerline product species, propane, 50 kW]{NIST Pool Fires, centerline product species, propane, 50 kW.}
+\label{NIST_Pool_Fires_Propane_50kW}
+\end{figure}
+
 \clearpage
 
-%\subsection{PRISME DOOR Experiments}
-%
-%Each compartment in the PRISME DOOR experiments contained carbon monoxide measurements in the upper (haut) and lower (bas) layers.
-%
-%\begin{figure}[!ht]
-%\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D1_Room_1_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D2_Room_1_CO} \\
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D3_Room_1_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D4_Room_1_CO} \\
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D5_Room_1_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D6_Room_1_CO}
-%\end{tabular*}
-%\label{PRISME_CO_1}
-%\end{figure}
-%
-%\begin{figure}[p]
-%\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D1_Room_2_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D2_Room_2_CO} \\
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D3_Room_2_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D4_Room_2_CO} \\
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D5_Room_2_CO} &
-%\includegraphics[height=2.15in]{SCRIPT_FIGURES/PRISME/PRS_D6_Room_2_CO}
-%\end{tabular*}
-%\label{PRISME_CO_2}
-%\end{figure}
-%
-%\clearpage
 
 \subsection{Summary, Products of Incomplete Combustion}
 \label{Carbon Monoxide Concentration}
 
 \begin{figure}[h]
-\begin{center}
-\begin{tabular}{c}
-\includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Carbon_Monoxide_Concentration}
-\end{tabular}
-\end{center}
+\centering
+\includegraphics[height=4.0in]{SCRIPT_FIGURES/Scatterplots/FDS_Carbon_Monoxide_Concentration}
 \caption[Summary of carbon monoxide predictions]{Summary of carbon monoxide predictions.}
 \label{Summary_CO_Concentration}
 \end{figure}
@@ -1997,11 +1960,8 @@ Label        &  Duration (h)     &  Location         &  Configuration           
 \end{figure}
 
 \begin{figure}[p]
-\begin{center}
-\begin{tabular}{c}
-\includegraphics[height=4.0in]{SCRIPT_FIGURES/ScatterPlots/FDS_Species_Concentration}
-\end{tabular}
-\end{center}
+\centering
+\includegraphics[height=4.0in]{SCRIPT_FIGURES/Scatterplots/FDS_Species_Concentration}
 \caption[Summary of species concentration predictions]{Summary of species concentration predictions.}
 \label{Summary_Species_Concentration}
 \end{figure}

@@ -7,7 +7,7 @@
 
 &MISC SIMULATION_MODE='SVLES', TMPA=32. /
 
-&WIND SPEED=4.6, DIRECTION=270., L=-500., Z_0=0.03 /
+&WIND SPEED=4.6, Z_REF=2., DIRECTION=270., L=-500., Z_0=0.03 /
 
 &SURF ID='IGNITION', HRRPUA=1500., COLOR='RED', TMP_FRONT=100., RAMP_Q='ignitor' /
 &RAMP ID='ignitor', T= 0., F=0. /
@@ -47,7 +47,7 @@
 
 &SURF ID                        = 'wet vegetation'
       MATL_ID(1,1:1)            = 'GENERIC VEGETATION'
-      MOISTURE_FRACTION         = 0.063
+      MOISTURE_CONTENT         = 0.063
       SURFACE_VOLUME_RATIO      = 9770.
       LENGTH                    = 0.20
       GEOMETRY                  = 'CYLINDRICAL' /

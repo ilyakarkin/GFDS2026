@@ -1074,7 +1074,9 @@ MODULE G_VELO
         SUBROUTINE SYNC_EDGE_VELOCITY_AVG_D2H(NM)
             INTEGER, INTENT(IN) :: NM
             INTEGER :: EDGE_LB,EDGE_UB,IE
-            REAL(EB), ALLOCATABLE :: EDGE_U_AVG_H(:),EDGE_V_AVG_H(:),EDGE_W_AVG_H(:)
+            ! Host buffers kept between calls: allocating them for every mesh and output step cost more than the copy
+            ! itself (first-touch page faults of several MB per mesh)
+            REAL(EB), ALLOCATABLE, SAVE :: EDGE_U_AVG_H(:),EDGE_V_AVG_H(:),EDGE_W_AVG_H(:)
 
             CALL POINT_TO_MESH(NM)
             GM => GPU_MESHES(NM)
@@ -1088,20 +1090,24 @@ MODULE G_VELO
 
             CALL GPU_WAIT(GM%STRM)
 
-            ALLOCATE(EDGE_U_AVG_H(EDGE_LB:EDGE_UB))
-            ALLOCATE(EDGE_V_AVG_H(EDGE_LB:EDGE_UB))
-            ALLOCATE(EDGE_W_AVG_H(EDGE_LB:EDGE_UB))
-            EDGE_U_AVG_H = GM%EDGE_U_AVG(EDGE_LB:EDGE_UB)
-            EDGE_V_AVG_H = GM%EDGE_V_AVG(EDGE_LB:EDGE_UB)
-            EDGE_W_AVG_H = GM%EDGE_W_AVG(EDGE_LB:EDGE_UB)
+            IF (ALLOCATED(EDGE_U_AVG_H)) THEN
+                IF (LBOUND(EDGE_U_AVG_H,1)>EDGE_LB .OR. UBOUND(EDGE_U_AVG_H,1)<EDGE_UB) &
+                    DEALLOCATE(EDGE_U_AVG_H,EDGE_V_AVG_H,EDGE_W_AVG_H)
+            ENDIF
+            IF (.NOT.ALLOCATED(EDGE_U_AVG_H)) THEN
+                ALLOCATE(EDGE_U_AVG_H(EDGE_LB:EDGE_UB))
+                ALLOCATE(EDGE_V_AVG_H(EDGE_LB:EDGE_UB))
+                ALLOCATE(EDGE_W_AVG_H(EDGE_LB:EDGE_UB))
+            ENDIF
+            EDGE_U_AVG_H(EDGE_LB:EDGE_UB) = GM%EDGE_U_AVG(EDGE_LB:EDGE_UB)
+            EDGE_V_AVG_H(EDGE_LB:EDGE_UB) = GM%EDGE_V_AVG(EDGE_LB:EDGE_UB)
+            EDGE_W_AVG_H(EDGE_LB:EDGE_UB) = GM%EDGE_W_AVG(EDGE_LB:EDGE_UB)
 
             DO IE=EDGE_LB,EDGE_UB
                 EDGE(IE)%U_AVG = EDGE_U_AVG_H(IE)
                 EDGE(IE)%V_AVG = EDGE_V_AVG_H(IE)
                 EDGE(IE)%W_AVG = EDGE_W_AVG_H(IE)
             ENDDO
-
-            DEALLOCATE(EDGE_U_AVG_H,EDGE_V_AVG_H,EDGE_W_AVG_H)
 
         END SUBROUTINE SYNC_EDGE_VELOCITY_AVG_D2H
 
@@ -1599,8 +1605,12 @@ MODULE G_VELO
 
             CFL = DT*UVWMAX
 
+            ! Particle CFL as in velo.f90:CHECK_STABILITY. PART_UVWMAX of this mesh is computed on the host by part.f90
+            ! (INSERT_ALL_PARTICLES of this predictor, MOVE_PARTICLES and PARTICLE_MASS_ENERGY_TRANSFER of the last
+            ! corrector, GPU_PARTICLES_CORRECTOR), in the same order as in MAIN_LOOP.
             ! Include surface vegetation drag if necessary
-            PART_CFL = 0._EB
+            IF (DRAG_UVWMAX>0._EB) PART_UVWMAX = MAX(PART_UVWMAX,DRAG_UVWMAX)
+            PART_CFL = DT*PART_UVWMAX
 
             PARABOLIC_IF: IF (CHECK_VN) THEN
 
@@ -1621,8 +1631,25 @@ MODULE G_VELO
 
             ENDIF PARABOLIC_IF
 
-            ! Attempt DT restriction to avoid clippings
+            ! Attempt DT restriction to avoid clippings (velo.f90 CHECK_STABILITY). With DENSITY_GPU the clipping flags of
+            ! the predictor DENSITY of this pass were read back with the CFL (MR_CLIP); otherwise the host DENSITY set them.
+            IF (DENSITY_GPU_ON) THEN
+                I0 = MESH_REDUCE_OFFSET(MR_CLIP,NM)
+                CLIP_RHOMIN = MESH_REDUCE_H(I0+1)>0.5_EB
+                CLIP_RHOMAX = MESH_REDUCE_H(I0+2)>0.5_EB
+            ENDIF
             DT_CLIP = HUGE(1._EB)
+            IF (CLIP_RHOMIN .OR. CLIP_RHOMAX) THEN
+                IF (DT_RESTRICT_COUNT>=CLIP_DT_RESTRICTIONS_MAX) THEN
+                    IF (CLIP_RHOMIN) WRITE(LU_ERR,'(A,F8.3,A,I0)') 'WARNING: Minimum density, ',RHOMIN,' kg/m3, clipped in Mesh ',NM
+                    IF (CLIP_RHOMAX) WRITE(LU_ERR,'(A,F8.3,A,I0)') 'WARNING: Maximum density, ',RHOMAX,' kg/m3, clipped in Mesh ',NM
+                ELSE
+                    CFL = HUGE(1._EB)
+                    DT_CLIP = DT
+                    DT_RESTRICT_COUNT = DT_RESTRICT_COUNT + 1
+                    DT_RESTRICT_STORE = MAX(DT_RESTRICT_STORE,DT_RESTRICT_COUNT)
+                ENDIF
+            ENDIF
 
             RAMP_TIME_IF: IF (RAMP_TIME_INDEX>0) THEN
 

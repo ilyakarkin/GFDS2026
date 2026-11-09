@@ -161,7 +161,7 @@ MODULE G_HT1D
             INTEGER, ALLOCATABLE :: INT_RAD_H(:)
             REAL(EB), ALLOCATABLE :: TWO_DX_KAPPA_H(:)
             REAL(EB) :: VOLSUM,KAPSUM,RHO_ADJ
-            INTEGER :: LI
+            INTEGER :: LI,SURF_BACK
 
             M => MESHES(NM)
             GM => GPU_MESHES(NM)
@@ -308,11 +308,30 @@ MODULE G_HT1D
                 IF (ONE_D%BACK_INDEX==0 .AND. GM%HT1D_BACKING_H(IL)==EXPOSED) GM%HT1D_BACKING_H(IL) = VOID
                 H_FIXED_B_H(IL) = SF%H_FIXED_B
                 TMP_G_BACK_H(IL) = SF%TMP_GAS_BACK
-                RAMP_H_FIXED_B_H(IL) = SF%RAMP_H_FIXED_B_INDEX
+                ! wall.f90 takes the back HTC from HEAT_TRANSFER_COEFFICIENT(...,BACK_SIDE=.TRUE.), whose CONSTANT_HTC
+                ! scales H_FIXED_B by the RAMP of the front, SF%RAMP_H_FIXED_INDEX (RAMP_H_FIXED_B_INDEX is not used)
+                RAMP_H_FIXED_B_H(IL) = SF%RAMP_H_FIXED_INDEX
                 RAMP_TMP_G_BACK_H(IL) = SF%RAMP(TIME_TGB)%INDEX
                 RAMP_TB_H(IL) = SF%RAMP(TIME_TB)%INDEX
                 TMP_BACK_H(IL) = SF%TMP_BACK
-                IF (SF%EMISSIVITY_BACK_SPECIFIED) THEN
+                ! wall.f90, EXPOSED: the emissivity of the SURF on the back wall (SF_BACK) if specified, then
+                ! SF%EMISSIVITY_BACK, then the solid's own (GET_EMISSIVITY); the back wall of another mesh also has its
+                ! SURF_INDEX here (INITIALIZE_BACK_WALL_EXCHANGE). The exposed back of a line keeps this value.
+                SURF_BACK = 0
+                IF (GM%HT1D_BACKING_H(IL)==EXPOSED .AND. ONE_D%BACK_MESH>=1 .AND. ONE_D%BACK_MESH<=NMESHES) THEN
+                    IF (ALLOCATED(MESHES(ONE_D%BACK_MESH)%WALL)) THEN
+                        IF (ONE_D%BACK_INDEX>=LBOUND(MESHES(ONE_D%BACK_MESH)%WALL,1) .AND. &
+                            ONE_D%BACK_INDEX<=UBOUND(MESHES(ONE_D%BACK_MESH)%WALL,1)) &
+                            SURF_BACK = MESHES(ONE_D%BACK_MESH)%WALL(ONE_D%BACK_INDEX)%SURF_INDEX
+                    ENDIF
+                    IF (SURF_BACK<LBOUND(SURFACE,1) .OR. SURF_BACK>UBOUND(SURFACE,1)) SURF_BACK = 0
+                    IF (SURF_BACK>0) THEN
+                        IF (.NOT.SURFACE(SURF_BACK)%EMISSIVITY_SPECIFIED) SURF_BACK = 0
+                    ENDIF
+                ENDIF
+                IF (SURF_BACK>0) THEN
+                    EMISSIVITY_B_H(IL) = SURFACE(SURF_BACK)%EMISSIVITY
+                ELSEIF (SF%EMISSIVITY_BACK_SPECIFIED) THEN
                     EMISSIVITY_B_H(IL) = SF%EMISSIVITY_BACK
                 ELSE
                     CALL GET_EMISSIVITY(ONE_D,NWP,EMISSIVITY_B_H(IL))
@@ -390,7 +409,7 @@ MODULE G_HT1D
                 ENDDO
                 DO NL=1,ONE_D%N_LAYERS
                     DO I=1,NMATL
-                        DENSITY_ADJUST_H(MATL_LAYER_OFFSET_H(IL)+(NL-1)*NMATL+I-1) = SF%DENSITY_ADJUST_FACTOR(NL,I)
+                        DENSITY_ADJUST_H(MATL_LAYER_OFFSET_H(IL)+(NL-1)*NMATL+I-1) = SF%DENSITY_ADJUST_FACTOR(MIN(MAX_LAYERS,NL),I)
                     ENDDO
                 ENDDO
                 DO I=0,NWP+1
@@ -847,7 +866,7 @@ MODULE G_HT1D
                 A_H = GM%HT1D_TMP_G_B_D     ; CALL SAVE_LINE_VALUES(1)
                 A_H = GM%HT1D_HTCB_D        ; CALL SAVE_LINE_VALUES(2)
                 A_H = GM%HT1D_Q_RAD_IN_B_D  ; CALL SAVE_LINE_VALUES(3)
-                A_H = GM%HT1D_EMISSIVITY_B_D; CALL SAVE_LINE_VALUES(4)
+                ! EMISSIVITY_B_D is a setup value (wall.f90 EXPOSED order), recomputed by INITIALIZE_GPU_HT1D
                 DEALLOCATE(A_H)
             ENDIF
 
@@ -882,7 +901,6 @@ MODULE G_HT1D
                 A_H = GM%HT1D_TMP_G_B_D     ; CALL RESTORE_LINE_VALUES(1) ; GM%HT1D_TMP_G_B_D      = A_H
                 A_H = GM%HT1D_HTCB_D        ; CALL RESTORE_LINE_VALUES(2) ; GM%HT1D_HTCB_D         = A_H
                 A_H = GM%HT1D_Q_RAD_IN_B_D  ; CALL RESTORE_LINE_VALUES(3) ; GM%HT1D_Q_RAD_IN_B_D   = A_H
-                A_H = GM%HT1D_EMISSIVITY_B_D; CALL RESTORE_LINE_VALUES(4) ; GM%HT1D_EMISSIVITY_B_D = A_H
                 DEALLOCATE(A_H)
             ENDIF
             DEALLOCATE(HT1D_SAVED(NM)%VALID,HT1D_SAVED(NM)%VALUES)
@@ -1374,7 +1392,7 @@ MODULE G_HT1D
                     ! TMP_B_D keeps this line's own back surface temperature (B1%TMP_B in wall.f90), not the back wall's TMP_F
                     HTCB_D(LINE) = MAX(0._EB,WALL_HEAT_TRANS_COEF_D(IW))
                     Q_RAD_IN_B_D(LINE) = WALL_Q_RAD_IN_D(IW)
-                    EMISSIVITY_B_D(LINE) = MAX(0._EB,WALL_EMISSIVITY_D(IW))
+                    ! EMISSIVITY_B_D keeps the value set at setup (wall.f90 EXPOSED: SF_BACK, SF, solid)
                     RAD_BACK_D(LINE) = RADIATION_FLAG
                 ENDIF
             ELSE

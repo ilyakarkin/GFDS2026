@@ -46,20 +46,60 @@ MODULE G_INIT
         SUBROUTINE CHECK_GPU_WALL_SETUP
             ! Refuse (SHUTDOWN, the caller then calls STOP_CHECK(1) on all processes) a thermally thick WALL cell that
             ! has no device HT1D line, with the reason given by GET_HT1D_LINE_SIZE.
-            USE GLOBAL_CONSTANTS, ONLY: PYROLYSIS_PREDICTED
-            USE TYPES, ONLY: MATERIAL,BOUNDARY_ONE_D_TYPE
+            USE GLOBAL_CONSTANTS, ONLY: PYROLYSIS_PREDICTED,SPECIFIED_MASS_FLUX,N_TRACKED_SPECIES
+            USE TYPES, ONLY: MATERIAL,BOUNDARY_ONE_D_TYPE,OBSTRUCTION_TYPE
             USE COMP_FUNCTIONS, ONLY: SHUTDOWN
             USE G_HT1D, ONLY: GET_HT1D_LINE_SIZE
-            INTEGER :: NM,IW,N,NMATL,ML_INDEX,NWP
+            INTEGER :: NM,IW,N,NMATL,ML_INDEX,NWP,IOR,SURF_THIN
             LOGICAL :: PYRO,ELIGIBLE
             CHARACTER(MESSAGE_LENGTH) :: MESSAGE
             CHARACTER(120) :: REASON,MATL_LIST
             TYPE(WALL_TYPE), POINTER :: WC
             TYPE(SURFACE_TYPE), POINTER :: SF
             TYPE(BOUNDARY_ONE_D_TYPE), POINTER :: ONE_D
+            TYPE(OBSTRUCTION_TYPE), POINTER :: OB
 
             IF (.NOT.WALL_BC_ON) RETURN
             MESH_LOOP: DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                ! A specified mass flux (HRRPUA, MLRPUA, MASS_FLUX) on a thin (zero cells thick) obstruction face: wall.f90
+                ! sets UN=0 there and adds the gas to the adjacent cell as a volume source (D_SOURCE, M_DOT_PPP); the GPU
+                ! wall kernels have no such branch and blow the gas through the face. wall.f90 takes that branch where the
+                ! cell behind the face is neither SOLID nor EXTERIOR, which is WC%THIN (init.f90): the wall cells are
+                ! checked below. A hidden (not yet created) thin obstruction is refused here already, unless its thin
+                ! plane is on the mesh boundary, where the cell behind the face is EXTERIOR and the ordinary mass flux
+                ! boundary condition applies; this check is repeated after every creation or removal.
+                IF (N_TRACKED_SPECIES>1) THEN
+                    SURF_THIN = 0
+                    DO N=1,MESHES(NM)%N_OBST
+                        OB => MESHES(NM)%OBSTRUCTION(N)
+                        IF (.NOT.OB%THIN .OR. .NOT.OB%HIDDEN) CYCLE
+                        IF (OB%I1==OB%I2 .AND. (OB%I1==0 .OR. OB%I1==MESHES(NM)%IBAR)) CYCLE
+                        IF (OB%J1==OB%J2 .AND. (OB%J1==0 .OR. OB%J1==MESHES(NM)%JBAR)) CYCLE
+                        IF (OB%K1==OB%K2 .AND. (OB%K1==0 .OR. OB%K1==MESHES(NM)%KBAR)) CYCLE
+                        DO IOR=-3,3
+                            IF (IOR==0) CYCLE
+                            IF (OB%SURF_INDEX(IOR)<1) CYCLE
+                            IF (SURFACE(OB%SURF_INDEX(IOR))%SPECIES_BC_INDEX==SPECIFIED_MASS_FLUX) SURF_THIN = OB%SURF_INDEX(IOR)
+                        ENDDO
+                    ENDDO
+                    DO IW=1,MESHES(NM)%N_EXTERNAL_WALL_CELLS+MESHES(NM)%N_INTERNAL_WALL_CELLS
+                        WC => MESHES(NM)%WALL(IW)
+                        IF (.NOT.WC%THIN .OR. WC%SURF_INDEX<1 .OR. WC%SURF_INDEX>SIZE(SURFACE)) CYCLE
+                        IF (SURFACE(WC%SURF_INDEX)%SPECIES_BC_INDEX==SPECIFIED_MASS_FLUX) SURF_THIN = WC%SURF_INDEX
+                    ENDDO
+                    IF (SURF_THIN>0) THEN
+                        ! a long SURF name is cut (40 characters, '...' marks a cut) to fit MESSAGE
+                        IF (LEN_TRIM(SURFACE(SURF_THIN)%ID)>40) THEN
+                            REASON = SURFACE(SURF_THIN)%ID(1:37)//'...'
+                        ELSE
+                            REASON = SURFACE(SURF_THIN)%ID
+                        ENDIF
+                        WRITE(MESSAGE,'(3A)') 'ERROR: GPU: HRRPUA, MLRPUA or MASS_FLUX on a thin obstruction (SURF ', &
+                            TRIM(REASON),') is not supported; run this case with --c'
+                        CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
+                        EXIT MESH_LOOP
+                    ENDIF
+                ENDIF
                 DO IW=1,MESHES(NM)%N_EXTERNAL_WALL_CELLS+MESHES(NM)%N_INTERNAL_WALL_CELLS
                     WC => MESHES(NM)%WALL(IW)
                     IF (WC%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
@@ -103,7 +143,14 @@ MODULE G_INIT
                     IF (HT1D_GPU_WALL_ACTIVE(NM,IW)) CYCLE
                     CALL GET_HT1D_LINE_SIZE(NM,IW,ELIGIBLE,NWP,NMATL,REASON)
                     IF (ELIGIBLE) REASON = 'the state of the back side'
-                    WRITE(MESSAGE,'(5A)') 'ERROR: GPU: thermally thick SURF ',TRIM(SF%ID),' with ',TRIM(REASON), &
+                    ! the message must fit MESSAGE (MESSAGE_LENGTH=200): a long SURF name is cut (40 characters, '...'
+                    ! marks a cut); the reasons of GET_HT1D_LINE_SIZE are shorter than 80 characters
+                    IF (LEN_TRIM(SF%ID)>40) THEN
+                        MATL_LIST = SF%ID(1:37)//'...'
+                    ELSE
+                        MATL_LIST = SF%ID
+                    ENDIF
+                    WRITE(MESSAGE,'(5A)') 'ERROR: GPU: thermally thick SURF ',TRIM(MATL_LIST),' with ',TRIM(REASON(1:80)), &
                         ' is not supported; run this case with --c'
                     CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
                     EXIT MESH_LOOP
@@ -117,6 +164,16 @@ MODULE G_INIT
             ! MINMOD and CHARM limiters of func.f90 GET_SCALAR_FACE_VALUE; MP5 has no GPU implementation.
             IF (I_FLUX_LIMITER==MP5_LIMITER) THEN
                 CALL SHUTDOWN('ERROR: GPU: FLUX_LIMITER=MP5 is not supported; run this case with --c',PROCESS_0_ONLY=.FALSE.)
+            ENDIF
+            ! Cut cells (GEOM, or MISC CC_IBM) have no device implementation: the GPU time loop never calls the CC_* routines
+            ! of main.f90 (CC_DENSITY, CC_END_STEP, CCCOMPUTE_RADIATION, ...).
+            IF (CC_IBM) THEN
+                CALL SHUTDOWN('ERROR: GPU: complex geometry (GEOM, CC_IBM) is not supported; run this case with --c', &
+                              PROCESS_0_ONLY=.FALSE.)
+            ENDIF
+            ! The device chemistry integrates only EXPLICIT EULER and RK2 RICHARDSON; CVODE (fire.f90) has no device version.
+            IF (COMBUSTION_ODE_SOLVER==CVODE_SOLVER) THEN
+                CALL SHUTDOWN('ERROR: GPU: ODE_SOLVER=CVODE is not supported; run this case with --c',PROCESS_0_ONLY=.FALSE.)
             ENDIF
         END SUBROUTINE CHECK_GPU_NUMERICS_SETUP
 
@@ -867,7 +924,7 @@ MODULE G_INIT
                                     SF_QREF_INDEX_H(:,:),SF_E2T_INDEX_H(:,:),SF_THICK2QREF_H(:,:,:)
             INTEGER, ALLOCATABLE :: SF_RAMP_HEAT_INDEX_H(:), SF_RAMP_TEMP_INDEX_H(:), SF_RAMP_VELO_INDEX_H(:), &
                                     SF_RAMP_EFLUX_INDEX_H(:), SF_RAMP_MF_INDEX_H(:,:)
-            LOGICAL, ALLOCATABLE :: SF_ADIABATIC_H(:),SF_INERT_Q_REF_H(:)
+            LOGICAL, ALLOCATABLE :: SF_ADIABATIC_H(:),SF_INERT_Q_REF_H(:),SF_SET_H_H(:)
             REAL(EB), ALLOCATABLE :: EDGE_OMEGA_H(:,:) , EDGE_TAU_H(:,:)
 
             TYPE(WALL_TOPO_AOS_TYPE), ALLOCATABLE :: WALL_TOPO_AOS_H(:)
@@ -1063,6 +1120,7 @@ MODULE G_INIT
             IF (.NOT.ALLOCATED(SF_RAMP_MF_INDEX)) ALLOCATE(SF_RAMP_MF_INDEX(GPU_SURF_LB:GPU_SURF_UB,1:N_TRACKED_SPECIES))
             IF (.NOT.ALLOCATED(SF_RAMP_MF_TAU)) ALLOCATE(SF_RAMP_MF_TAU(GPU_SURF_LB:GPU_SURF_UB,1:N_TRACKED_SPECIES))
             IF (.NOT.ALLOCATED(SF_ADIABATIC)) ALLOCATE(SF_ADIABATIC(GPU_SURF_LB:GPU_SURF_UB))
+            IF (.NOT.ALLOCATED(SF_SET_H)) ALLOCATE(SF_SET_H(GPU_SURF_LB:GPU_SURF_UB))
             IF (.NOT.ALLOCATED(SF_INERT_Q_REF)) ALLOCATE(SF_INERT_Q_REF(GPU_SURF_LB:GPU_SURF_UB))
 
             IF (.NOT.ALLOCATED(RAMP_NPOINTS_D)) ALLOCATE(RAMP_NPOINTS_D(0:RAMP_UB))
@@ -1215,7 +1273,7 @@ MODULE G_INIT
             ALLOCATE(SF_RAMP_MF_TAU_H(GPU_SURF_LB:GPU_SURF_UB,1:N_TRACKED_SPECIES))
             ALLOCATE(SPECIES_ZZ0_H(1:N_TRACKED_SPECIES))
             ALLOCATE(SPECIES_RCON_H(1:N_TRACKED_SPECIES))
-            ALLOCATE(SF_ADIABATIC_H(GPU_SURF_LB:GPU_SURF_UB))
+            ALLOCATE(SF_ADIABATIC_H(GPU_SURF_LB:GPU_SURF_UB),SF_SET_H_H(GPU_SURF_LB:GPU_SURF_UB))
             ALLOCATE(SF_INERT_Q_REF_H(GPU_SURF_LB:GPU_SURF_UB))
             ALLOCATE(SURF_VELOCITY_BC_INDEX_H(GPU_SURF_LB:GPU_SURF_UB))
             ALLOCATE(SURF_SPECIFIED_NORMAL_VELOCITY_H(GPU_SURF_LB:GPU_SURF_UB))
@@ -1245,6 +1303,7 @@ MODULE G_INIT
                 SF_SPECIES_BC_INDEX_H(IW) = SURFACE(IW)%SPECIES_BC_INDEX
                 SF_PYROLYSIS_MODEL_H(IW) = SURFACE(IW)%PYROLYSIS_MODEL
                 SF_ADIABATIC_H(IW) = SURFACE(IW)%ADIABATIC
+                SF_SET_H_H(IW) = SURFACE(IW)%SET_H
                 SF_INERT_Q_REF_H(IW) = SURFACE(IW)%INERT_Q_REF
                 SF_MASS_FRACTION_H(IW,1:N_TRACKED_SPECIES) = SURFACE(IW)%MASS_FRACTION(1:N_TRACKED_SPECIES)
                 SF_MASS_FLUX_H(IW,1:N_TRACKED_SPECIES) = SURFACE(IW)%MASS_FLUX(1:N_TRACKED_SPECIES)
@@ -1352,6 +1411,7 @@ MODULE G_INIT
                 SF_RAMP_MF_TAU(:,N)   = SF_RAMP_MF_TAU_H(:,N)
             ENDDO
             SF_ADIABATIC = SF_ADIABATIC_H
+            SF_SET_H = SF_SET_H_H
             SF_INERT_Q_REF = SF_INERT_Q_REF_H
             SURF_VELOCITY_BC_INDEX = SURF_VELOCITY_BC_INDEX_H
             SURF_SPECIFIED_NORMAL_VELOCITY     = SURF_SPECIFIED_NORMAL_VELOCITY_H
@@ -1387,7 +1447,7 @@ MODULE G_INIT
             DEALLOCATE(SF_RAMP_HEAT_INDEX_H, SF_RAMP_TEMP_INDEX_H, SF_RAMP_VELO_INDEX_H, SF_RAMP_EFLUX_INDEX_H, STAT=ISTAT)
             DEALLOCATE(SF_RAMP_HEAT_TAU_H, SF_RAMP_TEMP_TAU_H, SF_RAMP_VELO_TAU_H, SF_RAMP_EFLUX_TAU_H, STAT=ISTAT)
             DEALLOCATE(SF_RAMP_MF_INDEX_H, SF_RAMP_MF_TAU_H, STAT=ISTAT)
-            DEALLOCATE(SF_ADIABATIC_H,SF_INERT_Q_REF_H,STAT=ISTAT)
+            DEALLOCATE(SF_ADIABATIC_H,SF_INERT_Q_REF_H,SF_SET_H_H,STAT=ISTAT)
             DEALLOCATE(SURF_VELOCITY_BC_INDEX_H, STAT=ISTAT)
             DEALLOCATE(SURF_SPECIFIED_NORMAL_VELOCITY_H, SURF_SPECIFIED_TANGENTIAL_VELOCITY_H, STAT=ISTAT)
             DEALLOCATE(SURF_SPECIFIED_NORMAL_GRADIENT_H, STAT=ISTAT)
@@ -1891,20 +1951,22 @@ MODULE G_INIT
                 ALLOCATE(GM%DIF_FXSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FXSD = 0._EB
                 ALLOCATE(GM%DIF_FYSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FYSD = 0._EB
                 ALLOCATE(GM%DIF_FZSD(0:IBP1,0:JBP1,0:KBP1,N_TOTAL_SCALARS)) ; GM%DIF_FZSD = 0._EB
-                BLOCK
-                    INTEGER, ALLOCATABLE :: THIN_NEG_H(:)
-                    INTEGER :: IW_T
-                    ALLOCATE(THIN_NEG_H(0:MAX(0,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS)))
-                    THIN_NEG_H = 0
-                    DO IW_T=1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
-                        IF (WALL(IW_T)%BC_INDEX<=0) CYCLE
-                        IF (WALL(IW_T)%THIN .AND. BOUNDARY_COORD(WALL(IW_T)%BC_INDEX)%IOR<0) THIN_NEG_H(IW_T) = 1
-                    ENDDO
-                    ALLOCATE(GM%WALL_THIN_NEG_D(0:UBOUND(THIN_NEG_H,1)))
-                    GM%WALL_THIN_NEG_D = THIN_NEG_H
-                    DEALLOCATE(THIN_NEG_H)
-                END BLOCK
             ENDIF
+            ! divg.f90 skips the IOR<0 side of a thin obstruction face after B1%RHO_D_DZDN_F is stored, so that only
+            ! one side sets the face fluxes (WC%THIN is set once, in INIT_WALL_CELL, and not changed afterwards)
+            BLOCK
+                INTEGER, ALLOCATABLE :: THIN_NEG_H(:)
+                INTEGER :: IW_T
+                ALLOCATE(THIN_NEG_H(0:MAX(0,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS)))
+                THIN_NEG_H = 0
+                DO IW_T=1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
+                    IF (WALL(IW_T)%BC_INDEX<=0) CYCLE
+                    IF (WALL(IW_T)%THIN .AND. BOUNDARY_COORD(WALL(IW_T)%BC_INDEX)%IOR<0) THIN_NEG_H(IW_T) = 1
+                ENDDO
+                ALLOCATE(GM%WALL_THIN_NEG_D(0:UBOUND(THIN_NEG_H,1)))
+                GM%WALL_THIN_NEG_D = THIN_NEG_H
+                DEALLOCATE(THIN_NEG_H)
+            END BLOCK
             ! FDS 6.11.1 (92299c9b7a): the face values are initialized (RHOA*ZZ0) and enter INTERPOLATED_BC
             DO N=1,N_TOTAL_SCALARS
                 GM%FXD(:,:,:,N) = MESHES(NM)%FX(:,:,:,N)
@@ -2082,7 +2144,7 @@ MODULE G_INIT
                     REAL(EB) :: SC_FAC(N_TRACKED_SPECIES)
                     DO N=1,N_TRACKED_SPECIES
                         SC_FAC(N) = 1._EB
-                        IF (SPECIES_MIXTURE(N)%SC_T_USER>TWENTY_EPSILON_EB) SC_FAC(N) = SC/SPECIES_MIXTURE(N)%SC_T_USER
+                        IF (SPECIES_MIXTURE(N)%SC_T_USER>TWENTY_EPSILON_EB) SC_FAC(N) = SC_T/SPECIES_MIXTURE(N)%SC_T_USER
                     ENDDO
                     ALLOCATE(SPECIES_SC_FAC_D(N_TRACKED_SPECIES))
                     SPECIES_SC_FAC_D = SC_FAC

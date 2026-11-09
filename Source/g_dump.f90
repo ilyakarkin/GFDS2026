@@ -263,8 +263,9 @@ MODULE G_DUMP
                 IF (SDV%MESH/=NM) CYCLE
                 SDV%GPU_VALUE_READY = .FALSE.
 
+                ! dump.f90 AREA INTEGRAL takes the face area from IOR_ASSUMED only (set for a plane XB without IOR); with
+                ! IOR_ASSUMED=0 the area, and so the value, is 0 (CASE DEFAULT of the kernel)
                 AREA_AXIS = ABS(DV%IOR_ASSUMED)
-                IF (AREA_AXIS==0) AREA_AXIS = ABS(DV%IOR)
                 IND = DV%QUANTITY_INDEX(1)
                 SELECT CASE(IND)
                    CASE(91,111); FLUX_AXIS = 1
@@ -284,7 +285,7 @@ MODULE G_DUMP
                           GM%DXD,GM%DYD,GM%DZD,GM%RDXND,GM%RDYND,GM%RDZND,GM%RRND, &
                           SDV%I1,SDV%I2,SDV%J1,SDV%J2,SDV%K1,SDV%K2,AREA_AXIS,FLUX_AXIS,IND, &
                           IBP1,JBP1,KBP1,N_TRACKED_SPECIES,I_MAX_TEMP,SIM_MODE,DNS_MODE,TMPA,CPOPR, &
-                          DV%QUANTITY_RANGE(1),DV%QUANTITY_RANGE(2))
+                          DV%QUANTITY_RANGE(1),DV%QUANTITY_RANGE(2),GM%CELL_SOLID,GM%CELL_INDEXD)
                       CALL FINALIZE_DEVC_REDUCTION_KERNEL<<<DIM3(1,1,1),GPU_DUMP_REDUCTION_BLOCK,0,GM%STRM>>>( &
                           GM%DUMP%DEVC_PARTIAL_D,GM%DUMP%DEVC_RESULT_D,N,GRID_BLOCKS)
                       N_ACTIVE = N_ACTIVE + 1
@@ -757,10 +758,12 @@ MODULE G_DUMP
         ATTRIBUTES(GLOBAL) SUBROUTINE DEVC_FLUX_REDUCTION_KERNEL(PARTIAL,U,V,W,RHO,TMP,MU,ZZ,H_SENS_Z, &
             DX,DY,DZ,RDXN,RDYN,RDZN,RRN,I1,I2,J1,J2,K1,K2,AREA_AXIS,FLUX_AXIS,IND, &
             IBP1,JBP1,KBP1,N_TRACKED_SPECIES,I_MAX_TEMP,SIM_MODE_LOCAL,DNS_MODE_LOCAL,TMPA_IN,CPOPR_IN, &
-            QUANTITY_MIN,QUANTITY_MAX)
+            QUANTITY_MIN,QUANTITY_MAX,CELL_SOLID,CELL_INDEXD)
             IMPLICIT NONE
 
             INTEGER, VALUE :: I1,I2,J1,J2,K1,K2,AREA_AXIS,FLUX_AXIS,IND
+            LOGICAL, DEVICE :: CELL_SOLID(0:*)
+            INTEGER, DEVICE :: CELL_INDEXD(0:IBP1,0:JBP1,0:*)
             INTEGER, VALUE :: IBP1,JBP1,KBP1,N_TRACKED_SPECIES,I_MAX_TEMP,SIM_MODE_LOCAL,DNS_MODE_LOCAL
             REAL(EB), VALUE :: TMPA_IN,CPOPR_IN,QUANTITY_MIN,QUANTITY_MAX
             REAL(EB), DEVICE :: PARTIAL(*)
@@ -844,6 +847,8 @@ MODULE G_DUMP
                    CASE DEFAULT
                       AREA = 0._EB
                 END SELECT
+                ! dump.f90 AREA INTEGRAL: a solid cell adds no area
+                IF (CELL_SOLID(CELL_INDEXD(I,J,K))) AREA = 0._EB
 
                 IF (VALUE<QUANTITY_MIN .OR. VALUE>QUANTITY_MAX) VALUE = 0._EB
                 VALUE = VALUE*AREA
@@ -935,10 +940,13 @@ MODULE G_DUMP
                       CELL_VALUE = RHO(II,JJ,KK)*Y_VALUE
                    CASE(2) ! HRRPUV is written in kW/m3
                       CELL_VALUE = Q(II,JJ,KK)*0.001_EB
-                   CASE(3) ! effective flame temperature, in the CPU units
-                      CELL_VALUE = TMP(II,JJ,KK)-TMPM_IN
-                      IF (RTE_CORRECTION .AND. CHI_R(II,JJ,KK)*Q(II,JJ,KK)>QR_CLIP_IN) &
-                          CELL_VALUE = (CELL_VALUE+TMPM_IN)*FR_C-TMPM_IN
+                   CASE(3) ! EFFECTIVE FLAME TEMPERATURE as dump.f90 GAS_PHASE_OUTPUT CASE(64): CHI_R of the nearest interior
+                      ! cell; FR_C = RTE_SOURCE_CORRECTION_FACTOR**0.25, which is 1 without RTE_SOURCE_CORRECTION
+                      IF (CHI_R(MAX(1,MIN(II,IBAR)),MAX(1,MIN(JJ,JBAR)),MAX(1,MIN(KK,KBAR)))*Q(II,JJ,KK)>QR_CLIP_IN) THEN
+                         CELL_VALUE = TMP(II,JJ,KK)*FR_C - TMPM_IN
+                      ELSE
+                         CELL_VALUE = TMP(II,JJ,KK) - TMPM_IN
+                      ENDIF
                    CASE DEFAULT
                       CELL_VALUE = 0._EB
                 END SELECT

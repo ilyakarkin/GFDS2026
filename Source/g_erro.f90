@@ -6,6 +6,7 @@ MODULE G_ERRO
     USE PRECISION_PARAMETERS, ONLY: EB
     USE GLOBAL_CONSTANTS, ONLY: LU_ERR,MY_RANK
     USE CUDAFOR
+    USE ISO_C_BINDING, ONLY: C_INT,C_INT64_T,C_PTR,C_NULL_PTR,C_LOC
     USE MPI_F08, ONLY: MPI_REQUEST,MPI_COMM_WORLD,MPI_DOUBLE_PRECISION,MPI_STATUSES_IGNORE, &
                        MPI_SUCCESS,MPI_IRECV,MPI_ISEND,MPI_WAITALL,MPI_ABORT
     IMPLICIT NONE
@@ -16,6 +17,14 @@ MODULE G_ERRO
     LOGICAL :: GPU_CAPTURING = .FALSE.
     INTEGER(KIND=cuda_stream_kind), SAVE :: CAPTURE_STREAM = 0
     TYPE(cudaEvent), SAVE :: CAPTURE_FORK_EVENT,CAPTURE_JOIN_EVENT
+    INTERFACE
+        !> cudaGraphExecUpdate of the CUDA 12 runtime (not in the CUDA Fortran module): EXEC and GRAPH are the handles
+        !> of TYPE(cudaGraphExec) and TYPE(cudaGraph), INFO points to a cudaGraphExecUpdateResultInfo (24 bytes).
+        INTEGER(C_INT) FUNCTION CUDA_GRAPH_EXEC_UPDATE(EXEC,GRAPH,INFO) BIND(C,NAME='cudaGraphExecUpdate')
+            IMPORT :: C_INT,C_PTR
+            TYPE(C_PTR), VALUE :: EXEC,GRAPH,INFO
+        END FUNCTION CUDA_GRAPH_EXEC_UPDATE
+    END INTERFACE
     INTERFACE GPU_MPI_IRECV
         MODULE PROCEDURE GPU_MPI_IRECV_1D,GPU_MPI_IRECV_3D
     END INTERFACE
@@ -114,11 +123,18 @@ MODULE G_ERRO
 
     !> End the capture of GPU_CAPTURE_BEGIN into the executable graph EXEC (not launched); .FALSE. if that failed, the
     !> captured launches did not run then.
-    LOGICAL FUNCTION GPU_CAPTURE_END(STREAMS,EXEC)
+    !> EXEC_EXISTS (optional): .TRUE. on entry if EXEC holds an idle executable graph of an earlier capture. It is then
+    !> updated in place to the new capture (cudaGraphExecUpdate: same nodes, new kernel arguments), which is cheaper
+    !> than a new instantiation; if the update is refused (other topology), EXEC is destroyed and instantiated anew.
+    !> On return EXEC_EXISTS tells whether EXEC holds an executable graph.
+    LOGICAL FUNCTION GPU_CAPTURE_END(STREAMS,EXEC,EXEC_EXISTS)
         INTEGER(KIND=cuda_stream_kind), INTENT(IN) :: STREAMS(:)
         TYPE(cudaGraphExec), INTENT(INOUT) :: EXEC
+        LOGICAL, INTENT(INOUT), OPTIONAL :: EXEC_EXISTS
         TYPE(cudaGraph) :: GRAPH
         INTEGER :: I,IERR,ISTAT
+        LOGICAL :: UPDATED
+        INTEGER(C_INT64_T), TARGET :: UPDATE_INFO(4)
 
         IERR = 0
         DO I=1,SIZE(STREAMS)
@@ -128,8 +144,22 @@ MODULE G_ERRO
         ISTAT = cudaStreamEndCapture(CAPTURE_STREAM,GRAPH)
         GPU_CAPTURING = .FALSE.
         IF (ISTAT==0 .AND. IERR==0) THEN
-            ISTAT = cudaGraphInstantiate(EXEC,GRAPH,0)
+            UPDATED = .FALSE.
+            IF (PRESENT(EXEC_EXISTS)) THEN
+                IF (EXEC_EXISTS) THEN
+                    UPDATE_INFO = 0
+                    UPDATED = CUDA_GRAPH_EXEC_UPDATE(TRANSFER(EXEC,C_NULL_PTR),TRANSFER(GRAPH,C_NULL_PTR), &
+                                                     C_LOC(UPDATE_INFO))==0
+                    IF (.NOT.UPDATED) THEN
+                        I = cudaGetLastError()   ! clear the refused update
+                        I = cudaGraphExecDestroy(EXEC)
+                        EXEC_EXISTS = .FALSE.
+                    ENDIF
+                ENDIF
+            ENDIF
+            IF (.NOT.UPDATED) ISTAT = cudaGraphInstantiate(EXEC,GRAPH,0)
             IERR = cudaGraphDestroy(GRAPH)
+            IF (PRESENT(EXEC_EXISTS)) EXEC_EXISTS = (ISTAT==0)
         ENDIF
         GPU_CAPTURE_END = (ISTAT==0 .AND. IERR==0)
         IF (.NOT.GPU_CAPTURE_END) WRITE(LU_ERR,'(A,I0)') ' GFDS: graph capture failed, direct launches are used: ',ISTAT

@@ -155,7 +155,7 @@ The terms $\hat{\bar{v}}$ and $\hat{\bar{w}}$ are defined similarly.  The model 
 \subsection{Vreman's Model}
 \label{sec:vreman}
 
-Vreman's eddy viscosity model \cite{vreman:2004} is given by
+Vreman's eddy viscosity model \cite{Vreman:2004} is given by
 \begin{equation}
 \label{eqn_mu_vreman}
 \mu_{\rm t} = \rho \, c \, \sqrt{ \frac{B_\beta}{\alpha_{ij}\alpha_{ij}} }
@@ -165,7 +165,7 @@ where
 B_\beta     &= \beta_{11}\beta_{22} - \beta_{12}^2 + \beta_{11}\beta_{33} - \beta_{13}^2 + \beta_{22}\beta_{33} - \beta_{23}^2 \quad ; \quad \beta_{ij} = \Delta_m^2 \alpha_{mi} \alpha_{mj} \label{eq:vreman_beta}\\
 \alpha_{ij} &= \frac{\partial u_j}{\partial x_i}
 \end{align}
-The notation is selected to exactly match Vreman's paper \cite{vreman:2004}.  The model considers a possible anisotropy in the filter width in direction $m$; contraction on $m$ is implied in Eq.~(\ref{eq:vreman_beta}).  The basic idea behind Vreman's model is to expand the velocity field in a Taylor series and to test filter this field analytically, thus avoiding the expensive explicit test filtering operations necessary in the dynamic model.  Therefore, this model is inexpensive.  Unlike constant coefficient Smagorinsky, however, Vreman's model is convergent, making it applicable to highly resolved LES calculations.
+The notation is selected to exactly match Vreman's paper \cite{Vreman:2004}.  The model considers a possible anisotropy in the filter width in direction $m$; contraction on $m$ is implied in Eq.~(\ref{eq:vreman_beta}).  The basic idea behind Vreman's model is to expand the velocity field in a Taylor series and to test filter this field analytically, thus avoiding the expensive explicit test filtering operations necessary in the dynamic model.  Therefore, this model is inexpensive.  Unlike constant coefficient Smagorinsky, however, Vreman's model is convergent, making it applicable to highly resolved LES calculations.
 
 The model constant may be related to the Smagorinsky constant, $c \approx 2.5 \, C_{\rm s}^2$.  Since Vreman's model is most applicable to high resolution cases, we base the coefficient off of $C_{\rm s} = 0.17$, which yields accurate results for highly resolved decaying isotropic turbulence (see the FDS Verification Guide \cite{FDS_Verification_Guide}).  The default Vreman constant is therefore set to $c = 0.07$.
 
@@ -175,7 +175,7 @@ The model constant may be related to the Smagorinsky constant, $c \approx 2.5 \,
 The Wall-Adapting Local Eddy-viscosity, or WALE, model of Nicoud and Ducros \cite{Nicoud:1999} was originally conceived as a method for properly scaling the eddy viscosity in the vicinity of a wall.  While the invariant used in the Smagorinsky model $|S|$ is $O(1)$ near a wall, the invariant designed for WALE correctly scales as $O(y^3)$, where $y$ is the distance from the wall.  The WALE model is used for the eddy viscosity in the first off-wall grid cell.  The dynamic turbulent viscosity is written as follows:
 \begin{equation}
 \label{eq:wale}
-\mu_{\si{t}} = \rho (C_{\si{w}} \Delta)^2 \frac{(S^d_{ij} S^d_{ij})^{3/2}}{(S_{ij} S_{ij})^{5/2} + (S^d_{ij} S^d_{ij})^{5/4}}
+\mu_{\unit{t}} = \rho (C_{\unit{w}} \Delta)^2 \frac{(S^d_{ij} S^d_{ij})^{3/2}}{(S_{ij} S_{ij})^{5/2} + (S^d_{ij} S^d_{ij})^{5/4}}
 \end{equation}
 where
 \begin{equation}
@@ -231,19 +231,19 @@ and material diffusivity are approximated from kinetic theory because the temper
 dependence of each is important in combustion scenarios.
 The viscosity of the species $\alpha$ is given by
 \be \mu_\alpha = \frac{26.69\times 10^{-7} (W_\alpha \, T)^\ha}{\sigma_\alpha^2 \, \Omega_v}
-\quad [=] \quad \si{kg/(m.s)} \ee
+\quad [=] \quad \unit{kg/(m.s)} \ee
 where $\sigma_\alpha$ is the Lennard-Jones
 hard-sphere diameter ($\text{\AA}$) and $\Omega_v$ is the
 collision integral, an empirical function of the
 temperature $T$. The thermal conductivity of species $\alpha$ is given by
-\be k_\alpha = \frac{\mu_\alpha \, c_{p,\alpha}}{\PR_\alpha}  \quad [=] \quad \si{W/(m.K)} \ee
+\be k_\alpha = \frac{\mu_\alpha \, c_{p,\alpha}}{\PR_\alpha}  \quad [=] \quad \unit{W/(m.K)} \ee
 Note if $\PR_\alpha$ is not defined, the value for nitrogen (0.71) is assumed.
 The viscosity and thermal conductivity of a gas mixture are given by  ~\cite{Davidson:1993}
 \be \mu_{\hbox{\tiny DNS}} = \frac{\sum_\alpha \mu_\alpha \; X_\alpha \; M_\alpha ^{1/2}}{\sum_\alpha X_\alpha \; M_\alpha ^{1/2}}  \quad ; \quad k_{\hbox{\tiny DNS}} = \frac{\sum_\alpha k_\alpha \; X_\alpha \; M_\alpha ^{1/2}}{\sum_\alpha X_\alpha \; M_\alpha ^{1/2}}  \ee
 The binary diffusion coefficient of species $\alpha$
 diffusing into species $\beta$ is given by
 \be D_{\alpha \beta} = \frac{2.66\times 10^{-7} \, T^{3/2} }{W_{\alpha \beta}^\ha \, \sigma_{\alpha \beta}^2 \, \Omega_D }
-\quad [=] \quad \si{m^2/s} \ee
+\quad [=] \quad \unit{m^2/s} \ee
 where $W_{\alpha \beta}=2(1/W_\alpha+1/W_\beta)^{-1}$, $\sigma_{\alpha \beta}=(\sigma_\alpha+\sigma_\beta)/2$, and
 $\Omega_D$ is the diffusion collision integral, an empirical
 function of the temperature, $T$~\cite{Poling:1}.
@@ -407,6 +407,7 @@ where $u_\infty(z,t)$ is the prescribed external wind field velocity component a
 
 
 \subsubsection{Solid Boundary Conditions}
+\label{ssub:solid_boundary_conditions}
 
 Boundary conditions at a solid surface fall into three distinct categories:
 \begin{enumerate}
@@ -557,9 +558,9 @@ Note that for both stages, the normal components of velocity at the interface ar
    \be
       \left| u_I^* - u_0^* \right| < 0.5 \, \delta x
    \ee
-    and the default convergence criteria for the pressure, $p=\rho(\cH-|\bu|^2/2)$, is
+    and the default convergence criteria for the pressure, $p=\rho(\cH-|\bu|^2/2)$, is derived by taking the divergence of Eq.~(\ref{momeq}) and separating out the baroclinic pressure terms:
    \be
-      \left| \nabla \cdot (p^k-p^{k-1}) \nabla (1/\rho) \right|<20/\dx^2
+       \left| \nabla \cdot (p^k-p^{k-1}) \nabla (1/\rho) \right| \equiv \left| \nabla \cdot \left( \frac{\partial \bu}{\partial t} + \bF_{\rm A} +  \nabla \frac{|\bu|^2}{2} + \frac{1}{\rho} \nabla p^k \right)  \right| < 20/\dx^2
    \ee
    If the criteria are not met, return to Step~\ref{step3}.
 \end{enumerate}
@@ -577,7 +578,7 @@ This section describes how the tangential component of velocity is specified at 
 \subsection{Smooth Walls}
 \label{smooth_wall_model}
 
-In finite-volume LES, when the momentum equation is integrated over a cell adjacent to the wall it turns out that the most difficult term to handle is the viscous stress, $\tau_w$, because the wall-normal gradient of the stream-wise velocity component cannot be resolved; the SGS stress at the wall is identically zero.  We have, therefore, an entirely different situation than exists in the bulk flow at high Reynolds number where the viscous terms are negligible and the SGS stress is of critical importance.  The fidelity of the SGS model still influences the wall stress, however, since other components of the SGS tensor affect the value of the near-wall velocity and hence the resulting viscous stress determined by the wall model. FDS models $\tau_w$ with a logarithmic velocity profile \cite{Pope:2000} described below.
+In finite-volume LES, when the momentum equation is integrated over a cell adjacent to the wall, the most difficult term to handle is the viscous stress, $\tau_w$, because the wall-normal gradient of the stream-wise velocity component cannot be resolved; the SGS stress at the wall is identically zero.  We have, therefore, an entirely different situation than exists in the bulk flow at high Reynolds number where the viscous terms are negligible and the SGS stress is of critical importance.  The fidelity of the SGS model still influences the wall stress, however, since other components of the SGS tensor affect the value of the near-wall velocity and hence the resulting viscous stress determined by the wall model. FDS models $\tau_w$ with a logarithmic velocity profile \cite{Pope:2000} described below.
 
 An important scaling quantity in the near-wall region is the friction velocity, defined as $u_\tau \equiv \sqrt{\tau_w/\rho}$.
 From the friction velocity we can define the non-dimensional stream-wise velocity $u^+ \equiv u/u_\tau$ and non-dimensional wall-normal distance $y^+ \equiv y/\delta_\nu$, where $\delta_\nu = \nu/u_\tau = \mu/(\rho u_\tau)$ is the \emph{viscous length scale}. In FDS, the law of the wall is approximated by
@@ -595,6 +596,33 @@ where $\kappa = 0.41$ is the von K\'arm\'an constant and $B=5.2$.  The region $5
 %where $(1/\kappa)_{\mbox{\tiny\emph{buffer}}}=4.74$ and $B_{\mbox{\tiny\emph{buffer}}}=-2.63$.
 
 For the purposes of adapting the log law model to FDS we suppose that the first off-wall velocity component represents the profile sampled at a distance $\delta y/2$ in the wall-normal direction---stream-wise components of velocity are stored at the face center on a staggered grid.  The density and molecular viscosity are taken as the average of the neighboring cell values and uniform on the cell face where the stream-wise velocity component is stored.
+
+\subsection{Corners}
+\label{corner_velocity_bc}
+
+At the corner edge of a solid obstruction, a no-slip boundary condition is applied. Consider the diagram in Fig.~\ref{fig:corner}. The solid vectors represent the two velocity components on the cell faces adjacent to the corner edge, which in this figure would be normal to the plane shown. The upper left of the figure is a solid obstruction. For the purposes of computing the components of the vorticity and stress tensor at this edge, it is assumed that the ``ghost'' velocity components, represented by dashed vectors, take on the negative values of their in-flow counterparts.
+
+\begin{figure}[h!]
+\centering
+\begin{picture}(200,150)(0,0)
+\setlength{\unitlength}{0.02in}
+\multiput(10,0)(20,0){5}{\line(0,1){100}}
+\multiput(0,10)(0,20){5}{\line(1,0){100}}
+\put(45,40){\vector(1,0){10}}
+\put(60,45){\vector(0,1){10}}
+\multiput(55,60)(-2,0){5}{\line(-1,0){1}}
+\put(47,60){\vector(-1,0){2}}
+\multiput(40,55)(0,-2){5}{\line(0,-1){1}}
+\put(40,47){\vector(0,-1){2}}
+\thicklines
+\put(50,50){\line(0,1){50}}
+\put(50,50){\line(-1,0){50}}
+\end{picture}
+\caption[Diagram of wall corner velocity boundary condition]{Diagram of wall corner velocity boundary condition.}
+\label{fig:corner}
+\end{figure}
+
+\FloatBarrier
 
 \subsection{Rough Walls}
 \label{rough_wall_model}

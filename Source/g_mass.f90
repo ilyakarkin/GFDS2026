@@ -411,8 +411,10 @@ MODULE G_MASS
                 DO I=1,N_ZONE
                     PBAR_S(:,I) = PBAR(:,I) + D_PBAR_DT(I)*DT
                 ENDDO
-                ! One contiguous host-to-device copy for all zones instead of one copy per zone
-                IF (N_ZONE>0) GM%PBAR_SD(:,1:N_ZONE) = PBAR_S(:,1:N_ZONE)
+                ! One contiguous host-to-device copy of zones 1:N_ZONE, in the order of the mesh stream. The array section
+                ! assignment was compiled as a copy of the whole device array to the host and back, and its device-to-host
+                ! part waited for all queued device work.
+                IF (N_ZONE>0) ISTAT = cudaMemcpyAsync(GM%PBAR_SD(0,1),PBAR_S(0,1),(KBP1+1)*N_ZONE,GM%STRM)
 
                 ! Restore density-equation velocity at interpolated boundaries.
                 UUD = GM%UD
@@ -440,7 +442,7 @@ MODULE G_MASS
                 CALL DENSITY_SUM_RHO_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%RHOSD,GM%ZZSD,IBAR,JBAR,KBAR,GM%CELL_INDEXD,GM%CELL_SOLID,N_TRACKED_SPECIES)
 
-                CALL CHECK_MASS_DENSITY_GPU(GM%RHOSD,GM%ZZSD)
+                CALL CHECK_MASS_DENSITY_GPU(GM%RHOSD,GM%ZZSD,NM)
 
                 ! Enforce density, ZZ, RSUM, and TMP EOS consistency.
                 CALL DENSITY_KERNEL_NORMALIZE_EOS<<<GRDD,BLKD,0,GM%STRM>>>( &
@@ -502,7 +504,7 @@ MODULE G_MASS
                 DO I=1,N_ZONE
                     PBAR(:,I) = 0.5_EB*(PBAR(:,I) + PBAR_S(:,I) + D_PBAR_DT_S(I)*DT)
                 ENDDO
-                IF (N_ZONE>0) GM%PBARD(:,1:N_ZONE) = PBAR(:,1:N_ZONE)
+                IF (N_ZONE>0) ISTAT = cudaMemcpyAsync(GM%PBARD(0,1),PBAR(0,1),(KBP1+1)*N_ZONE,GM%STRM)
 
                 ! Restore density-equation velocity at interpolated boundaries.
                 UUD = GM%USD
@@ -537,7 +539,7 @@ MODULE G_MASS
                 CALL DENSITY_SUM_RHO_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     GM%RHOD,GM%ZZD,IBAR,JBAR,KBAR,GM%CELL_INDEXD,GM%CELL_SOLID,N_TRACKED_SPECIES)
 
-                CALL CHECK_MASS_DENSITY_GPU(GM%RHOD,GM%ZZD)
+                CALL CHECK_MASS_DENSITY_GPU(GM%RHOD,GM%ZZD,NM)
 
                 ! Enforce density, ZZ, RSUM, and TMP EOS consistency.
                 CALL DENSITY_KERNEL_NORMALIZE_EOS<<<GRDD,BLKD,0,GM%STRM>>>( &
@@ -563,9 +565,10 @@ MODULE G_MASS
 
         END SUBROUTINE DENSITY_GPU
 
-        SUBROUTINE CHECK_MASS_DENSITY_GPU(RHOPD,RHO_ZZD)
+        SUBROUTINE CHECK_MASS_DENSITY_GPU(RHOPD,RHO_ZZD,NM)
             REAL(EB), DEVICE, DIMENSION(-1:,-1:,-1:) :: RHOPD
             REAL(EB), DEVICE, DIMENSION(-1:,-1:,-1:,1:) :: RHO_ZZD
+            INTEGER, INTENT(IN) :: NM
             TYPE(DIM3) :: BLKD, GRDD
             INTEGER :: N
 
@@ -575,9 +578,17 @@ MODULE G_MASS
             GM%WORK10D = 0._EB
             GM%IWORK1D(0,0,0) = 0
             GM%IWORK1D(0,0,1) = 0
+            ! IWORK1D(1,0,0) and IWORK1D(2,0,0) are mass.f90 CLIP_RHOMIN and CLIP_RHOMAX (cleared on the mesh stream)
+            CALL CLIP_FLAGS_ZERO_GPU<<<1,1,0,GM%STRM>>>(GM%IWORK1D)
             CALL CHECK_MASS_DENSITY_RHO_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                 RHOPD,GM%WORK10D,GM%DXD,GM%DYD,GM%DZD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%CELL_WALL_INDEX, &
                 GM%IWORK1D,RHOMIN,RHOMAX,TWO_EPSILON_EB,IBAR,JBAR,KBAR,GM%CELL_LB,GM%CELL_UB)
+            ! velo.f90 CHECK_STABILITY reads the flags of the predictor DENSITY (DT_CLIP); they are read back with the CFL
+            IF (PREDICTOR) THEN
+                CALL MESH_REDUCE_ENSURE(NMESHES)
+                CALL CLIP_FLAGS_TO_MESH_REDUCE_GPU<<<1,1,0,GM%STRM>>>(GM%IWORK1D,MESH_REDUCE_D, &
+                    MESH_REDUCE_OFFSET(MR_CLIP,NM))
+            ENDIF
             CALL CHECK_MASS_DENSITY_APPLY_RHO_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                 RHOPD,GM%WORK10D,RHO_ZZD,RHOMIN,RHOMAX,IBAR,JBAR,KBAR,GM%CELL_INDEXD,GM%CELL_SOLID,N_TRACKED_SPECIES)
 
@@ -598,6 +609,20 @@ MODULE G_MASS
                 RHOPD,RHO_ZZD,GM%IWORK1D,IBAR,JBAR,KBAR,GM%CELL_INDEXD,GM%CELL_SOLID,N_TRACKED_SPECIES)
 
         END SUBROUTINE CHECK_MASS_DENSITY_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE CLIP_FLAGS_ZERO_GPU(CLIP_FLAG)
+            INTEGER, DEVICE :: CLIP_FLAG(0:*)   ! IWORK1D(0:IBP1,0:JBP1,0:KBP1): (1,0,0) and (2,0,0)
+            CLIP_FLAG(1) = 0
+            CLIP_FLAG(2) = 0
+        END SUBROUTINE CLIP_FLAGS_ZERO_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE CLIP_FLAGS_TO_MESH_REDUCE_GPU(CLIP_FLAG,MESH_REDUCE,I0)
+            INTEGER, VALUE :: I0
+            INTEGER, DEVICE :: CLIP_FLAG(0:*)   ! IWORK1D(0:IBP1,0:JBP1,0:KBP1): (1,0,0) and (2,0,0)
+            REAL(EB), DEVICE :: MESH_REDUCE(*)
+            MESH_REDUCE(I0+1) = REAL(CLIP_FLAG(1),EB)
+            MESH_REDUCE(I0+2) = REAL(CLIP_FLAG(2),EB)
+        END SUBROUTINE CLIP_FLAGS_TO_MESH_REDUCE_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE DENSITY_APPLY_UVW_SAVE_KERNEL(UD, VD, WD, UVW_SAVE_D, WALL_TOPO, &
             WALL_BOUNDARY_TYPE_PREVIOUS, USE_PREVIOUS_BOUNDARY_TYPE, N_EXTERNAL_WALL_CELLS, INTERPOLATED_BOUNDARY_LOCAL,IBP1,JBP1)
@@ -744,9 +769,11 @@ MODULE G_MASS
             IF (RHOP(I,J,K) < RHOMIN_LOCAL) THEN
                 RHO_CUT = RHOMIN_LOCAL
                 SIGN_FACTOR = 1._EB
+                CLIP_FLAGD(1,0,0) = 1   ! CLIP_RHOMIN
             ELSE
                 RHO_CUT = RHOMAX_LOCAL
                 SIGN_FACTOR = -1._EB
+                CLIP_FLAGD(2,0,0) = 1   ! CLIP_RHOMAX
             ENDIF
 
             MASS_N = 0._EB

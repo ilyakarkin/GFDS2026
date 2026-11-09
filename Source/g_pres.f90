@@ -616,7 +616,7 @@ MODULE G_PRES
 
             CALL P_CALCULATE_KERNEL<<<GRDD,BLKD,0,GM%STRM>>>(PD,RHOPD,HPD,GM%KRESD, IBP1,JBP1,KBP1)
             CALL RESIDUALS_KERNEL<<<NBLK,BS_1D,0,GM%STRM>>>( &
-                GM%WORK8D,GM%FVXD,GM%FVX_BD,GM%FVYD,GM%FVY_BD,GM%FVZD,GM%FVZ_BD,GM%DDDTD,PD,GM%KRESD,GM%WORK10D,GM%WORK11D,GM%WORK12D, &
+                GM%WORK8D,GM%FVXD,GM%FVX_BD,GM%FVYD,GM%FVY_BD,GM%FVZD,GM%FVZ_BD,GM%DDDTD,PD,GM%KRESD,RHOPD, &
                 GM%RDXND,GM%RDYND,GM%RDZND,GM%RDXD,GM%RDYD,GM%RDZD,GM%RD,GM%RRND,IBAR,JBAR,KBAR)
             CALL RESIDUALS_BLOCKMAX_KERNEL<<<NBLK,BS_1D,0,GM%STRM>>>( &
                 GM%RESIDUAL_BLOCKMAX_D, GM%RESIDUAL_BLOCKI_D, GM%RESIDUAL_BLOCKJ_D, GM%RESIDUAL_BLOCKK_D, &
@@ -1800,12 +1800,13 @@ MODULE G_PRES
 
         END SUBROUTINE P_CALCULATE_KERNEL
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE RESIDUALS_KERNEL(RESIDUAL,FVX,FVX_B,FVY,FVY_B,FVZ,FVZ_B,DDDT,P,KRES,RRHO_X,RRHO_Y,RRHO_Z, &
+        ATTRIBUTES(GLOBAL) SUBROUTINE RESIDUALS_KERNEL(RESIDUAL,FVX,FVX_B,FVY,FVY_B,FVZ,FVZ_B,DDDT,P,KRES,RHOP, &
                                                        RDXN,RDYN,RDZN,RDX,RDY,RDZ,R,RRN,IBAR,JBAR,KBAR)
             IMPLICIT NONE
 
             INTEGER, VALUE :: IBAR, JBAR, KBAR
-            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: RESIDUAL,FVX,FVX_B,FVY,FVY_B,FVZ,FVZ_B,DDDT,P,KRES,RRHO_X,RRHO_Y,RRHO_Z
+            REAL(EB), DEVICE, DIMENSION(0:IBAR+1,0:JBAR+1,0:*) :: RESIDUAL,FVX,FVX_B,FVY,FVY_B,FVZ,FVZ_B,DDDT,P,KRES
+            REAL(EB), DEVICE, DIMENSION(-1:IBAR+2,-1:JBAR+2,-1:*) :: RHOP   ! GM%RHOD/RHOSD have two ghost layers
             REAL(EB), DEVICE, DIMENSION(0:*) :: RDXN,RDYN,RDZN,RDX,RDY,RDZ,R,RRN
 
             INTEGER :: GID, NCELL, TMP, REM, I, J, K
@@ -1826,12 +1827,14 @@ MODULE G_PRES
                  + (((FVZ(I,J,K-1)-FVZ_B(I,J,K-1)) - (FVZ(I,J,K)-FVZ_B(I,J,K))) * RDZ(K)) &
                  - DDDT(I,J,K)
 
-            LHSS = ((P(I+1,J,K)-P(I,J,K))*RDXN(I)*R(I)       *RRHO_X(I,J,K) - &
-                    (P(I,J,K)-P(I-1,J,K))*RDXN(I-1)*R(I-1)   *RRHO_X(I-1,J,K))*RDX(I)*RRN(I) &
-                 + ((P(I,J+1,K)-P(I,J,K))*RDYN(J)   *RRHO_Y(I,J,K) - &
-                    (P(I,J,K)-P(I,J-1,K))*RDYN(J-1) *RRHO_Y(I,J-1,K))*RDY(J) &
-                 + ((P(I,J,K+1)-P(I,J,K))*RDZN(K)   *RRHO_Z(I,J,K) - &
-                    (P(I,J,K)-P(I,J,K-1))*RDZN(K-1) *RRHO_Z(I,J,K-1))*RDZ(K) &
+            ! Face 1/rho from RHOP as in pres.f90 PRESSURE_SOLVER_CHECK_RESIDUALS (the WORK10D-12D copies made by
+            ! VELOCITY_FLUX_GPU can be overwritten before the pressure iterations, e.g. by the INIT HRRPUV radiation source)
+            LHSS = ((P(I+1,J,K)-P(I,J,K))*RDXN(I)*R(I)       *(2._EB/(RHOP(I,J,K)+RHOP(I+1,J,K))) - &
+                    (P(I,J,K)-P(I-1,J,K))*RDXN(I-1)*R(I-1)   *(2._EB/(RHOP(I-1,J,K)+RHOP(I,J,K))))*RDX(I)*RRN(I) &
+                 + ((P(I,J+1,K)-P(I,J,K))*RDYN(J)   *(2._EB/(RHOP(I,J,K)+RHOP(I,J+1,K))) - &
+                    (P(I,J,K)-P(I,J-1,K))*RDYN(J-1) *(2._EB/(RHOP(I,J-1,K)+RHOP(I,J,K))))*RDY(J) &
+                 + ((P(I,J,K+1)-P(I,J,K))*RDZN(K)   *(2._EB/(RHOP(I,J,K)+RHOP(I,J,K+1))) - &
+                    (P(I,J,K)-P(I,J,K-1))*RDZN(K-1) *(2._EB/(RHOP(I,J,K-1)+RHOP(I,J,K))))*RDZ(K) &
                  + ((KRES(I+1,J,K)-KRES(I,J,K))*RDXN(I)*R(I) - (KRES(I,J,K)-KRES(I-1,J,K))*RDXN(I-1)*R(I-1))*RDX(I)*RRN(I) &
                  + ((KRES(I,J+1,K)-KRES(I,J,K))*RDYN(J)   - (KRES(I,J,K)-KRES(I,J-1,K))*RDYN(J-1))*RDY(J) &
                  + ((KRES(I,J,K+1)-KRES(I,J,K))*RDZN(K)   - (KRES(I,J,K)-KRES(I,J,K-1))*RDZN(K-1))*RDZ(K)

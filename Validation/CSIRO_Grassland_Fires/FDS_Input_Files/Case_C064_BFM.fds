@@ -7,7 +7,7 @@
 
 &MISC SIMULATION_MODE='SVLES', TMPA=32. /
 
-&WIND SPEED=4.6, DIRECTION=270., L=-500., Z_0=0.03 /
+&WIND SPEED=4.6, Z_REF=2., DIRECTION=270., L=-500., Z_0=0.03 /
 
 &SURF ID='IGNITION', HRRPUA=1500., COLOR='RED', TMP_FRONT=100., RAMP_Q='ignitor' /
 &RAMP ID='ignitor', T= 0., F=0. /
@@ -46,10 +46,11 @@
       MATL_ID(1,1:1)            = 'GENERIC VEGETATION'
       MATL_ID(2,1)              = 'DIRT'
       THICKNESS(1:2)            = 0.21,0.10
-      MOISTURE_FRACTION(1)      = 0.063
+      MOISTURE_CONTENT(1)       = 0.063
       MASS_PER_VOLUME(1)        = 1.33
       DRAG_COEFFICIENT          = 2.8
-      SURFACE_VOLUME_RATIO(1)   = 9770. /
+      SURFACE_VOLUME_RATIO(1)   = 9770. 
+      TIME_STEP_FACTOR          = 15/
 
 &CATF OTHER_FILES='vegetation_model.txt' /
 

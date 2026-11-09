@@ -11,15 +11,27 @@ MODULE G_RADI
     USE G_FUNC, ONLY: EVALUATE_RAMP_DEVICE
     USE G_ERRO, ONLY: GPU_WAIT_ALL,GPU_STREAM_BARRIER,GPU_MPI_IRECV,GPU_MPI_ISEND,GPU_MPI_WAITALL
     USE RADCONS
+    USE RAD, ONLY: N_KAPPA_T,N_KAPPA_X,KAPPA_X_MIN,KAPPA_C_MIN,LOG_KAPPA_X_FAC,LOG_KAPPA_C_FAC,Y2RADCAL_SPECIES, &
+                   RADCAL_SPECIES2KAPPA,KAPPA_COND,N_RADCAL_ARRAY_SIZE,RADCAL_SPECIES_INDEX
     USE CUDAFOR, ONLY: CUDA_STREAM_KIND,cudaMemcpyAsync,cudaGraph,cudaGraphExec,cudaGraphLaunch, &
         cudaGraphInstantiate,cudaGraphDestroy,cudaGraphExecDestroy,cudaStreamBeginCapture,cudaStreamEndCapture, &
         cudaStreamCaptureModeRelaxed
     IMPLICIT NONE
 
     ! Radiation sweep: per-slice kernels (SLICE, as originally), or the cell data that does not depend on the upwind
-    ! intensities prepared for all cells in one kernel first (RECORDS, default). CHECK runs both and compares.
-    ! Chosen with the environment variable GFDS_RADI_SWEEP=SLICE|RECORDS|CHECK.
-    INTEGER, PARAMETER :: RADI_SWEEP_SLICE=0,RADI_SWEEP_RECORDS=1,RADI_SWEEP_CHECK=2
+    ! intensities prepared for all cells in one kernel first (RECORDS), swept slice by slice, or (TILES, default) swept
+    ! tile by tile by many thread blocks in one kernel. CHECK runs RECORDS on a copy and TILES and compares.
+    ! Chosen with the environment variable GFDS_RADI_SWEEP=SLICE|RECORDS|TILES|CHECK.
+    INTEGER, PARAMETER :: RADI_SWEEP_SLICE=0,RADI_SWEEP_RECORDS=1,RADI_SWEEP_CHECK=2,RADI_SWEEP_TILES=3
+    !> Tiled sweep: tiles of up to RADI_TILE**3 cells. A cell depends only on its upwind neighbours in x, y and z, so a
+    !> tile depends only on its three upwind tiles. Each thread block takes the next tile in the order of the tile
+    !> diagonals, waits until its upwind tiles are done, and sweeps the tile diagonal by diagonal in shared memory
+    !> with the arithmetic of RADIATION_SWEEP_RECORD_CELL; every cell gets the same upwind values as in the slice
+    !> sweep, so the intensities are the same.
+    INTEGER, PARAMETER :: RADI_TILE=8,RADI_TILE1=RADI_TILE+1,RADI_TILE_THREADS=64,RADI_TILE_MAX_BLOCKS=256
+    INTEGER, PARAMETER :: RADI_TILE_MAX_DIAG=3*RADI_TILE-2,RADI_TILE_NINFO=12+RADI_TILE_MAX_DIAG
+    !> Meshes with fewer cells are swept by the record sweep (one thread block for small slices), which is as fast there
+    INTEGER, PARAMETER :: RADI_TILE_MIN_CELLS=20000
     INTEGER :: RADI_SWEEP_MODE=-1
     INTEGER, PARAMETER :: RADI_SWEEP_N_COEF=10
     INTEGER :: RADI_GRAPH_MODE=-1   ! angle-group graphs: -1 not decided, 0 off (GFDS_RADI_GRAPH=0), 1 on
@@ -105,12 +117,15 @@ MODULE G_RADI
             GM%RADI%SLICE_OFFSET_H(GM%RADI%NSLICES+1) = IDX
 
             IF (RADI_SWEEP_MODE<0) THEN
-                RADI_SWEEP_MODE = RADI_SWEEP_RECORDS
+                RADI_SWEEP_MODE = RADI_SWEEP_TILES
                 CALL GET_ENVIRONMENT_VARIABLE('GFDS_RADI_SWEEP',SWEEP_MODE_TEXT)
                 SELECT CASE(TRIM(SWEEP_MODE_TEXT))
                     CASE('SLICE','slice') ; RADI_SWEEP_MODE = RADI_SWEEP_SLICE
+                    CASE('RECORDS','records') ; RADI_SWEEP_MODE = RADI_SWEEP_RECORDS
                     CASE('CHECK','check') ; RADI_SWEEP_MODE = RADI_SWEEP_CHECK
                 END SELECT
+                IF (RADI_SWEEP_MODE==RADI_SWEEP_CHECK) WRITE(LU_ERR,'(A)') &
+                    ' GFDS: radiation sweep check: tiled sweep against the record sweep'
             ENDIF
             GM%RADI%MAX_SLICE = 0
             DO SID=1,GM%RADI%NSLICES
@@ -126,6 +141,8 @@ MODULE G_RADI
                 ALLOCATE(GM%RADI%SWEEP_CHECK_IL_D(0:IBP1,0:JBP1,0:KBP1),GM%RADI%SWEEP_CHECK_IL_UP_D(0:IBP1,0:JBP1,0:KBP1))
                 ALLOCATE(GM%RADI%SWEEP_CHECK_COUNT_D(2))
             ENDIF
+            IF ((RADI_SWEEP_MODE==RADI_SWEEP_TILES .AND. NCELL>=RADI_TILE_MIN_CELLS) .OR. &
+                RADI_SWEEP_MODE==RADI_SWEEP_CHECK) CALL RADI_SETUP_TILES
 
             ALLOCATE(GM%RADI%IJK_SLICE_MAP_D(1:NCELL,1:3))
             ALLOCATE(GM%RADI%KAPPA_GAS_D(0:IBP1,0:JBP1,0:KBP1))
@@ -218,13 +235,23 @@ MODULE G_RADI
                 ENDIF
             ENDIF
 
-            IF (N_RADCAL_ARRAY_SIZE>0 .AND. ALLOCATED(Z2RADCAL_SPECIES) .AND. ALLOCATED(RADCAL_SPECIES2KAPPA) .AND. &
+            IF (N_RADCAL_ARRAY_SIZE>0 .AND. ALLOCATED(Y2RADCAL_SPECIES) .AND. ALLOCATED(RADCAL_SPECIES2KAPPA) .AND. &
                 .NOT.ALLOCATED(RADI_RADCAL_SPECIES_INDEX_D)) THEN
                 ALLOCATE(RADI_RADCAL_SPECIES_INDEX_D(1:N_RADCAL_ARRAY_SIZE))
                 ALLOCATE(RADI_Z2RADCAL_SPECIES_D(1:N_RADCAL_ARRAY_SIZE,1:N_TRACKED_SPECIES))
                 ALLOCATE(RADI_RADCAL_SPECIES2KAPPA_D(1:N_RADCAL_ARRAY_SIZE,0:N_KAPPA_X,0:N_KAPPA_T,1:NUMBER_SPECTRAL_BANDS))
                 RADI_RADCAL_SPECIES_INDEX_D = RADCAL_SPECIES_INDEX(1:N_RADCAL_ARRAY_SIZE)
-                RADI_Z2RADCAL_SPECIES_D = Z2RADCAL_SPECIES
+                ! FDS 6.11.1 GET_KAPPA weights the primitive mass fractions Y=Z2Y*(Z*KAPPA_COND). The device folds the product
+                ! into one matrix; it leaves out only the clip of Y to [0,1], which is inactive for gas-cell ZZ in [0,1].
+                BLOCK
+                    REAL(EB), ALLOCATABLE :: Z2RADCAL(:,:)
+                    INTEGER :: NS
+                    Z2RADCAL = MATMUL(Y2RADCAL_SPECIES(1:N_RADCAL_ARRAY_SIZE,1:N_SPECIES),Z2Y(1:N_SPECIES,1:N_TRACKED_SPECIES))
+                    DO NS=1,N_TRACKED_SPECIES
+                        Z2RADCAL(:,NS) = Z2RADCAL(:,NS)*KAPPA_COND(NS)
+                    ENDDO
+                    RADI_Z2RADCAL_SPECIES_D = Z2RADCAL
+                END BLOCK
                 RADI_RADCAL_SPECIES2KAPPA_D = RADCAL_SPECIES2KAPPA
                 ALLOCATE(RADI_MWR_KC_D(1:N_TRACKED_SPECIES))
                 RADI_MWR_KC_D = MWR_Z(1:N_TRACKED_SPECIES)*KAPPA_COND(1:N_TRACKED_SPECIES)
@@ -235,6 +262,83 @@ MODULE G_RADI
         !--------------------------------------------------------------------------
         ! Radiation H2D/D2H synchronization helpers
         !--------------------------------------------------------------------------
+        !> Tiles of the tiled sweep of the current mesh (GM, IBAR/JBAR/KBAR), in forward coordinates (the octant of a
+        !> direction is applied by reflection, as for the slice map). Tile order: by tile diagonal TI+TJ+TK, so the
+        !> upwind tiles of a tile come before it. Cell order: by tile, within a tile by the diagonal LI+LJ+LK.
+        !> TILE_INFO(:,T): 1 offset of the first cell of the tile in the cell order minus 1, 2-4 forward I,J,K of its
+        !> first cell, 5-7 cells in x,y,z, 8-10 upwind tiles in x,y,z (0: none), 11 number of diagonals ND,
+        !> 12..12+ND offsets of the diagonals in the tile (12: 0).
+
+        SUBROUTINE RADI_SETUP_TILES
+            INTEGER :: NTI,NTJ,NTK,TI,TJ,TK,TD,T,IDX,LD,LI,LJ,LK,NX,NY,NZ,NT
+            INTEGER, ALLOCATABLE :: ORDER(:,:,:),INFO_H(:,:),MAP_H(:,:)
+
+            NTI = (IBAR+RADI_TILE-1)/RADI_TILE
+            NTJ = (JBAR+RADI_TILE-1)/RADI_TILE
+            NTK = (KBAR+RADI_TILE-1)/RADI_TILE
+            NT = NTI*NTJ*NTK
+            GM%RADI%NTILES = NT
+            ALLOCATE(ORDER(-1:NTI-1,-1:NTJ-1,-1:NTK-1),INFO_H(RADI_TILE_NINFO,NT),MAP_H(IBAR*JBAR*KBAR,3))
+            ORDER = 0
+            INFO_H = 0
+            T = 0
+            DO TD=0,NTI+NTJ+NTK-3
+                DO TK=0,NTK-1
+                    DO TJ=0,NTJ-1
+                        TI = TD-TJ-TK
+                        IF (TI<0 .OR. TI>NTI-1) CYCLE
+                        T = T + 1
+                        ORDER(TI,TJ,TK) = T
+                    ENDDO
+                ENDDO
+            ENDDO
+            IDX = 0
+            DO TD=0,NTI+NTJ+NTK-3
+                DO TK=0,NTK-1
+                    DO TJ=0,NTJ-1
+                        TI = TD-TJ-TK
+                        IF (TI<0 .OR. TI>NTI-1) CYCLE
+                        T = ORDER(TI,TJ,TK)
+                        NX = MIN(RADI_TILE,IBAR-TI*RADI_TILE)
+                        NY = MIN(RADI_TILE,JBAR-TJ*RADI_TILE)
+                        NZ = MIN(RADI_TILE,KBAR-TK*RADI_TILE)
+                        INFO_H(1,T) = IDX
+                        INFO_H(2,T) = TI*RADI_TILE+1
+                        INFO_H(3,T) = TJ*RADI_TILE+1
+                        INFO_H(4,T) = TK*RADI_TILE+1
+                        INFO_H(5,T) = NX
+                        INFO_H(6,T) = NY
+                        INFO_H(7,T) = NZ
+                        INFO_H(8,T) = ORDER(TI-1,TJ,TK)
+                        INFO_H(9,T) = ORDER(TI,TJ-1,TK)
+                        INFO_H(10,T) = ORDER(TI,TJ,TK-1)
+                        INFO_H(11,T) = NX+NY+NZ-2
+                        DO LD=0,NX+NY+NZ-3
+                            INFO_H(12+LD,T) = IDX-INFO_H(1,T)
+                            DO LK=1,NZ
+                                DO LJ=1,NY
+                                    LI = LD+3-LJ-LK
+                                    IF (LI<1 .OR. LI>NX) CYCLE
+                                    IDX = IDX + 1
+                                    MAP_H(IDX,1) = INFO_H(2,T)+LI-1
+                                    MAP_H(IDX,2) = INFO_H(3,T)+LJ-1
+                                    MAP_H(IDX,3) = INFO_H(4,T)+LK-1
+                                ENDDO
+                            ENDDO
+                        ENDDO
+                        INFO_H(12+NX+NY+NZ-2,T) = IDX-INFO_H(1,T)
+                    ENDDO
+                ENDDO
+            ENDDO
+            ALLOCATE(GM%RADI%TILE_IJK_MAP_D(1:IBAR*JBAR*KBAR,1:3),GM%RADI%TILE_INFO_D(RADI_TILE_NINFO,NT))
+            ALLOCATE(GM%RADI%TILE_DONE_D(0:NT))
+            GM%RADI%TILE_IJK_MAP_D = MAP_H
+            GM%RADI%TILE_INFO_D = INFO_H
+            GM%RADI%TILE_DONE_D = 0
+            DEALLOCATE(ORDER,INFO_H,MAP_H)
+
+        END SUBROUTINE RADI_SETUP_TILES
+
         SUBROUTINE RADI_SYNC_WALL_RADIATION_H2D
             INTEGER :: IW
 
@@ -490,7 +594,7 @@ MODULE G_RADI
             ! the radiation stage (they read IL_R of the last exchange), so their sweeps overlap on the device.
             ! GPU_RADIATION_EXCHANGE and the later stages order themselves through the legacy default stream, which waits
             ! for all mesh streams. The CUDA Fortran default stream is not changed (cudaforSetDefaultStream): once set, the
-            ! array assignments of the other stages became slower on the host (DENSITY_GPU twice as slow on a 44-mesh building model).
+            ! array assignments of the other stages became slower on the host (DENSITY_GPU twice as slow on a large model).
 
             IF (RADIATION) THEN
                 RADIATION_COMPLETED(NM) = .FALSE.
@@ -845,7 +949,7 @@ MODULE G_RADI
                                     BBFA*RPI_SIGMA*TMPA4, RPI, TWO_D, NULL_BOUNDARY, OPEN_BOUNDARY, MIRROR_BOUNDARY, &
                                     INTERPOLATED_BOUNDARY,IBP1,JBP1,SIZE(GM%RADI%CELL_ILW_D,1), &
                                     SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,1),SIZE(GM%RADI%BOUNDARY_RADIA_ILW_D,2), &
-                                    NUMBER_RADIATION_ANGLES)
+                                    NUMBER_RADIATION_ANGLES,GM%WALL_TMP_EXTERIORD,BBFA*RPI_SIGMA)
 
                                 DO NOM=1,NMESHES
                                     IF (.NOT.ALLOCATED(GM%RADI%OMESH(NOM)%IL_R_D)) CYCLE
@@ -1015,7 +1119,8 @@ MODULE G_RADI
                 ENDIF
             ENDIF
 
-            IF (.NOT.GPU_DEBUG_H2D_D2H .AND. UPDATE_INTENSITY .AND. RADI_NEEDS_UII_D2H()) UII = GM%RADI%UII_D
+            ! Read back after all meshes are launched (a copy here would wait for this mesh before the next is launched)
+            IF (.NOT.GPU_DEBUG_H2D_D2H .AND. UPDATE_INTENSITY .AND. RADI_NEEDS_UII_D2H()) GM%RADI%UII_PENDING = .TRUE.
 
         END SUBROUTINE RADIATION_FVM_GPU
 
@@ -1179,6 +1284,14 @@ MODULE G_RADI
             ! streams and every later launch on a mesh stream waits for it, as when the radiation ran on the default stream.
             CALL GPU_STREAM_BARRIER
 
+            ! Integrated intensity of the meshes updated in this radiation call, for the INTEGRATED INTENSITY slices
+            DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+                IF (.NOT.ALLOCATED(GPU_MESHES(NM)%RADI)) CYCLE
+                IF (.NOT.GPU_MESHES(NM)%RADI%UII_PENDING) CYCLE
+                GPU_MESHES(NM)%RADI%UII_PENDING = .FALSE.
+                MESHES(NM)%UII = GPU_MESHES(NM)%RADI%UII_D
+            ENDDO
+
             DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
                 IF (.NOT.ALLOCATED(GPU_MESHES(NM)%RADI)) CYCLE
                 IF (.NOT.GPU_MESHES(NM)%RADI%TARGETS_PENDING) CYCLE
@@ -1259,15 +1372,22 @@ MODULE G_RADI
             INTEGER :: N_DIFF(2)
 
             SELECT CASE(RADI_SWEEP_MODE)
+                CASE(RADI_SWEEP_TILES)
+                    IF (GM%RADI%NTILES>0) THEN
+                        CALL RADI_RUN_SWEEP_TILES(IL_D,IL_UP_D)
+                    ELSE
+                        CALL RADI_RUN_SWEEP_RECORDS(IL_D,IL_UP_D)
+                    ENDIF
+                    RETURN
                 CASE(RADI_SWEEP_RECORDS)
                     CALL RADI_RUN_SWEEP_RECORDS(IL_D,IL_UP_D)
                     RETURN
                 CASE(RADI_SWEEP_CHECK)
-                    ! Per-slice sweep on a copy, then the record sweep on IL_D; both start from the same IL.
+                    ! Record sweep on a copy, then the tiled sweep on IL_D; both start from the same IL.
                     GM%RADI%SWEEP_CHECK_IL_D = IL_D
                     GM%RADI%SWEEP_CHECK_IL_UP_D = IL_UP_D
-                    CALL RADI_RUN_SWEEP_SLICES(GM%RADI%SWEEP_CHECK_IL_D,GM%RADI%SWEEP_CHECK_IL_UP_D)
-                    CALL RADI_RUN_SWEEP_RECORDS(IL_D,IL_UP_D)
+                    CALL RADI_RUN_SWEEP_RECORDS(GM%RADI%SWEEP_CHECK_IL_D,GM%RADI%SWEEP_CHECK_IL_UP_D)
+                    CALL RADI_RUN_SWEEP_TILES(IL_D,IL_UP_D)
                     GM%RADI%SWEEP_CHECK_COUNT_D = 0
                     CALL RADIATION_SWEEP_COMPARE_GPU<<<GM%GRDD_3D_BP1,GM%BLKD_3D_BP1,0,GM%STRM>>>( &
                         IL_D,IL_UP_D,GM%RADI%SWEEP_CHECK_IL_D,GM%RADI%SWEEP_CHECK_IL_UP_D,GM%RADI%SWEEP_CHECK_COUNT_D, &
@@ -1335,6 +1455,31 @@ MODULE G_RADI
             ENDIF
 
             END SUBROUTINE RADI_RUN_SWEEP_RECORDS
+
+            SUBROUTINE RADI_RUN_SWEEP_TILES(IL_D,IL_UP_D)
+            REAL(EB), DEVICE, DIMENSION(0:,0:,0:) :: IL_D,IL_UP_D
+            INTEGER :: NCELL,SY,SZ,NT
+
+            NCELL = SIZE(GM%RADI%TILE_IJK_MAP_D,1)
+            NT = GM%RADI%NTILES
+            IF (NT<=0 .OR. NCELL<=0) RETURN
+            SY = IBP1+1
+            SZ = (IBP1+1)*(JBP1+1)
+
+            CALL RADIATION_TILE_RESET_GPU<<<(NT+GPU_BLKD_1D)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>(GM%RADI%TILE_DONE_D,NT)
+            ! The records in tile order (the same per-cell arithmetic as for the slice order)
+            CALL RADIATION_SWEEP_PREPARE_GPU<<<(NCELL+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                GM%RADI%SWEEP_COEF_D,GM%RADI%SWEEP_LIN_D,GM%RADI%SWEEP_FLAG_D, &
+                CELL_ILW_D,EXTCOE_D,KFST4_GAS_D,KFST4_PART_D,SCAEFF_D,SCAEFF_G_D,UIIOLD_D, &
+                GM%CELL_INDEXD,GM%CELL_SOLID,GM%RADI%TILE_IJK_MAP_D,GM%DXD,GM%DYD,GM%DZD,DLX_D,DLY_D,DLZ_D,RSA_D, &
+                N_IN,ISTEP_IN,JSTEP_IN,KSTEP_IN,RSA_RAT_IN,RFPI,SY,SZ, &
+                IBP1,JBP1,KBP1,GM%CELL_LB,GM%CELL_UB,SIZE(CELL_ILW_D,1),NCELL,RADI_SWEEP_N_COEF)
+            CALL RADIATION_SWEEP_TILES_GPU<<<MIN(NT,RADI_TILE_MAX_BLOCKS),RADI_TILE_THREADS,0,GM%STRM>>>( &
+                IL_D,IL_UP_D,GM%RADI%SWEEP_COEF_D,GM%RADI%SWEEP_LIN_D,GM%RADI%SWEEP_FLAG_D,GM%RADI%TILE_IJK_MAP_D, &
+                GM%RADI%TILE_INFO_D,GM%RADI%TILE_DONE_D,NT,SOLID_PARTICLES,NCELL,RADI_SWEEP_N_COEF, &
+                ISTEP_IN,JSTEP_IN,KSTEP_IN,IBP1,JBP1,KBP1,SY,SZ)
+
+            END SUBROUTINE RADI_RUN_SWEEP_TILES
 
         END SUBROUTINE RADI_RUN_SWEEP
 
@@ -1906,12 +2051,14 @@ MODULE G_RADI
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_WALL_LOOP1_GPU(IL_D, CELL_ILW_D, BOUNDARY_RADIA_ILW_D, OUTRAD_W_D, INRAD_W_D, &
             WALL_TOPO, WALL_EMISSIVITY_D, WALL_BR_INDEX_D, CELL_INDEX_D, DLN_D, DLM_D, N_IN, IBND_IN, N_WALL_TOTAL, &
             IL_OPEN_IN, RPI_IN, TWO_D_IN, NULL_BOUNDARY_IN, OPEN_BOUNDARY_IN, MIRROR_BOUNDARY_IN, &
-            INTERPOLATED_BOUNDARY_IN, IBP1_IN, JBP1_IN, CELL_ILW_SIZE_IN, NBR_IN, NBAND_IN, NRA_IN)
+            INTERPOLATED_BOUNDARY_IN, IBP1_IN, JBP1_IN, CELL_ILW_SIZE_IN, NBR_IN, NBAND_IN, NRA_IN, &
+            WALL_TMP_EXTERIOR_D, BBFA_RPI_SIGMA_IN)
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
             INTEGER, VALUE :: N_IN,IBND_IN,N_WALL_TOTAL,IBP1_IN,JBP1_IN,CELL_ILW_SIZE_IN,NBR_IN,NBAND_IN,NRA_IN
             INTEGER, VALUE :: NULL_BOUNDARY_IN,OPEN_BOUNDARY_IN,MIRROR_BOUNDARY_IN,INTERPOLATED_BOUNDARY_IN
-            REAL(EB), VALUE :: IL_OPEN_IN,RPI_IN
+            REAL(EB), VALUE :: IL_OPEN_IN,RPI_IN,BBFA_RPI_SIGMA_IN
+            REAL(EB), DEVICE, DIMENSION(0:*) :: WALL_TMP_EXTERIOR_D
             LOGICAL, VALUE :: TWO_D_IN
             REAL(EB), DEVICE, DIMENSION(0:IBP1_IN,0:JBP1_IN,0:*) :: IL_D
             REAL(EB), DEVICE, DIMENSION(1:CELL_ILW_SIZE_IN,1:*) :: CELL_ILW_D
@@ -1943,7 +2090,13 @@ MODULE G_RADI
             IF (IBR <= 0) RETURN
 
             IF (BOUNDARY_TYPE==OPEN_BOUNDARY_IN) THEN
-                IL_D(II,JJ,KK) = IL_OPEN_IN
+                ! radi.f90 WALL_LOOP1: an OPEN VENT with TMP_EXTERIOR radiates at TMP_EXTERIOR (with its RAMP); the host
+                ! sets WALL_TMP_EXTERIOR_D = TMP_0+RAMP*(TMP_EXTERIOR-TMP_0) for these walls in WALL_BC_GPU, else 0
+                IF (WALL_TMP_EXTERIOR_D(IW)>0._EB) THEN
+                    IL_D(II,JJ,KK) = BBFA_RPI_SIGMA_IN*WALL_TMP_EXTERIOR_D(IW)**4
+                ELSE
+                    IL_D(II,JJ,KK) = IL_OPEN_IN
+                ENDIF
             ELSEIF (BOUNDARY_TYPE==MIRROR_BOUNDARY_IN) THEN
                 ABS_IOR = ABS(IOR)
                 ILW_VAL = BOUNDARY_RADIA_ILW_D(IBR,IBND_IN,DLM_D(N_IN,ABS_IOR))
@@ -2191,7 +2344,152 @@ MODULE G_RADI
 
         END SUBROUTINE RADIATION_SWEEP_BLOCK_GPU
 
-        !> GFDS_RADI_SWEEP=CHECK: count cells where the record sweep differs from the per-slice sweep.
+        !> Tiled sweep: clear the counter of taken tiles and the tile done flags.
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_TILE_RESET_GPU(TILE_DONE_D,NT)
+            IMPLICIT NONE
+            INTEGER, VALUE :: NT
+            INTEGER, DEVICE, DIMENSION(0:*) :: TILE_DONE_D
+            INTEGER :: I
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X - 1
+            IF (I<=NT) TILE_DONE_D(I) = 0
+        END SUBROUTINE RADIATION_TILE_RESET_GPU
+
+        !> Tiled sweep of the records (RADIATION_SWEEP_PREPARE_GPU in tile order) of all cells of the mesh. Each block
+        !> takes tiles in their order (TILE_DONE_D(0) counts the taken tiles), so a block only waits for tiles taken
+        !> before by running blocks. Per tile: the records and the current IL of the tile cells (kept for solid cells,
+        !> which are not swept) go to shared memory; after the upwind tiles are done (TILE_DONE_D), the upwind faces of
+        !> IL are read (from L2, bypassing L1: they were written by other blocks); the diagonals of the tile are swept
+        !> with a block barrier between them (RADIATION_SWEEP_RECORD_CELL arithmetic); IL (and IL_UP) are written to
+        !> IL_D as they are computed; then, after a memory fence, the tile is flagged done.
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_SWEEP_TILES_GPU(IL_D,IL_UP_D,COEF_D,LIN_D,FLAG_D,MAP_D, &
+            TILE_INFO_D,TILE_DONE_D,NT,SOLID_PARTICLES_IN,NCELL_IN,NCOEF_IN,ISTEP_IN,JSTEP_IN,KSTEP_IN, &
+            IBP1_IN,JBP1_IN,KBP1_IN,SY_IN,SZ_IN)
+            IMPLICIT NONE
+            INTEGER, VALUE :: NT,NCELL_IN,NCOEF_IN,ISTEP_IN,JSTEP_IN,KSTEP_IN,IBP1_IN,JBP1_IN,KBP1_IN,SY_IN,SZ_IN
+            LOGICAL, VALUE :: SOLID_PARTICLES_IN
+            REAL(EB), DEVICE, DIMENSION(0:*) :: IL_D,IL_UP_D
+            REAL(EB), DEVICE, DIMENSION(1:NCOEF_IN,1:NCELL_IN) :: COEF_D
+            INTEGER, DEVICE, DIMENSION(1:NCELL_IN) :: LIN_D,FLAG_D
+            INTEGER, DEVICE, DIMENSION(1:NCELL_IN,1:3) :: MAP_D
+            INTEGER, DEVICE, DIMENSION(1:RADI_TILE_NINFO,1:*) :: TILE_INFO_D
+            INTEGER, DEVICE, DIMENSION(0:*) :: TILE_DONE_D
+            REAL(EB), SHARED :: S_IL(0:RADI_TILE1**3-1)
+            REAL(EB), SHARED :: S_COEF(1:9,1:RADI_TILE**3)
+            INTEGER, SHARED :: S_PK(1:RADI_TILE**3),S_LIN(1:RADI_TILE**3),S_INFO(1:RADI_TILE_NINFO),S_T
+            INTEGER :: TID,NB,T,BASE,I0,J0,K0,NX,NY,NZ,NC,Q,P,M,LI,LJ,LK,I,J,K,D,NHX,NHY,NHZ,R,DG,PK,FLAG,L,ISTAT
+            INTEGER :: NH,HG1,HG2,HG3,HS1,HS2,HS3
+            REAL(EB) :: H1,H2,H3,ILXU,ILYU,ILZU,AILFU,AIU_SUM,ILN
+
+            TID = THREADIDX%X
+            NB = BLOCKDIM%X
+            TILE_LOOP: DO
+                IF (TID==1) S_T = ATOMICADD(TILE_DONE_D(0),1) + 1
+                CALL SYNCTHREADS()
+                T = S_T
+                IF (T>NT) EXIT TILE_LOOP
+                IF (TID<=RADI_TILE_NINFO) S_INFO(TID) = TILE_INFO_D(TID,T)
+                CALL SYNCTHREADS()
+                BASE = S_INFO(1)
+                I0 = S_INFO(2) ; J0 = S_INFO(3) ; K0 = S_INFO(4)
+                NX = S_INFO(5) ; NY = S_INFO(6) ; NZ = S_INFO(7)
+                NC = NX*NY*NZ
+
+                ! Records and current IL of the tile cells (independent of the upwind tiles)
+                DO Q=TID,NC,NB
+                    P = BASE+Q
+                    DO M=1,9
+                        S_COEF(M,Q) = COEF_D(M,P)
+                    ENDDO
+                    LI = MAP_D(P,1)-I0+1
+                    LJ = MAP_D(P,2)-J0+1
+                    LK = MAP_D(P,3)-K0+1
+                    L = LI + RADI_TILE1*(LJ + RADI_TILE1*LK)
+                    S_PK(Q) = FLAG_D(P) + 16*L
+                    S_LIN(Q) = LIN_D(P)
+                    S_IL(L) = __LDCG(IL_D(LIN_D(P)))
+                ENDDO
+
+                ! Upwind faces: cells of the upwind tiles or ghost cells. Their addresses are computed before the wait and
+                ! the values loaded after it, at most 3 per thread (3*RADI_TILE**2 face cells, RADI_TILE_THREADS threads)
+                NHX = NY*NZ
+                NHY = NX*NZ
+                NHZ = NX*NY
+                NH = 0
+                DO Q=TID,NHX+NHY+NHZ,NB
+                    IF (Q<=NHX) THEN
+                        LI = 0 ; LJ = MOD(Q-1,NY)+1 ; LK = (Q-1)/NY+1
+                    ELSEIF (Q<=NHX+NHY) THEN
+                        R = Q-NHX
+                        LJ = 0 ; LI = MOD(R-1,NX)+1 ; LK = (R-1)/NX+1
+                    ELSE
+                        R = Q-NHX-NHY
+                        LK = 0 ; LI = MOD(R-1,NX)+1 ; LJ = (R-1)/NX+1
+                    ENDIF
+                    I = I0+LI-1 ; J = J0+LJ-1 ; K = K0+LK-1
+                    IF (ISTEP_IN < 0) I = IBP1_IN - I
+                    IF (JSTEP_IN < 0) J = JBP1_IN - J
+                    IF (KSTEP_IN < 0) K = KBP1_IN - K
+                    NH = NH + 1
+                    IF (NH==1) THEN ; HG1 = I + SY_IN*J + SZ_IN*K ; HS1 = LI + RADI_TILE1*(LJ + RADI_TILE1*LK) ; ENDIF
+                    IF (NH==2) THEN ; HG2 = I + SY_IN*J + SZ_IN*K ; HS2 = LI + RADI_TILE1*(LJ + RADI_TILE1*LK) ; ENDIF
+                    IF (NH==3) THEN ; HG3 = I + SY_IN*J + SZ_IN*K ; HS3 = LI + RADI_TILE1*(LJ + RADI_TILE1*LK) ; ENDIF
+                ENDDO
+
+                ! Wait for the upwind tiles, one thread per upwind tile
+                IF (TID<=3) THEN
+                    D = S_INFO(7+TID)
+                    IF (D>0) THEN
+                        DO WHILE (ATOMICADD(TILE_DONE_D(D),0)==0)
+                        ENDDO
+                    ENDIF
+                    CALL THREADFENCE()
+                ENDIF
+                CALL SYNCTHREADS()
+
+                IF (NH>=3) THEN
+                    H1 = __LDCG(IL_D(HG1)) ; H2 = __LDCG(IL_D(HG2)) ; H3 = __LDCG(IL_D(HG3))
+                    S_IL(HS1) = H1 ; S_IL(HS2) = H2 ; S_IL(HS3) = H3
+                ELSEIF (NH==2) THEN
+                    H1 = __LDCG(IL_D(HG1)) ; H2 = __LDCG(IL_D(HG2))
+                    S_IL(HS1) = H1 ; S_IL(HS2) = H2
+                ELSEIF (NH==1) THEN
+                    S_IL(HS1) = __LDCG(IL_D(HG1))
+                ENDIF
+                CALL SYNCTHREADS()
+
+                ! Diagonals of the tile (at most 3*RADI_TILE**2/4 cells, one per thread)
+                DO DG=1,S_INFO(11)
+                    Q = S_INFO(11+DG)+TID
+                    IF (Q<=S_INFO(12+DG)) THEN
+                        PK = S_PK(Q)
+                        FLAG = IAND(PK,15)
+                        IF (FLAG<8) THEN
+                        L = ISHFT(PK,-4)
+                        IF (IAND(FLAG,1)/=0) THEN ; ILXU = S_COEF(7,Q) ; ELSE ; ILXU = S_IL(L-1) ; ENDIF
+                        IF (IAND(FLAG,2)/=0) THEN ; ILYU = S_COEF(8,Q) ; ELSE ; ILYU = S_IL(L-RADI_TILE1) ; ENDIF
+                        IF (IAND(FLAG,4)/=0) THEN ; ILZU = S_COEF(9,Q) ; ELSE ; ILZU = S_IL(L-RADI_TILE1*RADI_TILE1) ; ENDIF
+                        AILFU = 0._EB
+                        AIU_SUM = S_COEF(1,Q)*ILXU + S_COEF(2,Q)*ILYU + S_COEF(3,Q)*ILZU + AILFU
+                        IF (SOLID_PARTICLES_IN) IL_UP_D(S_LIN(Q)) = MAX(0._EB,AIU_SUM/COEF_D(10,BASE+Q))
+                        ILN = MAX(0._EB, S_COEF(4,Q) * (AIU_SUM + S_COEF(5,Q)*S_COEF(6,Q)))
+                        S_IL(L) = ILN
+                        IL_D(S_LIN(Q)) = ILN
+                        ENDIF
+                    ENDIF
+                    CALL SYNCTHREADS()
+                ENDDO
+
+                ! Publish the tile: its IL stores before the done flag
+                CALL THREADFENCE()
+                CALL SYNCTHREADS()
+                IF (TID==1) ISTAT = ATOMICEXCH(TILE_DONE_D(T),1)
+            ENDDO TILE_LOOP
+
+        END SUBROUTINE RADIATION_SWEEP_TILES_GPU
+
+        !> GFDS_RADI_SWEEP=CHECK: count cells where the tiled sweep differs from the record sweep.
 
         ATTRIBUTES(GLOBAL) SUBROUTINE RADIATION_SWEEP_COMPARE_GPU(IL_D,IL_UP_D,REF_IL_D,REF_IL_UP_D,COUNT_D,IBP1_IN,JBP1_IN,KBP1_IN, &
             SOLID_PARTICLES_IN)

@@ -4,6 +4,8 @@ GFDS v1.0 is derived from the Fire Dynamics Simulator (FDS) source distributed b
 
 Changes completed in October 2026 add a CUDA Fortran execution path for flow, pressure, combustion, gray-gas radiation, wall, one-dimensional solid heat-transfer, multi-mesh communication, timing, and output calculations. Build and run instructions are provided in [README.md](README.md), with example inputs in [case/](case/).
 
+The FireCat GFDS fork in this repository moves that baseline to the FDS 6.11.1 source (tag `FDS-6.11.1`) and carries the GPU execution path over to it; [README.md](README.md) lists the differences from FDS 6.11.1.
+
 The NIST notice in [LICENSE.md](LICENSE.md) remains applicable to this modified work and must remain intact in redistributed copies.
 
 GFDS makes no warranty of any kind. Users assume all risks arising from its use.

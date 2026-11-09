@@ -28,6 +28,7 @@ TYPE STORAGE_TYPE
    INTEGER :: N_ITEMS_DIM=0                          !< Dimension of 1-D arrays ITEM_INDEX and SURF_INDEX
    INTEGER, ALLOCATABLE, DIMENSION(:) :: ITEM_INDEX  !< Array of indices of the WALL cells, CFACEs, or PARTICLEs
    INTEGER, ALLOCATABLE, DIMENSION(:) :: SURF_INDEX  !< Array of SURF indices of the WALL cells, CFACEs, or PARTICLEs
+   LOGICAL, ALLOCATABLE, DIMENSION(:) :: SAVE_FLAG   !< Array of logical parameters to indicate whether the entry is needed
    INTEGER :: N_REALS_DIM=0                          !< Dimension of the array REALS
    INTEGER :: N_INTEGERS_DIM=0                       !< Dimension of the array INTEGERS
    INTEGER :: N_LOGICALS_DIM=0                       !< Dimension of the array LOGICALS
@@ -88,7 +89,7 @@ TYPE LAGRANGIAN_PARTICLE_CLASS_TYPE
    REAL(EB) :: INITIAL_MASS=-1._EB        !< Initial mass of single particle (kg)
    REAL(EB) :: FTPR                       !< 4/3 * PI * SPECIES(N)\%DENSITY_LIQUID (kg/m3)
    REAL(EB) :: FREE_AREA_FRACTION         !< Area fraction of cell open for flow in SCREEN_DRAG model
-   REAL(EB) :: POROUS_VOLUME_FRACTION     !< Volume fraction of cell open to flow in porous media model
+   REAL(EB) :: POROUS_VOLUME_FRACTION     !< Volume fraction of cell occupied by porous media in the porous media model
    REAL(EB) :: MEAN_DROPLET_VOLUME=0._EB  !< Mean droplet volume
    REAL(EB) :: RUNNING_AVERAGE_FACTOR     !< Fraction of older value to use for particle statistics summations
    REAL(EB) :: SHAPE_FACTOR               !< Ratio of particle cross sectional area to surface area
@@ -123,6 +124,7 @@ TYPE LAGRANGIAN_PARTICLE_CLASS_TYPE
    INTEGER :: DRAG_LAW=1                  !< Code indicating type of drag law
    INTEGER :: DEVC_INDEX=0                !< Index of device that governs this class of particles
    INTEGER :: CTRL_INDEX=0                !< Index of controller that governs this class of particles
+   INTEGER :: NODE_INDEX=0                !< Index of ductnode for surface
    INTEGER :: ORIENTATION_INDEX=0         !< Starting position of the particle class orientation vector within the master array
    INTEGER :: N_ORIENTATION               !< Number of orientations (directions) corresponding to this class of particles
    INTEGER :: Z_INDEX=-1                  !< Species mixture index for this class
@@ -242,6 +244,7 @@ TYPE BOUNDARY_ONE_D_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: LAYER_THICKNESS     !< (1:N_LAYERS) Thickness of layer (m)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: LAYER_THICKNESS_OLD !< (1:N_LAYERS) Thickness of layer (m) at last remesh
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_LAYER_THICKNESS !< (1:N_LAYERS) Minimum thickness of layer (m)
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_LAYER_MASS      !< (1:N_LAYERS) Layer mass for removal (m)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_DIFFUSIVITY     !< (1:N_LAYERS) Min diffusivity of all matls in layer (m2/s)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: DDSUM               !< Scaling factor to get minimum cell size
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: SMALLEST_CELL_SIZE  !< Minimum cell size (m)
@@ -322,6 +325,7 @@ TYPE BOUNDARY_PROP1_TYPE
    REAL(EB) :: RHO_G                 !< Gas density in near wall cell (kg/m3)
    REAL(EB) :: RDN=1._EB             !< \f$ 1/ \delta n \f$ at the surface (1/m)
    REAL(EB) :: K_G=0.025_EB          !< Thermal conductivity of gas in adjacent gas phase cell near wall
+   REAL(EB) :: M_DOT_LAYER_PP=0._EB  !< Mass of a layer removed in kg used to update OB%MASS
    REAL(EB) :: Q_DOT_G_PP=0._EB      !< Heat release rate per unit area (W/m2)
    REAL(EB) :: Q_DOT_O2_PP=0._EB     !< Heat release rate per unit area (W/m2) due to oxygen consumption
    REAL(EB) :: Q_CONDENSE=0._EB      !< Heat release rate per unit area (W/m2) due to gas condensation
@@ -353,6 +357,7 @@ TYPE BOUNDARY_PROP2_TYPE
    REAL(EB) :: Y_PLUS=1._EB          !< Dimensionless boundary layer thickness unit
    REAL(EB) :: Z_STAR=1._EB          !< Dimensionless boundary layer unit
    REAL(EB) :: PHI_LS=-1._EB         !< Level Set value for output only
+   REAL(EB) :: TAU_LS=-1._EB         !< Level Set HRR ramp characteristic time
    REAL(EB) :: WORK1=0._EB           !< Work array
    REAL(EB) :: WORK2=0._EB           !< Work array
    REAL(EB) :: WORK3=0._EB           !< Work array
@@ -645,6 +650,7 @@ TYPE SPECIES_MIXTURE_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: R50
    REAL(EB) :: OXR                  !< Required oxygen for complete combustion (gm/gm-species)
    REAL(EB) :: OXA                  !< Available oxygen for combustion (gm/gm-species)
+   REAL(EB) :: EQUIV                !< Species equiv ratio OXR/OXA
 
 
 END TYPE SPECIES_MIXTURE_TYPE
@@ -916,12 +922,14 @@ TYPE SURFACE_TYPE
    REAL(EB) :: TIME_STEP_FACTOR=10._EB                 !< Maximum amount to reduce solid phase conduction time step
    REAL(EB) :: REMESH_RATIO=0.05                       !< Fraction change in wall node DX to trigger a remesh
    REAL(EB) :: FILM_FACTOR=ONTH                        !< Weighting factor for evaluating surface file properties
+   REAL(EB), DIMENSION(3) :: HT3D_WEIGHT=ONTH          !< Directional weighting factor for HT3D mass transport
 
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: DX,RDX,RDXN,X_S,DX_WGT,MF_FRAC,PARTICLE_INSERT_CLOCK
    REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: RHO_0
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: MASS_FRACTION,MASS_FLUX,DDSUM,SMALLEST_CELL_SIZE,SWELL_RATIO
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: REFERENCE_HEAT_FLUX !< Reference flux for the flux scaling pyrolysis model (kW/m2)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: SPYRO_TH_FACTOR     !< Thickness scaling factor for the flux scaling pyrolysis model
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_LAYER_MASS      !< Initial mass in each layer
 
    TYPE(RAMP_ID_TYPE),  ALLOCATABLE, DIMENSION(:) :: RAMP
    INTEGER, DIMENSION(3) :: RGB
@@ -937,6 +945,8 @@ TYPE SURFACE_TYPE
    INTEGER :: N_LPC=0         !< Number of particle classes emitted by the surface
    INTEGER :: N_CONE_CURVES=0 !< Total number of time vs. heat release rate curves specified for the S-pyro model
    INTEGER :: N_MATL          !< Total number of unique materials over all layers
+   INTEGER :: NODE_INDEX=0    !< Ductnode index
+   INTEGER :: I_GRAD = 1      !< Geometry factor for volume
    INTEGER, DIMENSION(30) :: ONE_D_REALS_ARRAY_SIZE=0,ONE_D_INTEGERS_ARRAY_SIZE=0,ONE_D_LOGICALS_ARRAY_SIZE=0
    INTEGER, ALLOCATABLE, DIMENSION(:) :: N_LAYER_CELLS      !< Number of wall cells per material layer
    INTEGER, ALLOCATABLE, DIMENSION(:) :: LAYER_INDEX        !< The layer each wall cell belongs to
@@ -957,16 +967,18 @@ TYPE SURFACE_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_DIFFUSIVITY
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: HEAT_SOURCE
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: LAYER_THICKNESS
-   REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_LAYER_THICKNESS  ! Smallest layer size before layer is removed (m)
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: MIN_LAYER_THICKNESS !< Smallest layer size before layer is removed (m)
    LOGICAL, ALLOCATABLE, DIMENSION(:) :: HT3D_LAYER
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: CELL_SIZE_FACTOR
-   REAL(EB), ALLOCATABLE, DIMENSION(:) :: CELL_SIZE                               !< Specified constant cell size (m)
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: CELL_SIZE           !< Specified constant cell size (m)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: STRETCH_FACTOR
    REAL(EB), DIMENSION(MAX_LAYERS) :: LAYER_DENSITY,&
-                                      MOISTURE_FRACTION,SURFACE_VOLUME_RATIO,PACKING_RATIO,KAPPA_S=-1._EB,RENODE_DELTA_T
+        MOISTURE_CONTENT,SURFACE_VOLUME_RATIO,PACKING_RATIO,KAPPA_S=-1._EB,RENODE_DELTA_T
+   REAL(EB), DIMENSION(MAX_LAYERS) :: DELAMINATION_TMP,DELAMINATION_DENSITY !< Temp. and density criteria for layer delam.
    REAL(EB), DIMENSION(MAX_LAYERS,MAX_MATERIALS) :: DENSITY_ADJUST_FACTOR=1._EB,RHO_S
    CHARACTER(LABEL_LENGTH), ALLOCATABLE, DIMENSION(:) :: MATL_NAME
    CHARACTER(LABEL_LENGTH), DIMENSION(MAX_LAYERS,MAX_MATERIALS) :: MATL_ID
+   CHARACTER(LABEL_LENGTH) :: NODE_ID='null'           !< ID of a duct node
    REAL(EB), DIMENSION(MAX_LAYERS,MAX_MATERIALS) :: MATL_MASS_FRACTION
    LOGICAL :: BURN_AWAY,ADIABATIC,USER_DEFINED=.TRUE., &
               FREE_SLIP=.FALSE.,NO_SLIP=.FALSE.,SPECIFIED_NORMAL_VELOCITY=.FALSE.,SPECIFIED_TANGENTIAL_VELOCITY=.FALSE., &
@@ -987,6 +999,7 @@ TYPE SURFACE_TYPE
    LOGICAL :: INERT_Q_REF                            !< Treat REFERENCE_HEAT_FLUX as an inert atmosphere test
    LOGICAL :: ALLOW_UNDERSIDE_PARTICLES=.FALSE.      !< Allow droplets to move along downward facing surfaces
    LOGICAL :: ALLOW_SURFACE_PARTICLES=.TRUE.         !< Allow particles to live on a solid surface
+   LOGICAL :: SKIP_INRAD = .FALSE.                   !< Only apply external flux to a surface
    INTEGER :: GEOMETRY,BACKING,PROFILE,HEAT_TRANSFER_MODEL=0,NEAR_WALL_TURB_MODEL=5
    CHARACTER(LABEL_LENGTH) :: PART_ID
    CHARACTER(LABEL_LENGTH) :: ID,TEXTURE_MAP,LEAK_PATH_ID(2)
@@ -1000,12 +1013,12 @@ TYPE SURFACE_TYPE
 
    ! Level Set Firespread
 
-   LOGICAL :: VEG_LSET_SPREAD,VEG_LSET_TAN2,VEG_LSET_ROS_FIXED
-   REAL(EB) :: VEG_LSET_IGNITE_T,VEG_LSET_ROS_HEAD,VEG_LSET_ROS_00,VEG_LSET_QCON,VEG_LSET_ROS_FLANK,VEG_LSET_ROS_BACK, &
-               VEG_LSET_WIND_EXP,VEG_LSET_SIGMA,VEG_LSET_HT,VEG_LSET_BETA,&
+   LOGICAL :: VEG_LSET_SPREAD,VEG_LSET_ROS_FIXED
+   REAL(EB) :: VEG_LSET_IGNITE_T,VEG_LSET_ROS_00,VEG_LSET_QCON,VEG_LSET_SIGMA,VEG_LSET_HT,VEG_LSET_BETA,&
                VEG_LSET_M1,VEG_LSET_M10,VEG_LSET_M100,VEG_LSET_MLW,VEG_LSET_MLH,VEG_LSET_SURF_LOAD,VEG_LSET_FIREBASE_TIME, &
-               VEG_LSET_CHAR_FRACTION
-   INTEGER :: VEG_LSET_FUEL_INDEX
+               VEG_LSET_CHAR_FRACTION,VEG_LSET_WIND_HEIGHT, &
+               B_ROTH,C_ROTH,BETA_ROTH
+   INTEGER :: VEG_LSET_FUEL_INDEX,I_RAMP_LS_WIND=-1
 
 END TYPE SURFACE_TYPE
 
@@ -1013,7 +1026,7 @@ TYPE (SURFACE_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: SURFACE
 
 TYPE OMESH_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:,:,:) ::&
-         MU,RHO,RHOS,TMP,U,V,W,US,VS,WS,H,HS,FVX,FVY,FVZ,FVX_D,FVY_D,FVZ_D,D,DS,KRES,IL_S,IL_R,Q
+         MU,RHO,RHOS,TMP,U,V,W,US,VS,WS,H,HS,FVX,FVY,FVZ,FVX_D,FVY_D,FVZ_D,D,DS,KRES,IL_S,IL_R,IL_R_OLD,Q
    REAL(EB), ALLOCATABLE, DIMENSION(:,:,:,:) :: ZZ,ZZS
    INTEGER, ALLOCATABLE, DIMENSION(:) :: IIO_R,JJO_R,KKO_R,IOR_R,IIO_S,JJO_S,KKO_S,IOR_S
    INTEGER :: I_MIN_R=-10,I_MAX_R=-10,J_MIN_R=-10,J_MAX_R=-10,K_MIN_R=-10,K_MAX_R=-10,NIC_R=0, &
@@ -1027,6 +1040,13 @@ TYPE OMESH_TYPE
    TYPE (STORAGE_TYPE) :: WALL_SEND_BUFFER,WALL_RECV_BUFFER
    TYPE (STORAGE_TYPE) :: THIN_WALL_SEND_BUFFER,THIN_WALL_RECV_BUFFER
 
+   ! Cross-mesh BACK CFACE exchange (exposed backing of immersed geometry CFACEs):
+   TYPE (STORAGE_TYPE) :: CFACE_SEND_BUFFER,CFACE_RECV_BUFFER
+   INTEGER :: N_CFACE_QUERY=0,N_CFACE_QUERY_DIM=0
+   REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: CFACE_QUERY_XYZ   !< Back-face intersection points (3,N) that NM needs NOM to resolve
+   REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: CFACE_QUERY_NBACK !< Back GEOMETRY triangle normal (3,N) used to orient the back CFACE search
+   INTEGER,  ALLOCATABLE, DIMENSION(:)   :: CFACE_QUERY_FRONT !< Front CFACE index (in NM) associated with each query
+
    ! CC_IBM data exchange arrays:
    INTEGER :: NICC_S(2)=0, NICC_R(2)=0, NICF_S(2)=0, NICF_R(2)=0, NLKF_S=0, NLKF_R=0, &
               NFCC_S(2)=0, NFCC_R(2)=0, NCC_INT_R=0, NFEP_R(5)=0, NFEP_R_G=0
@@ -1036,6 +1056,7 @@ TYPE OMESH_TYPE
    INTEGER, ALLOCATABLE, DIMENSION(:) :: ICC_UNKZ_CT_S, ICC_UNKZ_CC_S, ICC_UNKZ_CT_R, ICC_UNKZ_CC_R,&
                                          ICF_UFFB_CF_S, ICF_UFFB_CF_R
    INTEGER, ALLOCATABLE, DIMENSION(:) :: UNKZ_CT_S, UNKZ_CC_S, UNKZ_CT_R, UNKZ_CC_R
+   INTEGER, ALLOCATABLE, DIMENSION(:,:,:) :: MUNKH,GSCH,EWC_TYPE
 
    ! Face variables data (velocities):
    INTEGER, ALLOCATABLE, DIMENSION(:) :: IIO_FC_R,JJO_FC_R,KKO_FC_R,AXS_FC_R,IIO_FC_S,JJO_FC_S,KKO_FC_S,AXS_FC_S
@@ -1144,10 +1165,10 @@ END TYPE TRANSFORM_TYPE
 
 TYPE GEOMETRY_TYPE
    CHARACTER(LABEL_LENGTH) :: ID,MATL_ID,DEVC_ID,MOVE_ID
-   CHARACTER(LABEL_LENGTH), ALLOCATABLE, DIMENSION(:) :: SURF_ID
+   CHARACTER(LABEL_LENGTH), ALLOCATABLE, DIMENSION(:) :: SURF_ID,VENT_ID
    CHARACTER(LABEL_LENGTH) :: GEOC_FILENAME='null',TEXTURE_MAPPING
    LOGICAL :: COMPONENT_ONLY,IS_DYNAMIC=.TRUE.,HAVE_SURF,HAVE_MATL,HIDDEN,REMOVEABLE,SHOW_BNDF=.TRUE., &
-              READ_BINARY=.FALSE.,IS_TERRAIN=.FALSE.
+              READ_BINARY=.FALSE.,IS_TERRAIN=.FALSE.,HAVE_NODE=.FALSE.
    INTEGER :: N_VERTS_BASE,N_FACES_BASE,N_VOLUS_BASE,N_VERTS,N_EDGES,N_FACES,N_VOLUS,NSUB_GEOMS,GEOM_TYPE,IJK(3),N_LEVELS,&
               DEVC_INDEX=-1,CTRL_INDEX=-1,PROP_INDEX=-1,DEVC_INDEX_O=-1,CTRL_INDEX_O=-1,MATL_INDEX=-1,&
               CYLINDER_NSEG_THETA,CYLINDER_NSEG_AXIS,CELL_BLOCK_IOR=0
@@ -1157,7 +1178,7 @@ TYPE GEOMETRY_TYPE
                XB(6),SPHERE_ORIGIN(3),SPHERE_RADIUS,TEXTURE_ORIGIN(3),TEXTURE_SCALE(2),MIN_LEDGE,MAX_LEDGE,MEAN_LEDGE,&
                GEOM_BOX(LOW_IND:HIGH_IND,IAXIS:KAXIS),TRANSPARENCY,CYLINDER_ORIGIN(3),CYLINDER_AXIS(3),&
                CYLINDER_RADIUS,CYLINDER_LENGTH,CELL_BLOCK_ORIENTATION(3)=0._EB
-   INTEGER, ALLOCATABLE,DIMENSION(:)   :: FACES,VOLUS,SUB_GEOMS,SURFS,MATLS
+   INTEGER, ALLOCATABLE,DIMENSION(:)   :: FACES,VOLUS,SUB_GEOMS,SURFS,VENTS,MATLS
    INTEGER, ALLOCATABLE,DIMENSION(:,:) :: EDGES,FACE_EDGES,EDGE_FACES
    REAL(EB),ALLOCATABLE,DIMENSION(:)   :: FACES_AREA,VERTS_BASE,VERTS,TFACES,DAZIM,DELEV,ZVALS
    REAL(EB),ALLOCATABLE,DIMENSION(:,:) :: FACES_NORMAL,DSCALE,DXYZ0,DXYZ
@@ -1339,6 +1360,7 @@ TYPE CFACE_TYPE
    INTEGER :: B2_INDEX=0                 !< Derived type carrying most of the surface boundary conditions
    INTEGER :: BR_INDEX=0                 !< Derived type carrying angular-specific radiation intensities
    INTEGER :: SURF_INDEX=0
+   INTEGER :: NODE_INDEX=0
    INTEGER :: VENT_INDEX=0
    INTEGER :: BOUNDARY_TYPE=0
    INTEGER :: CUT_FACE_IND1=-11          !< First index pointing to CUT_FACE array for this CFACE.
@@ -1375,6 +1397,7 @@ TYPE CC_CUTCELL_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:,:)    ::           XYZCEN !< Cut-cell centroid locations. (IAXIS:KAXIS,1:NCELL)
    INTEGER,  ALLOCATABLE, DIMENSION(:)      ::             UNKZ !< Cut-cells unknown number for scalars.
    INTEGER,  ALLOCATABLE, DIMENSION(:)      ::        NOADVANCE !< Array to define if cut-cell should be blocked. (1:NCELL)
+   INTEGER,  ALLOCATABLE, DIMENSION(:,:)    ::     BODTRI_DONOR !< Donor body/triangle for blocked-cell generated inboundary faces. (1:2,1:NCELL)
    INTEGER                                  ::       N_NOMICC=0 !< Number of entries in NOMICC
    INTEGER,  ALLOCATABLE, DIMENSION(:,:)    ::           NOMICC !< OMESH cut-cells array. (1:2,1:N_NOMICC)
 
@@ -1422,6 +1445,21 @@ TYPE CC_CUTCELL_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:,:)    :: DEL_RHO_D_DEL_Z_VOL !< Cut-cells DEL_RHO_D_DEL_Z * VOL
    REAL(EB), ALLOCATABLE, DIMENSION(:,:)    :: U_DOT_DEL_RHO_Z_VOL !< Cut-cells U_DOT_DEL_RHO_Z * VOL
 END TYPE CC_CUTCELL_TYPE
+
+
+!> \brief Mesh-owned GCELL storage in SoA form.
+!! One GCELL slot IG = one connected gas polyhedron in the active complex-geometry region.
+
+TYPE CC_GCELL_TYPE
+   INTEGER :: N = 0
+   INTEGER,  ALLOCATABLE, DIMENSION(:)   :: CELL_TYPE !< (1:N) CC_GCELL_CUT or CC_GCELL_REG.
+   INTEGER,  ALLOCATABLE, DIMENSION(:,:) :: IJK       !< (IAXIS:KAXIS,1:N) host Cartesian cell indices.
+   INTEGER,  ALLOCATABLE, DIMENSION(:)   :: ICC       !< (1:N) CUT_CELL index (0 if regular cell).
+   INTEGER,  ALLOCATABLE, DIMENSION(:)   :: JCC       !< (1:N) sub-cell index within CUT_CELL (0 if regular).
+   INTEGER,  ALLOCATABLE, DIMENSION(:)   :: STATUS    !< (1:N) active / blocked.
+   REAL(EB), ALLOCATABLE, DIMENSION(:)   :: VOLUME    !< (1:N) cached volume.
+   REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: XYZCEN    !< (IAXIS:KAXIS,1:N) cached centroid.
+END TYPE CC_GCELL_TYPE
 
 
 !> \brief Regular faces type that contains indexes for construction of H Poisson discretization matrix.
@@ -1531,7 +1569,7 @@ TYPE RAMPS_TYPE
    INTEGER :: NUMBER_DATA_POINTS,NUMBER_INTERPOLATION_POINTS,DEVC_INDEX=-1,CTRL_INDEX=-1,DEVC_DEP_INDEX=-1,CTRL_DEP_INDEX=-1,&
               RESERVED_RAMP_INDEX=0
    CHARACTER(LABEL_LENGTH) :: ID='null',DEVC_ID='null',CTRL_ID='null',DEVC_ID_DEP='null',CTRL_ID_DEP='null'
-   LOGICAL :: DEP_VAR_UNITS_CONVERTED=.FALSE.,EXTERNAL_FILE=.FALSE.
+   LOGICAL :: DEP_VAR_UNITS_CONVERTED=.FALSE.,EXTERNAL_FILE=.FALSE.,CYCLING=.FALSE.
 END TYPE RAMPS_TYPE
 
 TYPE (RAMPS_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: RAMPS
@@ -1546,12 +1584,12 @@ INTEGER :: N_RESERVED_RAMPS=0
 TYPE (RESERVED_RAMPS_TYPE), DIMENSION(10), TARGET :: RESERVED_RAMPS
 
 TYPE SLICE_TYPE
-   INTEGER :: I1,I2,J1,J2,K1,K2,GEOM_INDEX=-1,INDEX,INDEX2=0,Z_INDEX=-999,Y_INDEX=-999,MATL_INDEX=-999,&
-              PART_INDEX=0,VELO_INDEX=0,PROP_INDEX=0,REAC_INDEX=0,SLCF_INDEX,IOR
+   INTEGER :: I1,I2,J1,J2,K1,K2,GEOM_INDEX=-1,INDEX,Z_INDEX=-999,Y_INDEX=-999,MATL_INDEX=-999,&
+              PART_INDEX=0,VELO_INDEX=0,REAC_INDEX=0,SLCF_INDEX,IOR
    REAL(FB), DIMENSION(2) :: MINMAX
    REAL(FB) :: RLE_MIN, RLE_MAX
    REAL(EB):: AGL_SLICE
-   LOGICAL :: TERRAIN_SLICE=.FALSE.,CELL_CENTERED=.FALSE.,RLE=.FALSE.,DEBUG=.FALSE.,THREE_D=.FALSE.
+   LOGICAL :: TERRAIN_SLICE=.FALSE.,CELL_CENTERED=.FALSE.,RLE=.FALSE.,DEBUG=.FALSE.,THREE_D=.FALSE.,DRY=.FALSE.
    CHARACTER(LABEL_LENGTH) :: SLICETYPE='STRUCTURED',SMOKEVIEW_LABEL
    CHARACTER(LABEL_LENGTH) :: SMOKEVIEW_BAR_LABEL,ID='null',MATL_ID='null'
 END TYPE SLICE_TYPE
@@ -1733,6 +1771,13 @@ TYPE ZONE_MESH_TYPE
 END TYPE ZONE_MESH_TYPE
 
 
+!> \brief Per-row container for variable nonzeros in H matrix (used by GLOBMAT_SOLVER)
+TYPE H_ROW_TYPE
+   INTEGER :: NNZ = 0
+   INTEGER, ALLOCATABLE, DIMENSION(:) :: JD   !< Column indices for this row
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: D   !< Nonzero values for this row (same length as JD)
+END TYPE H_ROW_TYPE
+
 !> \brief Parameters associated with a ZONE, used in GLOBMAT_SOLVER unstructured pressure solver
 
 TYPE ZONE_SOLVE_TYPE
@@ -1754,14 +1799,12 @@ TYPE ZONE_SOLVE_TYPE
    INTEGER :: CONNECTED_ZONE_PARENT=0                 !< Index of first zone in a connected zone list.
    INTEGER, ALLOCATABLE, DIMENSION(:)   :: NUNKH_LOC  !< Number of local H unknowns per mesh for a given pressure zone.
    INTEGER, ALLOCATABLE, DIMENSION(:)   :: UNKH_IND   !< H unknown numbering start index per mesh for a given pressure zone.
-   INTEGER, ALLOCATABLE, DIMENSION(:)   :: NNZ_D_MAT_H!< Number of non-zeros per row of global matrix.
-   INTEGER, ALLOCATABLE, DIMENSION(:,:) :: JD_MAT_H   !< Column index per row of non-zeros of global matrix.
-   REAL(EB),ALLOCATABLE, DIMENSION(:,:) :: D_MAT_H    !< Nonzero values per row for global matrix.
    INTEGER, ALLOCATABLE, DIMENSION(:,:) :: MESH_IJK   !< I,J,K positions of cell with unknown row IROW (1:3,1:NUNKH).
    REAL(EB),ALLOCATABLE, DIMENSION(:)   :: A_H        !< Matrix coefficients for pressure zone, up triang part, CSR format.
    INTEGER ,ALLOCATABLE, DIMENSION(:)   :: IA_H,JA_H  !< Matrix indexes for pressure zone, up triang part, CSR format.
    REAL(EB),ALLOCATABLE, DIMENSION(:)   :: F_H,X_H    !< RHS and Solution containers for pressure zone.
    REAL(FB),ALLOCATABLE, DIMENSION(:)   :: A_H_FB,F_H_FB,X_H_FB!< Arrays in case of single precision solve.
+   TYPE(H_ROW_TYPE), ALLOCATABLE, DIMENSION(:) :: ROW_H !< Variable-nnz per-row storage for assembly.
 END TYPE ZONE_SOLVE_TYPE
 
 TYPE (ZONE_SOLVE_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: ZONE_SOLVE
@@ -1877,10 +1920,10 @@ TYPE DUCTNODE_TYPE
    LOGICAL :: AMBIENT = .FALSE.                            !< Node is connected to the ambient
    LOGICAL :: LEAKAGE=.FALSE.                              !< Node is being used for leakage
    LOGICAL :: VENT=.FALSE.                                 !< Node has an attached vent
+   LOGICAL :: GEOM=.FALSE.                                 !< Node has an attached GEOM
    LOGICAL :: HMT_FILTER=.FALSE.                           !< Filter is in mass transport ductrun
    LOGICAL :: TRANSPORT_PARTICLES=.FALSE.                  !< Particles will be transported through the vent attached to the node
    LOGICAL :: SPECIFIED_XYZ=.FALSE.                        !< Node has explicit XYZ.
-   LOGICAL, ALLOCATABLE, DIMENSION(:) :: IN_MESH           !< (i) Flag indicating node is present in mesh i
 END TYPE DUCTNODE_TYPE
 
 TYPE (DUCTNODE_TYPE), DIMENSION(:), ALLOCATABLE,  TARGET :: DUCTNODE
@@ -2042,6 +2085,7 @@ TYPE FAN_TYPE
    REAL(EB) :: MAX_PRES                !< Maximum fan pressure (Pa) used for FAN_TYPE=2
    REAL(EB) :: OFF_LOSS=1._EB          !< Flow loss through fan when it is not running
    REAL(EB) :: TAU=0._EB               !< t2 or tanh time constant for spinning up fan speed
+   REAL(EB) :: CURVE_TEMP              !< Temperature basis for fan curve
    CHARACTER(LABEL_LENGTH) :: ID       !< Name of fan
    CHARACTER(LABEL_LENGTH) :: FAN_RAMP !< Name of RAMP containing fan curve
 END TYPE FAN_TYPE
@@ -2074,7 +2118,7 @@ TYPE NETWORK_TYPE
    INTEGER, ALLOCATABLE, DIMENSION(:) :: MATRIX_INDEX !< Position of ducts and nodes in solution matrix
 END TYPE NETWORK_TYPE
 
-TYPE(NETWORK_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: NETWORK
+TYPE(NETWORK_TYPE), TARGET :: NETWORK
 
 TYPE DUCTRUN_TYPE
    INTEGER :: N_DUCTS = 0                              !< Number of ducts in ductrun
@@ -2112,6 +2156,7 @@ TYPE HVAC_QUANTITY_TYPE
    CHARACTER(LABEL_LENGTH) :: SMOKEVIEW_LABEL !< Smokeview label for QUANTITY
    CHARACTER(LABEL_LENGTH) :: SMOKEVIEW_BAR_LABEL !< Smokeview colorbar label for QUANTITY
    CHARACTER(LABEL_LENGTH) :: UNITS !< Units for QUANTITY
+   LOGICAL :: DRY !< Remove water vapor before computing a mass or volume fraction
 END TYPE HVAC_QUANTITY_TYPE
 
 

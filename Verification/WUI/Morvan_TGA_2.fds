@@ -1,16 +1,17 @@
 &HEAD CHID='Morvan_TGA_2', TITLE='Same as Morvan_TGA, except directly specifying A and E' /
 
-&MESH IJK=5,5,5, XB=-1.2,3.6,-1.2,1.2,0.0,9.6
+&MESH IJK=5,5,5, XB=-1.2,3.6,-1.2,1.2,0.0,9.6 /
 
 &TIME T_END=1. /
 
-&REAC FUEL='CELLULOSE', C=2.28, H=6.34, O=2.44, SOOT_YIELD=0.02, HEAT_OF_COMBUSTION=17700. /
+&SPEC ID='CELLULOSE', C=2.28, H=6.34, O=2.44/
+&REAC FUEL='CELLULOSE', SOOT_YIELD=0.02, HEAT_OF_COMBUSTION=17700. /
 
 &SPEC ID='WATER VAPOR' /
 
 &SURF ID                        = 'foliage'
       MATL_ID                   = 'vegetation'
-      MOISTURE_FRACTION         = 0.10
+      MOISTURE_CONTENT         = 0.10
       SURFACE_VOLUME_RATIO      = 3940.
       LENGTH                    = 0.05
       GEOMETRY                  = 'CYLINDRICAL'

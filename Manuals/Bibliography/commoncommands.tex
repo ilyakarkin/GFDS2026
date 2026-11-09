@@ -27,15 +27,17 @@
 \usepackage{multirow}
 %\usepackage{pdfsync}
 \usepackage{tikz}
+\usetikzlibrary{patterns,arrows.meta,positioning}
 \usepackage{bm}
 \usepackage{pgfplots}
 %\pgfplotsset{compat=1.7}
 \usepackage{tocloft}
 \usepackage{color}
-\usepackage{amsmath}
 \definecolor{linknavy}{rgb}{0,0,0.50196}
 \definecolor{linkred}{rgb}{1,0,0}
 \definecolor{linkblue}{rgb}{0,0,1}
+\usepackage{amsmath}
+\usepackage{cancel}
 \usepackage{float}
 \usepackage{caption}
 \usepackage{pict2e}
@@ -44,6 +46,7 @@
 \usepackage{geometry}
 \usepackage{relsize}
 \usepackage{longtable}
+\usepackage{xltabular}
 \usepackage{lscape}
 \usepackage{booktabs}
 \usepackage{colortbl}
@@ -61,11 +64,17 @@
 \usepackage[section]{placeins}
 \usepackage{scrextend}
 \usepackage{needspace}
+\usepackage[backend=biber, style=numeric-comp, sorting=none, backref=true, giveninits=true, maxbibnames=99]{biblatex}
+\ExecuteBibliographyOptions[report]{doi=true, url=true}
+\renewbibmacro{in:}{}
+\DeclareFieldFormat{titlecase}{#1}
 
 \newcommand{\nopart}{\expandafter\def\csname Parent-1\endcsname{}} % To fix table of contents in pdf.
 \newcommand{\ct}[1]{\lstinline{#1}}
+\newcommand{\tct}[1]{\lstinline[basicstyle=\scriptsize\ttfamily]!#1!}
 
 \usepackage{siunitx}
+
 
 \usepackage{listings}
 \usepackage{textcomp}
@@ -73,7 +82,7 @@
     tabsize=4,
     rulecolor=,
     language=Fortran,
-        basicstyle=\footnotesize\ttfamily,
+        basicstyle=\small\ttfamily,
         upquote=true,
         aboveskip={\baselineskip},
         belowskip={\baselineskip},
@@ -100,11 +109,22 @@
         citecolor=linkred,     % citation number colors
         linkcolor=linknavy,    % \ref{...} and \pageref{...}
         pdfproducer={pdflatex},
-        pagebackref,
         pdfpagemode=UseNone,
         bookmarksopen=true,
         plainpages=false,
+        hypertexnames=true,
         verbose]{hyperref}
+
+% Needed to fix page back ref links
+\makeatletter
+\hypersetup{pageanchor=false}
+
+\let\FDS@orig@pagenumbering\pagenumbering
+\renewcommand*{\pagenumbering}[1]{%
+  \hypersetup{pageanchor=true}%
+  \FDS@orig@pagenumbering{#1}%
+}
+\makeatother
 
 % The Following commented code makes the ``Draft'' watermark on each page.
 %\usepackage{eso-pic}
@@ -155,7 +175,7 @@ Chandan Paul
 
 \newcommand{\logosigs}{
 \begin{minipage}[b]{6.25in}
-\parbox[b]{.5\textwidth}{\flushleft{\includegraphics[height=1.5in]{../Bibliography/FDS_Logo_lock}}}
+\parbox[b]{.5\textwidth}{\flushleft{\includegraphics[height=0.8in]{../Bibliography/FSRI_blk_logo_Lockup}}}
 \hfill
 \parbox[b]{.5\textwidth}{\flushright{\includegraphics[height=1in]{../Bibliography/nistident_flright_vec}}}
 \end{minipage}
@@ -172,7 +192,7 @@ Eric Mueller \\
 Simo Hostikka \\
 {\em Aalto University, Espoo, Finland} \\[.1in]
 Jason Floyd \\
-{\em Fire Safety Research Institute, UL Research Institutes, Columbia, Maryland} \\[.1in]
+{\em UL Research Institutes' Fire Safety Research Institute, Columbia, Maryland} \\[.1in]
 Chandan Paul \\
 {\em The George Washington University, Washington, D.C.}
 \end{flushright}
@@ -274,8 +294,8 @@ http://dx.doi.org/10.6028/NIST.SP.#1
 \newcommand{\dx}{\delta x}
 \newcommand{\dy}{\delta y}
 \newcommand{\dz}{\delta z}
-\newcommand{\degF}{$^\circ$F}
-\newcommand{\degC}{$^\circ$C}
+\newcommand{\degF}{\textdegree F}
+\newcommand{\degC}{\textdegree C}
 \newcommand{\x}{x}
 \newcommand{\y}{y}
 \newcommand{\z}{z}

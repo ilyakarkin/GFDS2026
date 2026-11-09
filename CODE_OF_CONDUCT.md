@@ -6,9 +6,6 @@ Harassment, discrimination, threats, personal attacks, disruptive behavior, publ
 
 Project maintainers may edit or remove content, close discussions, reject contributions, or restrict participation when required.
 
-Report conduct concerns privately to:
-
-- [xiaoxm8@mail2.sysu.edu.cn](mailto:xiaoxm8@mail2.sysu.edu.cn)
-- [mingpj@mail.sysu.edu.cn](mailto:mingpj@mail.sysu.edu.cn)
+Report conduct concerns privately through the [GitHub report-abuse form](https://github.com/contact/report-abuse).
 
 This code is based on the [Contributor Covenant, version 2.0](https://www.contributor-covenant.org/version/2/0/code_of_conduct.html).

@@ -1,7 +1,9 @@
 MODULE SPECDATA
 
 USE PRECISION_PARAMETERS
+
 IMPLICIT NONE
+
 INTEGER ::  I,J
 INTEGER, PARAMETER :: NWATERK=183
 REAL(EB) :: CPLXREF_WATER(NWATERK,2)
@@ -315,14 +317,16 @@ DATA (CPLXREF_FUEL( 94,J), J=1,3) / 10.0_EB, 1.45_EB, 8.24E-04_EB /
 
 END MODULE SPECDATA
 
-MODULE WSGG_ARRAYS
-USE PRECISION_PARAMETERS
 
+MODULE WSGG_ARRAYS
+
+USE PRECISION_PARAMETERS
 REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: WSGG_B1_ARRAY,WSGG_B2_ARRAY,WSGG_D_ARRAY
 REAL(EB), ALLOCATABLE, DIMENSION(:,:,:) :: WSGG_C_ARRAY
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: WSGG_KAPPAP1_ARRAY,WSGG_KAPPAP2_ARRAY
 
 END MODULE WSGG_ARRAYS
+
 
 MODULE MIEV
 
@@ -2666,14 +2670,17 @@ END FUNCTION WRONG
 END SUBROUTINE TESTMI
 
 
+!> \brief Print out a warning or error message;  ABORT IF ERROR AFTER MAKING SYMBOLIC DUMP (MACHINE-SPECIFIC)
+
 SUBROUTINE ERRMSG( MESSAG, FATAL )
-! PRINT OUT A WARNING OR ERROR MESSAGE;  ABORT IF ERROR AFTER MAKING SYMBOLIC DUMP (MACHINE-SPECIFIC)
+
 USE COMP_FUNCTIONS, ONLY: SHUTDOWN
 CHARACTER :: MESSAG*(*)
 LOGICAL ::  FATAL,MSGLIM
 INTEGER ::  MAXMSG, NUMMSG
 SAVE      MAXMSG, NUMMSG, MSGLIM
 DATA      NUMMSG / 0 /,  MAXMSG / 100 /,  MSGLIM /.FALSE./
+
 IF (FATAL) CALL SHUTDOWN(MESSAG)
 NUMMSG = NUMMSG + 1
 IF( MSGLIM ) RETURN
@@ -2688,19 +2695,21 @@ RETURN
 END SUBROUTINE ERRMSG
 
 
+!> \brief Write names of erroneous variables and return T
+!> \param VARNAM Name of erroneous variable to be written
+
 LOGICAL FUNCTION WRTBAD( VARNAM )
-!          WRITE NAMES OF ERRONEOUS VARIABLES AND RETURN 'TRUE'
-!      INPUT :   VARNAM = NAME OF ERRONEOUS VARIABLE TO BE WRITTEN
-!                         ( CHARACTER, ANY LENGTH )
+
 CHARACTER VARNAM*(*)
 INTEGER   MAXMSG, NUMMSG
 SAVE      NUMMSG, MAXMSG
 DATA      NUMMSG / 0 /, MAXMSG / 50 /
+
 WRTBAD = .TRUE.
 NUMMSG = NUMMSG + 1
 WRITE(LU_ERR, '(3A)' ) ' ****  INPUT VARIABLE  ', VARNAM,'  IN ERROR  ****'
 IF( NUMMSG==MAXMSG ) CALL ERRMSG( 'TOO MANY INPUT ERRORS.  ABORTING...',.TRUE.)
-RETURN
+
 END FUNCTION WRTBAD
 
 
@@ -2717,7 +2726,7 @@ INTEGER ::  MINVAL
 
 WRITE(LU_ERR, '(3A,I7)' ) ' ****  SYMBOLIC DIMENSION  ', DIMNAM,'  SHOULD BE INCREASED TO AT LEAST ', MINVAL
 WRTDIM = .TRUE.
-RETURN
+
 END FUNCTION WRTDIM
 
 
@@ -2739,43 +2748,45 @@ END FUNCTION SQ
 
 END MODULE MIEV
 
+
+!> \brief Radiation heat transfer
+
 MODULE RAD
 
-! Radiation heat transfer
-
 USE PRECISION_PARAMETERS
+USE FDS_RANDOM, ONLY: FDS_RANDOM_NUMBER,FDS_RANDOM_SEED
 USE GLOBAL_CONSTANTS
 USE OUTPUT_CLOCKS, ONLY: RADF_CLOCK,RADF_COUNTER
 USE MESH_POINTERS
-USE MESH_VARIABLES
 USE RADCONS
-USE COMP_FUNCTIONS, ONLY : CURRENT_TIME
+USE RADCAL_VAR
 
 IMPLICIT NONE
 PRIVATE
 
-PUBLIC INIT_RADIATION,COMPUTE_RADIATION,BLACKBODY_FRACTION
+PUBLIC INIT_RADIATION,COMPUTE_RADIATION,BLACKBODY_FRACTION,CALCULATE_DIRECTION_COEFFICIENTS,INTERPOLATE_IL
+PUBLIC N_KAPPA_T,N_KAPPA_X,KAPPA_X_MIN,KAPPA_C_MIN,LOG_KAPPA_X_FAC,LOG_KAPPA_C_FAC,Y2RADCAL_SPECIES,RADCAL_SPECIES2KAPPA,&
+       KAPPA_COND,N_RADCAL_ARRAY_SIZE,RADCAL_SPECIES_INDEX  ! GPU: look-up tables of GET_KAPPA, copied to the device
 
 REAL(EB) :: TYY_FAC
-
-! Order of the cells in the 3-D Cartesian sweep of RADIATION_FVM without cut cells (CC_IBM always uses SLICE):
-! SLICE  - diagonal planes I+J+K=const, an OpenMP parallel loop over each plane (as in FDS). A fork and join per plane,
-!          about 1.4 million per solve of 32 meshes and 104 angles; with nvfortran the barriers dominate, and on a busy
-!          machine 12 threads are slower than one;
-! SERIAL - rows along I in plain array order on one thread: cache friendly and no barriers, about 1.9 times faster than
-!          SLICE on one thread (default, also with many OpenMP threads: they are still used by the other loops);
-! ROWS   - diagonals of rows J+K=const, the rows of each diagonal shared among the OpenMP threads.
-! Every cell gets the same upwind values and the same formula in all three orders, so the intensities agree to round-off
-! (SERIAL and ROWS are bitwise identical). Environment variable GFDS_RADI_CPU_SWEEP=SLICE|SERIAL|ROWS overrides.
-INTEGER, PARAMETER :: CPU_SWEEP_SLICE=0,CPU_SWEEP_SERIAL=1,CPU_SWEEP_ROWS=2
-INTEGER :: CPU_SWEEP_MODE=-1
-INTEGER, PARAMETER :: CPU_SWEEP_MIN_PARALLEL_ROWS=4  !< ROWS: shorter diagonals of rows are swept on one thread
+INTEGER :: N_KAPPA_T=44                             !< Number of temperature points in absorption coefficient look-up table
+INTEGER :: N_KAPPA_X=50                             !< Number of species points in absorption coefficient look-up table
+REAL(EB) :: KAPPA_X_MIN=1.E-5_EB,KAPPA_X_MAX=1._EB  !< Min/max volume fraction for absorption coefficient look-up table
+REAL(EB) :: KAPPA_C_MIN=2.E-7_EB,KAPPA_C_MAX=0.2_EB !< Min/Max mass fraction for soot coefficient look-up table
+REAL(EB) :: KAPPA_X_FAC,LOG_KAPPA_X_FAC             !< Scaling factor for absorption coefficient look-up table
+REAL(EB) :: KAPPA_C_FAC,LOG_KAPPA_C_FAC             !< Scaling factor for soot coefficient look-up table
+REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: Y2RADCAL_SPECIES !< Primitive species mapping to radcal species
+REAL(EB), ALLOCATABLE, DIMENSION(:,:,:,:) :: RADCAL_SPECIES2KAPPA ! Absorption coefficient look-up table
+REAL(EB), ALLOCATABLE, DIMENSION(:) :: KAPPA_COND  !< Array to remove condensed species from absorption coefficient look-up
+INTEGER :: N_RADCAL_ARRAY_SIZE                     !< Number of radcal species present
+INTEGER :: RADCAL_SPECIES_INDEX(16)                !< Mapping of radcal species present to radcal calling function
+CHARACTER(LABEL_LENGTH) :: RADCAL_SPECIES_ID(16)='NULL'!< Name of radcal species
 
 CONTAINS
 
 
 !> \brief Initialize radiation arrays.
-!>
+
 SUBROUTINE INIT_RADIATION
 
 ! Meanings of some variables defined here:
@@ -2796,12 +2807,11 @@ USE COMP_FUNCTIONS, ONLY: SHUTDOWN
 USE MIEV
 USE RADCAL_CALC
 USE WSGG_ARRAYS
-REAL(EB) :: THETAUP,THETALOW,PHIUP,PHILOW,F_THETA,PLANCK_C2,KSI,LT,RCRHO,YY,XX,BBF,AP0,AMEAN,RADIANCE,TRANSMISSIVITY,&
-            THETA,PHI,DLO
-INTEGER  :: N,I,J,K,IPC,IZERO,NN,NI,II,JJ,IIM,JJM,IBND,NS,NS2,NRA,NSB,RADCAL_TEMP(16)=0,RCT_SKIP=-1,IO
+REAL(EB) :: PLANCK_C2,KSI,LT,RCRHO,YY,BBF,AP0,AMEAN,RADIANCE,TRANSMISSIVITY,XX
+INTEGER  :: N,I,J,K,IPC,IZERO,IBND,NS,NRA,NSB,RADCAL_TEMP(16)=0,RCT_SKIP=-1
 TYPE (LAGRANGIAN_PARTICLE_CLASS_TYPE), POINTER :: LPC
-REAL(EB), ALLOCATABLE, DIMENSION(:) :: COSINE_ARRAY
 TYPE (RAD_FILE_TYPE), POINTER :: RF
+TYPE (SPECIES_TYPE), POINTER :: SS
 
 ! A few miscellaneous constants
 
@@ -2823,9 +2833,17 @@ ALLOCATE(DLY(1:NRA),STAT=IZERO)
 CALL ChkMemErr('RADI','DLY',IZERO)
 ALLOCATE(DLZ(1:NRA),STAT=IZERO)
 CALL ChkMemErr('RADI','DLZ',IZERO)
+ALLOCATE(MERI_COMP(1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','MERI_COMP',IZERO)
+ALLOCATE(AZIM_COMP(1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','AZIM_COMP',IZERO)
+ALLOCATE(AXIS_COMP(1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','AXIS_COMP',IZERO)
 IF (CYLINDRICAL) THEN
    ALLOCATE(DLB(1:NRA),STAT=IZERO)
    CALL ChkMemErr('RADI','DLB',IZERO)
+   ALLOCATE(DLB_COMP(1:NRA),STAT=IZERO)
+   CALL ChkMemErr('RADI','DLB_COMP',IZERO)
 ENDIF
 ALLOCATE(DLN(-3:3,1:NRA),STAT=IZERO)
 CALL ChkMemErr('RADI','DLN',IZERO)
@@ -2833,128 +2851,16 @@ ALLOCATE(DLM(1:NRA,3),STAT=IZERO)
 CALL ChkMemErr('RADI','DLM',IZERO)
 ALLOCATE(DLANG(3,1:NRA),STAT=IZERO)
 CALL ChkMemErr('RADI','DLANG',IZERO)
+ALLOCATE(DLANG_OLD(3,1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','DLANG_OLD',IZERO)
+ALLOCATE(DLANG_LOCAL(3,1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','DLANG_LOCAL',IZERO)
+ALLOCATE(DLO_ORIENTATION(1:N_ORIENTATION_VECTOR,1:NRA),STAT=IZERO)
+CALL ChkMemErr('RADI','DLO_ORIENTATION',IZERO)
 
-! Determine mean direction normals and sweeping orders
-! as described in the FDS Tech. Ref. Guide Vol. 1 Sec. 6.2.2.
 
-N = 0
-DO I=1,NRT
-   DO J=1,NRP(I)
-      N = N + 1
-      THETALOW  = PI*REAL(I-1)/REAL(NRT)
-      THETAUP   = PI*REAL(I)/REAL(NRT)
-      F_THETA   = 0.5_EB*(THETAUP-THETALOW  - COS(THETAUP)*SIN(THETAUP) + COS(THETALOW)*SIN(THETALOW))
-      THETA = 0.5_EB*(THETAUP+THETALOW)
-      IF (CYLINDRICAL) THEN
-         PHILOW = PI*REAL(J-1)/REAL(NRP(I))
-         PHIUP  = PI*REAL(J)/REAL(NRP(I))
-      ELSEIF (TWO_D) THEN
-         PHILOW = TWOPI*REAL(J-1)/REAL(NRP(I)) + PIO2
-         PHIUP  = TWOPI*REAL(J)/REAL(NRP(I))   + PIO2
-      ELSE
-         PHILOW = TWOPI*REAL(J-1)/REAL(NRP(I))
-         PHIUP  = TWOPI*REAL(J)/REAL(NRP(I))
-      ENDIF
-      PHI=0.5_EB*(PHILOW+PHIUP)
-      RSA(N) = (PHIUP-PHILOW)*(COS(THETALOW)-COS(THETAUP))
-      IF (CYLINDRICAL) THEN
-         DLX(N) =  (SIN(PHIUP)-SIN(PHILOW)) *F_THETA
-         DLY(N) =  (-SIN(DPHI0/2.)*(SIN(PHIUP)-SIN(PHILOW))  +COS(DPHI0/2.)*(COS(PHILOW)-COS(PHIUP)))*F_THETA
-         DLB(N) =  (-SIN(DPHI0/2.)*(SIN(PHIUP)-SIN(PHILOW))  -COS(DPHI0/2.)*(COS(PHILOW)-COS(PHIUP)))*F_THETA
-         DLZ(N)    = 0.5_EB*(PHIUP-PHILOW)   * ((SIN(THETAUP))**2-(SIN(THETALOW))**2)
-         DLANG(1,N)  = SIN(THETA)*COS(PHI)
-         DLANG(2,N)  = SIN(THETA)*SIN(PHI)
-         DLANG(3,N)  = COS(THETA)
-         IF (N==1000000) WRITE(LU_ERR,'(A)') 'This line should never get executed. It is here only to prevent optimization.'
-      ELSEIF (TWO_D) THEN
-         DLX(N) = (SIN(PHIUP)-SIN(PHILOW))*F_THETA
-         DLY(N) = 0._EB
-         DLZ(N) = (COS(PHILOW)-COS(PHIUP))*F_THETA
-         DLANG(1,N)  = COS(PHI)
-         DLANG(2,N)  = 0._EB
-         DLANG(3,N)  = SIN(PHI)
-      ELSE
-         DLX(N) = (SIN(PHIUP)-SIN(PHILOW))*F_THETA
-         DLY(N) = (COS(PHILOW)-COS(PHIUP))*F_THETA
-         DLZ(N)    = 0.5_EB*(PHIUP-PHILOW)      * ((SIN(THETAUP))**2-(SIN(THETALOW))**2)
-         DLANG(1,N)  = SIN(THETA)*COS(PHI)
-         DLANG(2,N)  = SIN(THETA)*SIN(PHI)
-         DLANG(3,N)  = COS(THETA)
-      ENDIF
-   ENDDO
-ENDDO
-
-! Set (wall normal)*(angle vector) value
-
-DO N = 1,NRA
-   DLN( 0,N) = 0._EB !prevent undefined variable errors
-   DLN(-1,N) = -DLX(N)
-   DLN( 1,N) =  DLX(N)
-   DLN(-2,N) = -DLY(N)
-   DLN( 2,N) =  DLY(N)
-   DLN(-3,N) = -DLZ(N)
-   DLN( 3,N) =  DLZ(N)
-ENDDO
-
-! In axially symmetric case, each angle represents two symmetric angles. So weight the intensities by two.
-
-WEIGH_CYL = 1._EB
-IF (CYLINDRICAL) THEN
-   WEIGH_CYL = 2._EB
-   ! Wall direction cosines are only used for flux integrations, so they can by multiplied in advance.
-   DLN = WEIGH_CYL * DLN
-ENDIF
-
-! Calculate mirroring matrix
-
-N = 0
-DO I=1,NRT
-   DO J=1,NRP(I)
-      N = N + 1
-      DO K=1,3
-         IF (TWO_D .AND. .NOT.CYLINDRICAL) THEN
-            SELECT CASE(K)
-               CASE(1)             ! X-surfaces
-                  IIM = 1
-                  JJM = NRP(I) - J + 1
-               CASE(2)             ! Y-surfaces
-                  IIM = 1
-                  JJM = J
-               CASE(3)             ! Z-surfaces
-                  IIM = 1
-                  JJM = NRP(I)/2 - J + 1
-            END SELECT
-            JJM = MODULO(JJM,NRP(I))
-            IF (JJM==0) JJM = NRP(I)
-         ELSE
-            SELECT CASE(K)
-               CASE(1)             ! X-surfaces
-                  IIM = I
-                  JJM = NRP(I)/2 - J + 1
-               CASE(2)             ! Y-surfaces
-                  IIM = I
-                  JJM = NRP(I) - J + 1
-               CASE(3)             ! Z-surfaces
-                  IIM = NRT - I + 1
-                  JJM = J
-            END SELECT
-            IIM = MODULO(IIM,NRT)
-            JJM = MODULO(JJM,NRP(I))
-            IF (IIM==0) IIM = NRT
-            IF (JJM==0) JJM = NRP(I)
-         ENDIF
-
-         NN = 0
-         DO II = 1,IIM
-            DO JJ = 1,NRP(II)
-               NN = NN + 1
-               IF ((II==IIM).AND.(JJ==JJM)) NI = NN
-            ENDDO
-         ENDDO
-         DLM(N,K) = NI
-      ENDDO
-   ENDDO
-ENDDO
+! Set for ray rotation
+ALLOW_RANDOM_RADIATION_ROTATION = RANDOMIZE_RADIATION_DIRECTIONS .AND. .NOT.CYLINDRICAL .AND. .NOT.TWO_D
 
 !-----------------------------------------------------
 !
@@ -3191,17 +3097,15 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
 
    BUILD_KAPPA_ARRAY: IF (N_RADCAL_ARRAY_SIZE>0) THEN
 
-      ! Look-up table in volume fraction (gases) and mass fraction (soot) on a log scale, as in FDS 6.11.1
-      ! (0eab2e6d17 "Fix kappa lookup to be accurate in volume fraction", c33b760989 condensed species).
-
       KAPPA_X_FAC = (KAPPA_X_MAX/KAPPA_X_MIN)**(1._EB/(N_KAPPA_X-1))
       LOG_KAPPA_X_FAC = LOG(KAPPA_X_FAC)
       KAPPA_C_FAC = (KAPPA_C_MAX/KAPPA_C_MIN)**(1._EB/(N_KAPPA_X-1))
       LOG_KAPPA_C_FAC = LOG(KAPPA_C_FAC)
 
-      ALLOCATE(Z2RADCAL_SPECIES(N_RADCAL_ARRAY_SIZE,1:N_TRACKED_SPECIES),STAT=IZERO)
-      CALL ChkMemErr('RADI','ZZ2RADCAL_SPECIES',IZERO)
-      Z2RADCAL_SPECIES = 0._EB
+      ALLOCATE(Y2RADCAL_SPECIES(N_RADCAL_ARRAY_SIZE,1:N_SPECIES),STAT=IZERO)
+      CALL ChkMemErr('RADI','Y2RADCAL_SPECIES',IZERO)
+      Y2RADCAL_SPECIES = 0._EB
+
       ALLOCATE(KAPPA_COND(N_TRACKED_SPECIES),STAT=IZERO)
       CALL ChkMemErr('RADI','KAPPA_COND',IZERO)
       KAPPA_COND = 1._EB
@@ -3210,20 +3114,18 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
          IF (SPECIES_MIXTURE(NS)%EVAPORATION_SMIX_INDEX>0) THEN
             CALL MEAN_CROSS_SECTIONS(SMIX_INDEX=NS)
             KAPPA_COND(NS) = 0._EB
-            CYCLE !No gas absorption for the liquid phase
          ENDIF
-         DO NS2=1,N_SPECIES
-            IF (SPECIES(NS2)%RADCAL_INDEX > 0) THEN
-               IF (SPECIES(NS2)%RADCAL_ID/='SOOT') THEN
-                  Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) = Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) + &
-                                                                   Z2Y(NS2,NS) / SPECIES(NS2)%MW
-               ELSE
-                  Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) = Z2RADCAL_SPECIES(SPECIES(NS2)%RADCAL_INDEX,NS) + &
-                                                                   Z2Y(NS2,NS) * &
-                                                                   SPECIES(SOOT_INDEX)%DENSITY_SOLID/SPECIES(NS2)%DENSITY_SOLID
-               ENDIF
+      ENDDO
+      DO NS=1,N_SPECIES
+         SS => SPECIES(NS)
+         IF (SS%RADCAL_INDEX > 0) THEN
+            IF (SS%RADCAL_ID/='SOOT') THEN
+               Y2RADCAL_SPECIES(SS%RADCAL_INDEX,NS) = Y2RADCAL_SPECIES(SS%RADCAL_INDEX,NS) + 1._EB / SPECIES(NS)%MW
+            ELSE
+               Y2RADCAL_SPECIES(SS%RADCAL_INDEX,NS) = Y2RADCAL_SPECIES(SPECIES(NS)%RADCAL_INDEX,NS) + &
+                                                      SPECIES(SOOT_INDEX)%DENSITY_SOLID/SPECIES(NS)%DENSITY_SOLID
             ENDIF
-         ENDDO
+         ENDIF
       ENDDO
 
       ! Allocate arrays for RadCal
@@ -3267,11 +3169,10 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
             ENDIF
             RCRHO = MW_AIR*P_INF/(R0*TEMP_GAS(1))
             IF (NSB>1) BBF = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),TEMP_GAS(1))
-            ! Table index J+1 holds volume fraction XX (gases) and mass fraction YY (soot); index 0 is zero.
             X_LOOP_Z: DO J=0,N_KAPPA_X-1
                IF (J==N_KAPPA_X-1) THEN
-                  XX = KAPPA_X_MAX
-                  YY = KAPPA_C_MAX
+               XX = KAPPA_X_MAX
+               YY = KAPPA_C_MAX
                ELSE
                   XX = MIN(1._EB,KAPPA_X_MIN*KAPPA_X_FAC**J)
                   YY = MIN(1._EB,KAPPA_C_MIN*KAPPA_C_FAC**J)
@@ -3280,42 +3181,9 @@ MAKE_KAPPA_ARRAYS: IF (.NOT.SOLID_PHASE_ONLY .AND. ANY(SPECIES%RADCAL_ID/='null'
                RADCAL_SPECIES_LOOP: DO NS = 1, N_RADCAL_ARRAY_SIZE
                   PARTIAL_PRESSURES_ATM = 0._EB
                   SELECT CASE(RADCAL_SPECIES_INDEX(NS))
-                     CASE(1) ! CARBON DIOXIDE
-                        PARTIAL_PRESSURES_ATM(1,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(1,1)
-                     CASE(2) ! WATER VAPOR
-                        PARTIAL_PRESSURES_ATM(2,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(2,1)
-                     CASE(3) ! CARBON MONOXIDE
-                        PARTIAL_PRESSURES_ATM(3,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(3,1)
-                     CASE(4) ! METHANE
-                        PARTIAL_PRESSURES_ATM(4,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(4,1)
-                     CASE(5) ! EHTYLENE
-                        PARTIAL_PRESSURES_ATM(5,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(5,1)
-                     CASE(6) ! ETHANE
-                        PARTIAL_PRESSURES_ATM(6,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(6,1)
-                     CASE(7) ! PROPYLENE
-                        PARTIAL_PRESSURES_ATM(7,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(7,1)
-                     CASE(8) ! PROPANE
-                        PARTIAL_PRESSURES_ATM(8,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(8,1)
-                     CASE(9) ! TOLUENE
-                        PARTIAL_PRESSURES_ATM(9,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(9,1)
-                     CASE(10) ! N-HEPTANE
-                        PARTIAL_PRESSURES_ATM(10,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(10,1)
-                     CASE(11) ! METHANOL
-                        PARTIAL_PRESSURES_ATM(11,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(11,1)
-                     CASE(12) ! MMA
-                        PARTIAL_PRESSURES_ATM(12,1) = XX
-                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - PARTIAL_PRESSURES_ATM(12,1)
+                     CASE(1:12) ! All non-soot, non NITROGEN species
+                        PARTIAL_PRESSURES_ATM(RADCAL_SPECIES_INDEX(NS),1) = XX
+                        PARTIAL_PRESSURES_ATM(14,1) = 1._EB - XX
                      CASE(16) ! SOOT
                         PARTIAL_PRESSURES_ATM(16,1) = YY*RCRHO/SPECIES(SOOT_INDEX)%DENSITY_SOLID
                         PARTIAL_PRESSURES_ATM(14,1) = 1._EB
@@ -3413,30 +3281,8 @@ DO IPC=1,N_LAGRANGIAN_CLASSES
    IF (LPC%LIQUID_DROPLET) CALL MEAN_CROSS_SECTIONS(PARTICLE_CLASS=IPC)
 ENDDO
 
-! Determine angle factors for Lagrangian particles with ORIENTATION
-! COSINE_ARRAY holds the cosines of the angles formed by the orientation vector and the radiation directions.
-! DLO is the integral of the orientation vector dotted with the directional solid angle of the radiation directions.
-! VIEW_ANGLE_FACTOR is the reduction of the radiation due to a view angle less than 180, like a narrow field of view radiometer.
-
-IF (SOLID_PARTICLES) THEN
-   ALLOCATE(COSINE_ARRAY(1:NRA))
-   ALLOCATE(NEAREST_RADIATION_ANGLE(N_ORIENTATION_VECTOR))
-   ALLOCATE(VIEW_ANGLE_FACTOR(N_ORIENTATION_VECTOR))
-   VIEW_ANGLE_FACTOR = 0._EB
-   DO IO=1,N_ORIENTATION_VECTOR
-      DLO = 0._EB
-      DO N=1,NRA
-         COSINE_ARRAY(N) = ORIENTATION_VECTOR(1,IO)*DLANG(1,N) + &
-                           ORIENTATION_VECTOR(2,IO)*DLANG(2,N) + &
-                           ORIENTATION_VECTOR(3,IO)*DLANG(3,N)
-         IF (-COSINE_ARRAY(N) > COS_HALF_VIEW_ANGLE(IO)) &
-            DLO = DLO - (ORIENTATION_VECTOR(1,IO)*DLX(N) + ORIENTATION_VECTOR(2,IO)*DLY(N) + ORIENTATION_VECTOR(3,IO)*DLZ(N))
-      ENDDO
-      NEAREST_RADIATION_ANGLE(IO) = MINLOC(COSINE_ARRAY,DIM=1)
-      VIEW_ANGLE_FACTOR(IO) = PI/DLO
-   ENDDO
-   DEALLOCATE(COSINE_ARRAY)
-ENDIF
+! Calculate angle specific variables
+CALL CALCULATE_FVM_ANGLES()
 
 ! Allocate array needed by angle-specific RADF output files
 
@@ -3447,6 +3293,385 @@ ENDDO
 
 END SUBROUTINE INIT_RADIATION
 
+!> \brief Precomputes angle-dependent quantities for the finite-volume
+!> radiation solver that will remain same even with random rotation.
+
+SUBROUTINE CALCULATE_FVM_ANGLES()
+
+REAL(EB) :: THETAUP,THETALOW,PHIUP,PHILOW,F_THETA,THETA,PHI
+INTEGER  :: NRA,N,I,J,K,IIM,JJM,NN,II,JJ,NI
+
+NRA = NUMBER_RADIATION_ANGLES
+
+N = 0
+DO I=1,NRT
+   DO J=1,NRP(I)
+      N = N + 1
+      THETALOW  = PI*REAL(I-1)/REAL(NRT)
+      THETAUP   = PI*REAL(I)/REAL(NRT)
+      F_THETA   = 0.5_EB*(THETAUP-THETALOW  - COS(THETAUP)*SIN(THETAUP) + COS(THETALOW)*SIN(THETALOW))
+      THETA = 0.5_EB*(THETAUP+THETALOW)
+      IF (CYLINDRICAL) THEN
+         PHILOW = PI*REAL(J-1)/REAL(NRP(I))
+         PHIUP  = PI*REAL(J)/REAL(NRP(I))
+      ELSEIF (TWO_D) THEN
+         PHILOW = TWOPI*REAL(J-1)/REAL(NRP(I)) + PIO2
+         PHIUP  = TWOPI*REAL(J)/REAL(NRP(I))   + PIO2
+      ELSE
+         PHILOW = TWOPI*REAL(J-1)/REAL(NRP(I))
+         PHIUP  = TWOPI*REAL(J)/REAL(NRP(I))
+      ENDIF
+      PHI=0.5_EB*(PHILOW+PHIUP)
+      RSA(N) = (PHIUP-PHILOW)*(COS(THETALOW)-COS(THETAUP))
+      IF (CYLINDRICAL) THEN
+         MERI_COMP(N) =  (SIN(PHIUP)-SIN(PHILOW)) *F_THETA
+         AZIM_COMP(N) =  (-SIN(DPHI0/2.)*(SIN(PHIUP)-SIN(PHILOW))  +COS(DPHI0/2.)*(COS(PHILOW)-COS(PHIUP)))*F_THETA
+         DLB_COMP(N)  =  (-SIN(DPHI0/2.)*(SIN(PHIUP)-SIN(PHILOW))  -COS(DPHI0/2.)*(COS(PHILOW)-COS(PHIUP)))*F_THETA
+         AXIS_COMP(N) = 0.5_EB*(PHIUP-PHILOW)   * ((SIN(THETAUP))**2-(SIN(THETALOW))**2)
+         DLANG_LOCAL(1,N)  = SIN(THETA)*COS(PHI)
+         DLANG_LOCAL(2,N)  = SIN(THETA)*SIN(PHI)
+         DLANG_LOCAL(3,N)  = COS(THETA)
+         IF (N==1000000) WRITE(LU_ERR,'(A)') 'This line should never get executed. It is here only to prevent optimization.'
+      ELSEIF (TWO_D) THEN
+         MERI_COMP(N) = (SIN(PHIUP)-SIN(PHILOW))*F_THETA
+         AZIM_COMP(N) = 0._EB
+         AXIS_COMP(N) = (COS(PHILOW)-COS(PHIUP))*F_THETA
+         DLANG_LOCAL(1,N)  = COS(PHI)
+         DLANG_LOCAL(2,N)  = 0._EB
+         DLANG_LOCAL(3,N)  = SIN(PHI)
+      ELSE
+         MERI_COMP(N)=(SIN(PHIUP)-SIN(PHILOW))*F_THETA
+         AZIM_COMP(N)=(COS(PHILOW)-COS(PHIUP))*F_THETA
+         AXIS_COMP(N)=0.5_EB*(PHIUP-PHILOW)      * ((SIN(THETAUP))**2-(SIN(THETALOW))**2)
+         DLANG_LOCAL(1,N) = SIN(THETA)*COS(PHI)
+         DLANG_LOCAL(2,N) = SIN(THETA)*SIN(PHI)
+         DLANG_LOCAL(3,N) = COS(THETA)
+      ENDIF
+   ENDDO
+ENDDO
+
+! Calculate mirroring matrix
+N = 0
+DO I=1,NRT
+   DO J=1,NRP(I)
+      N = N + 1
+      DO K=1,3
+         IF (TWO_D .AND. .NOT.CYLINDRICAL) THEN
+            SELECT CASE(K)
+               CASE(1)             ! X-surfaces
+                  IIM = 1
+                  JJM = NRP(I) - J + 1
+               CASE(2)             ! Y-surfaces
+                  IIM = 1
+                  JJM = J
+               CASE(3)             ! Z-surfaces
+                  IIM = 1
+                  JJM = NRP(I)/2 - J + 1
+            END SELECT
+            JJM = MODULO(JJM,NRP(I))
+            IF (JJM==0) JJM = NRP(I)
+         ELSE
+            SELECT CASE(K)
+               CASE(1)             ! X-surfaces
+                  IIM = I
+                  JJM = NRP(I)/2 - J + 1
+               CASE(2)             ! Y-surfaces
+                  IIM = I
+                  JJM = NRP(I) - J + 1
+               CASE(3)             ! Z-surfaces
+                  IIM = NRT - I + 1
+                  JJM = J
+            END SELECT
+            IIM = MODULO(IIM,NRT)
+            JJM = MODULO(JJM,NRP(I))
+            IF (IIM==0) IIM = NRT
+            IF (JJM==0) JJM = NRP(I)
+         ENDIF
+
+         NN = 0
+         DO II = 1,IIM
+            DO JJ = 1,NRP(II)
+               NN = NN + 1
+               IF ((II==IIM).AND.(JJ==JJM)) NI = NN
+            ENDDO
+         ENDDO
+         DLM(N,K) = NI
+      ENDDO
+   ENDDO
+ENDDO
+
+END SUBROUTINE CALCULATE_FVM_ANGLES
+
+
+
+!> \Calculate direction coefficients for with and without random rotations
+!> as described in the FDS Tech. Ref. Guide Vol. 1 Sec. 6.2.2.
+SUBROUTINE CALCULATE_DIRECTION_COEFFICIENTS()
+USE COMP_FUNCTIONS, ONLY : CURRENT_TIME
+
+INTEGER  :: NRA,N,IO,I,IERR
+REAL(EB) :: TNOW,AXIS(3),MERIDIAN(3), AZIMUTH(3),E1(3),E2(3),REF(3),PSI,DLO,MAGTMP,RNDNUM(3)
+
+TNOW=CURRENT_TIME()
+
+NRA = NUMBER_RADIATION_ANGLES
+
+IF (ALLOW_RANDOM_RADIATION_ROTATION) THEN
+   IF (MY_RANK == 0) THEN
+       CALL FDS_RANDOM_NUMBER(RNDNUM)
+   ENDIF
+   CALL MPI_BCAST(RNDNUM, 3, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, IERR) !broadcast the random number array
+
+   CALL GENERATE_RANDOM_UNIT_VECTOR(RNDNUM(1:2),AXIS)
+   PSI = RNDNUM(3)
+
+   PSI = TWOPI*PSI
+   REF = (/0._EB,0._EB,1._EB/)
+   IF (ABS(DOT_PRODUCT(AXIS,REF)) > ONE_M_EPS) THEN
+      REF = (/1._EB,0._EB,0._EB/)
+   ENDIF
+
+   ! e1 = REF x AXIS
+   E1(1) = REF(2)*AXIS(3) - REF(3)*AXIS(2)
+   E1(2) = REF(3)*AXIS(1) - REF(1)*AXIS(3)
+   E1(3) = REF(1)*AXIS(2) - REF(2)*AXIS(1)
+   MAGTMP = SQRT(DOT_PRODUCT(E1,E1))
+   E1 = E1/MAGTMP
+
+   ! e2 = AXIS x e1
+   E2(1) = AXIS(2)*E1(3) - AXIS(3)*E1(2)
+   E2(2) = AXIS(3)*E1(1) - AXIS(1)*E1(3)
+   E2(3) = AXIS(1)*E1(2) - AXIS(2)*E1(1)
+
+   MAGTMP = SQRT(DOT_PRODUCT(E2,E2))
+   E2 = E2/MAGTMP
+
+   ! Random spin around axis
+   MERIDIAN = COS(PSI)*E1 + SIN(PSI)*E2
+   MAGTMP = SQRT(DOT_PRODUCT(MERIDIAN,MERIDIAN))
+   MERIDIAN = MERIDIAN/MAGTMP
+
+   ! AZIMUTH = AXIS x MERIDIAN
+   AZIMUTH(1) = AXIS(2)*MERIDIAN(3) - AXIS(3)*MERIDIAN(2)
+   AZIMUTH(2) = AXIS(3)*MERIDIAN(1) - AXIS(1)*MERIDIAN(3)
+   AZIMUTH(3) = AXIS(1)*MERIDIAN(2) - AXIS(2)*MERIDIAN(1)
+
+   MAGTMP = SQRT(DOT_PRODUCT(AZIMUTH,AZIMUTH))
+   AZIMUTH = AZIMUTH/MAGTMP
+
+ELSE
+   ! No random rotation
+   MERIDIAN = (/1._EB, 0._EB, 0._EB/)
+   AZIMUTH  = (/0._EB, 1._EB, 0._EB/)
+   AXIS     = (/0._EB, 0._EB, 1._EB/)
+ENDIF
+
+
+IF (CYLINDRICAL) THEN
+   DLX(1:NRA) = MERI_COMP(1:NRA)
+   DLY(1:NRA) = AZIM_COMP(1:NRA)
+   DLB(1:NRA) = DLB_COMP(1:NRA)
+   DLZ(1:NRA) = AXIS_COMP(1:NRA)
+   DLANG(1:3,1:NRA) = DLANG_LOCAL(1:3,1:NRA)
+ELSEIF (TWO_D) THEN
+   DLX(1:NRA) = MERI_COMP(1:NRA)
+   DLY(1:NRA) = AZIM_COMP(1:NRA)
+   DLZ(1:NRA) = AXIS_COMP(1:NRA)
+   DLANG(1:3,1:NRA) = DLANG_LOCAL(1:3,1:NRA)
+ELSE ! Right now random rotation is allowed only for 3D
+   DLX(1:NRA) = MERI_COMP(1:NRA)*MERIDIAN(1)+AZIM_COMP(1:NRA)*AZIMUTH(1)+AXIS_COMP(1:NRA)*AXIS(1)
+   DLY(1:NRA) = MERI_COMP(1:NRA)*MERIDIAN(2)+AZIM_COMP(1:NRA)*AZIMUTH(2)+AXIS_COMP(1:NRA)*AXIS(2)
+   DLZ(1:NRA) = MERI_COMP(1:NRA)*MERIDIAN(3)+AZIM_COMP(1:NRA)*AZIMUTH(3)+AXIS_COMP(1:NRA)*AXIS(3)
+   DLANG_OLD(:,1:NRA)=DLANG(:,1:NRA)
+   DO I =1,3
+      DLANG(I,1:NRA) = MERIDIAN(I)*DLANG_LOCAL(1,1:NRA) + AZIMUTH(I)*DLANG_LOCAL(2,1:NRA)+ AXIS(I)*DLANG_LOCAL(3,1:NRA)
+   ENDDO
+ENDIF
+
+! Set (wall normal)*(angle vector) value
+DO N = 1,NRA
+   DLN( 0,N) = 0._EB !prevent undefined variable errors
+   DLN(-1,N) = -DLX(N)
+   DLN( 1,N) =  DLX(N)
+   DLN(-2,N) = -DLY(N)
+   DLN( 2,N) =  DLY(N)
+   DLN(-3,N) = -DLZ(N)
+   DLN( 3,N) =  DLZ(N)
+ENDDO
+
+! In axially symmetric case, each angle represents two symmetric angles. So weight the intensities by two.
+WEIGH_CYL = 1._EB
+IF (CYLINDRICAL) THEN
+   WEIGH_CYL = 2._EB
+   ! Wall direction cosines are only used for flux integrations, so they can by multiplied in advance.
+   DLN = WEIGH_CYL * DLN
+ENDIF
+
+! Determine angle factors for Lagrangian particles with ORIENTATION
+! COSINE_ARRAY holds the cosines of the angles formed by the orientation vector and the radiation directions.
+! DLO is the integral of the orientation vector dotted with the directional solid angle of the radiation directions.
+! VIEW_ANGLE_FACTOR is the reduction of the radiation due to a view angle less than 180, like a narrow field of view radiometer.
+IF (SOLID_PARTICLES) THEN
+   IF (.NOT. ALLOCATED(NEAREST_RADIATION_ANGLE)) ALLOCATE(NEAREST_RADIATION_ANGLE(N_ORIENTATION_VECTOR))
+   IF (.NOT. ALLOCATED(VIEW_ANGLE_FACTOR)) ALLOCATE(VIEW_ANGLE_FACTOR(N_ORIENTATION_VECTOR))
+   VIEW_ANGLE_FACTOR = 0._EB
+   DO IO=1,N_ORIENTATION_VECTOR
+      DLO = 0._EB
+      DO N=1,NRA
+         DLO_ORIENTATION(IO,N) = ORIENTATION_VECTOR(1,IO)*DLANG(1,N) + &
+                           ORIENTATION_VECTOR(2,IO)*DLANG(2,N) + &
+                           ORIENTATION_VECTOR(3,IO)*DLANG(3,N)
+         IF (-DLO_ORIENTATION(IO,N) > COS_HALF_VIEW_ANGLE(IO)) &
+            DLO = DLO - (ORIENTATION_VECTOR(1,IO)*DLX(N) + ORIENTATION_VECTOR(2,IO)*DLY(N) + ORIENTATION_VECTOR(3,IO)*DLZ(N))
+      ENDDO
+      NEAREST_RADIATION_ANGLE(IO) = MINLOC(DLO_ORIENTATION(IO,1:NRA),DIM=1)
+      VIEW_ANGLE_FACTOR(IO) = PI/DLO
+   ENDDO
+ENDIF
+T_USED(9)=T_USED(9)+CURRENT_TIME()-TNOW
+
+END SUBROUTINE CALCULATE_DIRECTION_COEFFICIENTS
+
+!> \Interpolate wall face and mesh interface intensities.
+SUBROUTINE INTERPOLATE_IL()
+USE COMP_FUNCTIONS, ONLY : CURRENT_TIME
+
+INTEGER, PARAMETER :: N_INTP=4 ! Number of neighbouring intensitiies for interpolation
+
+INTEGER :: NRA,NM,NNN,LL,I_INTP
+REAL(EB) :: TNOW,COSANG(NUMBER_RADIATION_ANGLES), DUMMY(NUMBER_RADIATION_ANGLES)
+INTEGER :: NNEW,NOLD,IBND,IW,NOM,ICF,IP
+INTEGER :: IDX(NUMBER_RADIATION_ANGLES,N_INTP)
+
+REAL(EB) :: W(NUMBER_RADIATION_ANGLES,N_INTP)
+REAL(EB) :: DIST,WSUM
+TYPE(WALL_TYPE), POINTER :: WC
+TYPE(BOUNDARY_RADIA_TYPE), POINTER :: BR
+REAL(EB) :: ILW_OLD(NUMBER_RADIATION_ANGLES)
+TYPE (OMESH_TYPE), POINTER :: M2
+TYPE(CFACE_TYPE), POINTER :: CFA
+TYPE(LAGRANGIAN_PARTICLE_CLASS_TYPE), POINTER :: LPC
+TYPE(LAGRANGIAN_PARTICLE_TYPE), POINTER :: LP
+
+TNOW=CURRENT_TIME()
+
+NRA = NUMBER_RADIATION_ANGLES
+
+DO NNEW=1,NRA
+   ! Compute angular proximity between the new direction and all old directions.
+   DO NOLD=1,NRA
+      COSANG(NOLD) = DOT_PRODUCT(DLANG(:,NNEW), &
+                               DLANG_OLD(:,NOLD))
+   ENDDO
+
+   ! Find N_INTP nearest neighbors
+   DUMMY(:) = COSANG(:)
+   DO I_INTP=1,N_INTP
+      IDX(NNEW,I_INTP) = MAXLOC(DUMMY,DIM=1)
+      DUMMY(IDX(NNEW,I_INTP)) = -HUGE(1._EB)
+   ENDDO
+
+   ! Inverse-distance-squared weighting. distance ~ (1-cos(theta))
+   WSUM = 0._EB
+   DO I_INTP=1,N_INTP
+      DIST = MAX(1._EB-COSANG(IDX(NNEW,I_INTP)),TWO_EPSILON_EB)
+      W(NNEW,I_INTP) = 1._EB/(DIST*DIST)
+      WSUM = WSUM + W(NNEW,I_INTP)
+   ENDDO
+   W(NNEW,:) = W(NNEW,:)/WSUM
+ENDDO
+
+DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
+   CALL POINT_TO_MESH(NM)
+
+   ! Interpolate intensity
+   DO IW = 1,N_EXTERNAL_WALL_CELLS+N_INTERNAL_WALL_CELLS
+      WC => WALL(IW)
+      BR => BOUNDARY_RADIA(WC%BR_INDEX)
+      DO IBND = 1,NUMBER_SPECTRAL_BANDS
+         ILW_OLD = BR%BAND(IBND)%ILW(:)
+         BR%BAND(IBND)%ILW(:) = 0._EB
+         DO I_INTP=1,N_INTP
+            BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:) + W(:,I_INTP)*ILW_OLD(IDX(:,I_INTP))*RSA(IDX(:,I_INTP))
+         ENDDO
+         BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:)/RSA(:)
+      ENDDO
+   ENDDO
+
+   ! Cut-cells
+   DO ICF = INTERNAL_CFACE_CELLS_LB+1,INTERNAL_CFACE_CELLS_LB+N_INTERNAL_CFACE_CELLS
+      CFA => CFACE(ICF)
+      BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
+      DO IBND = 1,NUMBER_SPECTRAL_BANDS
+         ILW_OLD = BR%BAND(IBND)%ILW(:)
+         BR%BAND(IBND)%ILW(:) = 0._EB
+         DO I_INTP=1,N_INTP
+            BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:) + W(:,I_INTP)*ILW_OLD(IDX(:,I_INTP))*RSA(IDX(:,I_INTP))
+         ENDDO
+         BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:)/RSA(:)
+      ENDDO
+   ENDDO
+
+   ! Particles
+   DO IP=1,NLP
+      LP => LAGRANGIAN_PARTICLE(IP)
+      LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
+      IF (LPC%SOLID_PARTICLE .OR. LPC%MASSLESS_TARGET) THEN
+         IF (LP%ORIENTATION_INDEX>0) THEN
+            BR => BOUNDARY_RADIA(LP%BR_INDEX)
+            DO IBND=1,NUMBER_SPECTRAL_BANDS
+               ILW_OLD = BR%BAND(IBND)%ILW(:)
+               BR%BAND(IBND)%ILW(:) = 0._EB
+               DO I_INTP=1,N_INTP
+                  BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:) + W(:,I_INTP)*ILW_OLD(IDX(:,I_INTP))*RSA(IDX(:,I_INTP))
+               ENDDO
+               BR%BAND(IBND)%ILW(:) = BR%BAND(IBND)%ILW(:)/RSA(:)
+            ENDDO
+         ENDIF
+      ENDIF
+   ENDDO
+
+   !Interpolate neighbouring mesh cell intensities
+   DO NNN=1,N_NEIGHBORING_MESHES
+      NOM = NEIGHBORING_MESH(NNN)
+      M2 => OMESH(NOM)
+      IF (M2%NIC_R>0) THEN
+         M2%IL_R_OLD = M2%IL_R
+         M2%IL_R = 0._EB
+         DO LL=1,M2%NIC_R
+            DO IBND=1,NUMBER_SPECTRAL_BANDS
+               DO I_INTP=1,N_INTP
+                   M2%IL_R(LL,:,IBND) = M2%IL_R(LL,:,IBND) + W(:,I_INTP)*M2%IL_R_OLD(LL,IDX(:,I_INTP),IBND)*RSA(IDX(:,I_INTP))
+               ENDDO
+               M2%IL_R(LL,:,IBND) = M2%IL_R(LL,:,IBND)/RSA(:)
+            ENDDO
+         ENDDO
+      ENDIF
+   ENDDO
+ENDDO
+T_USED(9)=T_USED(9)+CURRENT_TIME()-TNOW
+
+END SUBROUTINE INTERPOLATE_IL
+
+
+SUBROUTINE GENERATE_RANDOM_UNIT_VECTOR(RNDNUM,VEC)
+REAL(EB), INTENT(IN) ::RNDNUM(2)
+REAL(EB), INTENT(OUT) :: VEC(3)
+REAL(EB) :: U,V
+REAL(EB) :: THETA, PHI
+
+U = RNDNUM(1)
+V = RNDNUM(2)
+
+THETA = ACOS(1._EB - 2._EB*U)
+PHI   = TWOPI*V
+
+VEC(1) = SIN(THETA)*COS(PHI)
+VEC(2) = SIN(THETA)*SIN(PHI)
+VEC(3) = COS(THETA)
+
+END SUBROUTINE GENERATE_RANDOM_UNIT_VECTOR
+
 
 !> \brief Compute radiative source term and transfer.
 !> \param T Current time (s)
@@ -3456,6 +3681,7 @@ END SUBROUTINE INIT_RADIATION
 SUBROUTINE COMPUTE_RADIATION(T,NM,RAD_ITER)
 
 USE MATH_FUNCTIONS, ONLY : EVALUATE_RAMP
+USE COMP_FUNCTIONS, ONLY : CURRENT_TIME
 USE COMPLEX_GEOMETRY
 REAL(EB), INTENT(IN) :: T
 INTEGER, INTENT(IN) :: NM,RAD_ITER
@@ -3465,7 +3691,6 @@ REAL(EB) :: TNOW
 TNOW=CURRENT_TIME()
 
 CALL POINT_TO_MESH(NM)
-
 IF (RADIATION) THEN
    RADIATION_COMPLETED(NM) = .FALSE.
    CALL RADIATION_FVM
@@ -3488,23 +3713,25 @@ USE MIEV
 USE MATH_FUNCTIONS, ONLY : INTERPOLATE1D
 USE TRAN, ONLY : GET_IJK
 USE COMPLEX_GEOMETRY, ONLY : CC_CGSC,CC_SOLID
+USE CC_SCALARS, ONLY : GET_CFACE_RAD_NVEC
 USE PHYSICAL_FUNCTIONS, ONLY : GET_VOLUME_FRACTION, GET_MASS_FRACTION
 REAL(EB) :: RAP, AX, AXU, AXD, AY, AYU, AYD, AZ, AZU, AZD, VC, RU, RD, RP, AFD, &
             ILXU, ILYU, ILZU, QVAL, BBF, BBFA, NCSDROP, RSA_RAT,EFLUX,SOOT_MASS_FRACTION, &
             AIU_SUM,A_SUM,VOL,VC1,AY1,AZ1,DLO,COS_DLO,AILFU, &
-            RAD_Q_SUM_PARTIAL,KFST4_SUM_PARTIAL,ALPHA_CC
+            RAD_Q_SUM_PARTIAL,KFST4_SUM_PARTIAL,ALPHA_CC,SUMILW,NVECL(3)
 
 INTEGER  :: N,NN,IIG,JJG,KKG,I,J,K,IW,ICF,II,JJ,KK,IOR,IC,IWUP,IWDOWN, &
             ISTART, IEND, ISTEP, JSTART, JEND, JSTEP, &
             KSTART, KEND, KSTEP, NSTART, NEND, NSTEP, &
             I_UIID, N_UPDATES, IBND, NOM, ARRAY_INDEX,NRA, &
-            IMIN, JMIN, KMIN, IMAX, JMAX, KMAX, N_SLICE, M_IJK, IJK, LL
-INTEGER  :: IADD,IFACE,INDCF,IROW,ROW_FIRST,ROW_LAST
+            IMIN, JMIN, KMIN, IMAX, JMAX, KMAX, N_SLICE, M_IJK, IJK, LL,IO
+INTEGER  :: IADD,IFACE,INDCF
 INTEGER, ALLOCATABLE :: IJK_SLICE(:,:)
-REAL(EB) :: XID,YJD,ZKD,KAPPA_PART_SINGLE,DLF,DLA(3),TSI,TMP_EXTERIOR,TEMP_ORIENTATION(3)
+REAL(EB) :: XID,YJD,ZKD,KAPPA_PART_SINGLE,DLF,DLA(3),TSI,TMP_EXTERIOR,TEMP_ORIENTATION(3),&
+            COS_DLO_ARR(NUMBER_RADIATION_ANGLES)
 REAL(EB), ALLOCATABLE, DIMENSION(:) :: ZZ_GET
 INTEGER :: IID,JJD,KKD,IP
-LOGICAL :: UPDATE_INTENSITY
+LOGICAL :: UPDATE_INTENSITY, IS_PARTICLE_ORIENTATION_RAMP
 REAL(EB), POINTER, DIMENSION(:,:,:) :: IL,UIIOLD,KAPPA_PART,KFST4_PART,EXTCOE,SCAEFF,SCAEFF_G,IL_UP
 REAL(EB), POINTER, DIMENSION(:)     :: OUTRAD_W,INRAD_W,OUTRAD_F,INRAD_F,IL_F
 TYPE (OMESH_TYPE), POINTER :: M2
@@ -3529,8 +3756,6 @@ REAL(EB), ALLOCATABLE, DIMENSION(:) :: Z_ARRAY
 ALLOCATE(Z_ARRAY(N_TRACKED_SPECIES))
 
 ALLOCATE( IJK_SLICE(3, IBAR*KBAR) )
-
-IF (CPU_SWEEP_MODE<0) CALL SET_CPU_SWEEP_MODE
 
 KFST4_GAS  => WORK1
 IL         => WORK2
@@ -3684,7 +3909,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
       DO IP = 1,NLP
          LP => LAGRANGIAN_PARTICLE(IP)
          LPC => LAGRANGIAN_PARTICLE_CLASS(LP%CLASS_INDEX)
-         IF (.NOT.LPC%SOLID_PARTICLE) CYCLE
+         IF (.NOT.LPC%SOLID_PARTICLE .OR. LPC%MASSLESS_TARGET) CYCLE
          B1 => BOUNDARY_PROP1(LP%B1_INDEX)
          BC => BOUNDARY_COORD(LP%BC_INDEX)
          CALL GET_IJK(BC%X,BC%Y,BC%Z,NM,XID,YJD,ZKD,IID,JJD,KKD)
@@ -3722,21 +3947,28 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
       !$OMP END PARALLEL
    ENDIF
 
-   ! Compute source term KAPPA*4*SIGMA*TMP**4
+   ! Compute source term KFST4_GAS = KAPPA*4*SIGMA*TMP**4
 
    WIDE_BAND_MODEL_IF: IF (WIDE_BAND_MODEL) THEN
 
-      ! Wide band model
-
+      ALPHA_CC = 1._EB
       DO K=1,KBAR
          DO J=1,JBAR
             DO I=1,IBAR
                IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
                IF (CC_IBM) THEN
+                  ALPHA_CC = 1._EB
                   IF (CCVAR(I,J,K,CC_CGSC)==CC_SOLID) CYCLE
+                  IC = CCVAR(I,J,K,CC_IDCC)
+                  IF (IC>0) ALPHA_CC = CUT_CELL(IC)%ALPHA_CC
                ENDIF
                BBF = BLACKBODY_FRACTION(WL_LOW(IBND),WL_HIGH(IBND),TMP(I,J,K))
                KFST4_GAS(I,J,K) = BBF*KAPPA_GAS(I,J,K)*FOUR_SIGMA*TMP(I,J,K)**4
+               IF (CHI_R(I,J,K)*Q(I,J,K)>QR_CLIP) THEN ! Precomputation of quantities for the RTE source term correction
+                  VOL = R(I)*DX(I)*DY(J)*DZ(K)*ALPHA_CC
+                  RAD_Q_SUM = RAD_Q_SUM + (BBF*CHI_R(I,J,K)*Q(I,J,K) + KAPPA_GAS(I,J,K)*UIID(I,J,K,IBND))*VOL
+                  KFST4_SUM = KFST4_SUM + KFST4_GAS(I,J,K)*VOL
+               ENDIF
             ENDDO
          ENDDO
       ENDDO
@@ -3769,24 +4001,10 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
 
                KFST4_GAS(I,J,K) = BBF*KAPPA_GAS(I,J,K)*FOUR_SIGMA*TMP(I,J,K)**4._EB
                IF (CHI_R(I,J,K)*Q(I,J,K)>QR_CLIP) THEN ! Precomputation of quantities for the RTE source term correction
-                     VOL = R(I)*DX(I)*DY(J)*DZ(K)*ALPHA_CC
-                     RAD_Q_SUM = RAD_Q_SUM + (BBF*CHI_R(I,J,K)*Q(I,J,K) + KAPPA_GAS(I,J,K)*UIID(I,J,K,IBND))*VOL
-                     KFST4_SUM = KFST4_SUM + KFST4_GAS(I,J,K)*VOL
+                  VOL = R(I)*DX(I)*DY(J)*DZ(K)*ALPHA_CC
+                  RAD_Q_SUM = RAD_Q_SUM + (BBF*CHI_R(I,J,K)*Q(I,J,K) + KAPPA_GAS(I,J,K)*UIID(I,J,K,IBND))*VOL
+                  KFST4_SUM = KFST4_SUM + KFST4_GAS(I,J,K)*VOL
                ENDIF
-            ENDDO
-         ENDDO
-      ENDDO
-
-      ! Correct the source term in the RTE based on user-specified RADIATIVE_FRACTION on REAC
-
-      DO K=1,KBAR
-         DO J=1,JBAR
-            DO I=1,IBAR
-               IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
-               IF (CC_IBM) THEN
-                  IF (CCVAR(I,J,K,CC_CGSC)==CC_SOLID) CYCLE
-               ENDIF
-               IF (CHI_R(I,J,K)*Q(I,J,K)>QR_CLIP) KFST4_GAS(I,J,K) = KFST4_GAS(I,J,K)*RTE_SOURCE_CORRECTION_FACTOR
             ENDDO
          ENDDO
       ENDDO
@@ -3832,22 +4050,6 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          KFST4_SUM = KFST4_SUM + KFST4_SUM_PARTIAL
          !$OMP END CRITICAL
 
-         ! Correct the source term in the RTE based on user-specified RADIATIVE_FRACTION on REAC
-
-         !$OMP DO
-         DO K=1,KBAR
-            DO J=1,JBAR
-               DO I=1,IBAR
-                  IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
-                  IF (CC_IBM) THEN
-                     IF (CCVAR(I,J,K,CC_CGSC)==CC_SOLID) CYCLE
-                  ENDIF
-                  IF (CHI_R(I,J,K)*Q(I,J,K)>QR_CLIP) KFST4_GAS(I,J,K) = KFST4_GAS(I,J,K)*RTE_SOURCE_CORRECTION_FACTOR
-               ENDDO
-            ENDDO
-         ENDDO
-         !$OMP END DO
-
          !$OMP END PARALLEL
 
       ELSE RTE_SOURCE_CORRECTION_IF  ! OPTICALLY_THIN
@@ -3869,6 +4071,24 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
       ENDIF RTE_SOURCE_CORRECTION_IF
 
    ENDIF WIDE_BAND_MODEL_IF
+
+   ! Correct the source term in the RTE based on user-specified RADIATIVE_FRACTION on REAC
+
+   IF (RTE_SOURCE_CORRECTION) THEN
+      !$OMP PARALLEL DO COLLAPSE(3)
+      DO K=1,KBAR
+         DO J=1,JBAR
+            DO I=1,IBAR
+               IF (CELL(CELL_INDEX(I,J,K))%SOLID) CYCLE
+               IF (CC_IBM) THEN
+                  IF (CCVAR(I,J,K,CC_CGSC)==CC_SOLID) CYCLE
+               ENDIF
+               IF (CHI_R(I,J,K)*Q(I,J,K)>QR_CLIP) KFST4_GAS(I,J,K) = KFST4_GAS(I,J,K)*RTE_SOURCE_CORRECTION_FACTOR
+            ENDDO
+         ENDDO
+      ENDDO
+      !$OMP END PARALLEL DO
+   ENDIF
 
    ! Add contribution to source term from a user-specified volumetric heat release rate
 
@@ -3972,9 +4192,10 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          CFA => CFACE(ICF)
          BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
          BC  => BOUNDARY_COORD(CFA%BC_INDEX)
+         NVECL = GET_CFACE_RAD_NVEC(CFA)
          DO N=1,NRA
             DLA = (/DLX(N),DLY(N),DLZ(N)/)
-            DLF = DOT_PRODUCT(BC%NVEC,DLA) ! face normal * radiation angle
+            DLF = DOT_PRODUCT(NVECL,DLA) ! face normal * radiation angle
             IF (DLF<0._EB) INRAD_F(ICF) = INRAD_F(ICF) - DLF*BR%BAND(IBND)%ILW(N)
          ENDDO
       ENDDO
@@ -4078,7 +4299,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
                BC => BOUNDARY_COORD(CFA%BC_INDEX)
                B1 => BOUNDARY_PROP1(CFA%B1_INDEX)
-               DLF = DOT_PRODUCT(BC%NVEC,DLA) ! face normal * radiation angle
+               DLF = DOT_PRODUCT(GET_CFACE_RAD_NVEC(CFA),DLA) ! face normal * radiation angle
                IF (DLF<0._EB) CYCLE CFACE_LOOP1
                BR%BAND(IBND)%ILW(N) = OUTRAD_F(ICF) + RPI*(1._EB-B1%EMISSIVITY)*INRAD_F(ICF)
             ENDDO CFACE_LOOP1
@@ -4187,38 +4408,6 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                   ENDDO I2LOOP
                ENDDO K2LOOP
 
-            ELSEIF (.NOT.CC_IBM .AND. CPU_SWEEP_MODE==CPU_SWEEP_SERIAL) THEN GEOMETRY2  ! 3D cartesian, rows in array order
-
-               DO K=KSTART,KEND,KSTEP
-                  DO J=JSTART,JEND,JSTEP
-                     CALL SWEEP_ROW(J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
-                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
-                  ENDDO
-               ENDDO
-
-            ELSEIF (.NOT.CC_IBM .AND. CPU_SWEEP_MODE==CPU_SWEEP_ROWS) THEN GEOMETRY2  ! 3D cartesian, diagonals of rows
-
-               ! Row (J,K) needs rows (J-JSTEP,K) and (J,K-KSTEP) only, so the rows with the same number of steps
-               ! from the corner (JSTART,KSTART) are independent.
-
-               ROW_DIAGONAL_LOOP: DO N_SLICE=0,JBAR+KBAR-2
-                  ROW_FIRST = MAX(0,N_SLICE-JBAR+1)  ! steps in K of the first and last row of the diagonal
-                  ROW_LAST  = MIN(KBAR-1,N_SLICE)
-                  IF (ROW_LAST-ROW_FIRST+1<CPU_SWEEP_MIN_PARALLEL_ROWS) THEN
-                     DO IROW=ROW_FIRST,ROW_LAST
-                        CALL SWEEP_ROW(JSTART+JSTEP*(N_SLICE-IROW),KSTART+KSTEP*IROW,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
-                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
-                     ENDDO
-                  ELSE
-                     !$OMP PARALLEL DO SCHEDULE(STATIC)
-                     DO IROW=ROW_FIRST,ROW_LAST
-                        CALL SWEEP_ROW(JSTART+JSTEP*(N_SLICE-IROW),KSTART+KSTEP*IROW,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,&
-                                    IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
-                     ENDDO
-                     !$OMP END PARALLEL DO
-                  ENDIF
-               ENDDO ROW_DIAGONAL_LOOP
-
             ELSE GEOMETRY2  ! Sweep in 3D cartesian geometry
 
                IPROP_LOOP: DO N_SLICE = ISTEP*ISTART + JSTEP*JSTART + KSTEP*KSTART, &
@@ -4288,7 +4477,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                            DO IFACE=1,CF%NFACE
                               CFA => CFACE(CF%CFACE_INDEX(IFACE))
                               BC => BOUNDARY_COORD(CFA%BC_INDEX)
-                              DLF = DOT_PRODUCT(BC%NVEC,DLA) ! face normal * radiation angle
+                              DLF = DOT_PRODUCT(GET_CFACE_RAD_NVEC(CFA),DLA) ! face normal * radiation angle
                               IF (DLF>0._EB) THEN ! upwind
                                  BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
                                  AILFU = AILFU + DLF*CFA%AREA*BR%BAND(IBND)%ILW(N)
@@ -4325,7 +4514,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                            ICF = FCVAR(I,J,K+IADD,CC_IDCF,KAXIS)
                            IF (ICF>0) AZD = AZD*CUT_FACE(ICF)%ALPHA_CF
                            IF(FCVAR(I,J,K+IADD,CC_FGSC,KAXIS)==CC_SOLID) AZD = 0._EB
-
+                           IF(ALL((/EXTCOE(I,J,K),AXD+AYD+AZD+AFD/)<TWO_EPSILON_EB)) CYCLE SLICE_LOOP
                            ! Adjust volume
                            IC = CCVAR(I,J,K,CC_IDCC)
                            VC = VC*CUT_CELL(IC)%ALPHA_CC
@@ -4335,6 +4524,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
 
                      A_SUM = AXD + AYD + AZD + AFD
                      AIU_SUM = AXU*ILXU + AYU*ILYU + AZU*ILZU + AILFU
+
                      IF (SOLID_PARTICLES) IL_UP(I,J,K) = MAX(0._EB,AIU_SUM/A_SUM)
                      RAP = 1._EB/(A_SUM + EXTCOE(I,J,K)*VC*RSA(N))
                      IL(I,J,K) = MAX(0._EB, RAP * (AIU_SUM + VC*RSA(N)*RFPI* &
@@ -4347,6 +4537,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                ENDDO IPROP_LOOP
 
             ENDIF GEOMETRY2
+
             ! Copy the Y-downwind intensities to Y-upwind in cylindrical case
 
             IF (CYLINDRICAL) THEN
@@ -4399,7 +4590,8 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                BC => BOUNDARY_COORD(WC%BC_INDEX)
                IF (DLN(BC%IOR,N)>=0._EB) CYCLE WALL_LOOP3     ! outgoing
                BR => BOUNDARY_RADIA(WC%BR_INDEX)
-               BR%BAND(IBND)%ILW(ANGLE_INC_COUNTER) = BR%BAND(IBND)%ILW(ANGLE_INC_COUNTER) - DLN(BC%IOR,N)*IL(BC%IIG,BC%JJG,BC%KKG)
+               BR%BAND(IBND)%ILW(ANGLE_INC_COUNTER) = BR%BAND(IBND)%ILW(ANGLE_INC_COUNTER) &
+                                                      - DLN(BC%IOR,N)*IL(BC%IIG,BC%JJG,BC%KKG)
             ENDDO WALL_LOOP3
             !$OMP END DO
             !$OMP END PARALLEL
@@ -4408,7 +4600,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                CFA => CFACE(ICF)
                IF (CFA%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE CFACE_LOOP2
                BC => BOUNDARY_COORD(CFA%BC_INDEX)
-               DLF = DOT_PRODUCT(BC%NVEC,DLA) ! face normal * radiation angle
+               DLF = DOT_PRODUCT(GET_CFACE_RAD_NVEC(CFA),DLA) ! face normal * radiation angle
                IF (DLF>=0._EB) CYCLE CFACE_LOOP2      ! outgoing
                BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
                BC => BOUNDARY_COORD(CFA%BC_INDEX)
@@ -4420,7 +4612,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                CFA => CFACE(ICF)
                IF (CFA%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE CFACE_LOOP3
                BC => BOUNDARY_COORD(CFA%BC_INDEX)
-               DLF = DOT_PRODUCT(BC%NVEC,DLA) ! face normal * radiation angle
+               DLF = DOT_PRODUCT(GET_CFACE_RAD_NVEC(CFA),DLA) ! face normal * radiation angle
                IF (DLF>=0._EB) CYCLE CFACE_LOOP3      ! outgoing
                BR  => BOUNDARY_RADIA(CFA%BR_INDEX)
                BC => BOUNDARY_COORD(CFA%BC_INDEX)
@@ -4457,18 +4649,21 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
                   IF (LPC%N_ORIENTATION==0) CYCLE PARTICLE_RADIATION_LOOP
                   BC => BOUNDARY_COORD(LP%BC_INDEX)
                   TEMP_ORIENTATION(1:3) = ORIENTATION_VECTOR(1:3,LP%ORIENTATION_INDEX)
+                  IS_PARTICLE_ORIENTATION_RAMP = .FALSE.
                   IF (LP%INIT_INDEX > 0) THEN
                      IN => INITIALIZATION(LP%INIT_INDEX)
                      IF (ANY(IN%ORIENTATION_RAMP_INDEX > 0)) THEN
-                        TEMP_ORIENTATION(1) = EVALUATE_RAMP(T,IN%ORIENTATION_RAMP_INDEX(1))
-                        TEMP_ORIENTATION(2) = EVALUATE_RAMP(T,IN%ORIENTATION_RAMP_INDEX(2))
-                        TEMP_ORIENTATION(3) = EVALUATE_RAMP(T,IN%ORIENTATION_RAMP_INDEX(3))
-                        TEMP_ORIENTATION = TEMP_ORIENTATION / &
-                                           (SQRT(TEMP_ORIENTATION(1)**2+TEMP_ORIENTATION(2)**2+TEMP_ORIENTATION(3)**2) &
-                                           +TWENTY_EPSILON_EB)
+                        CALL CALC_PARTICLE_TEMP_ORIENTATION(T,IN%ORIENTATION_RAMP_INDEX(1:3),TEMP_ORIENTATION)
+                        IS_PARTICLE_ORIENTATION_RAMP = .TRUE.
                      ENDIF
                   ENDIF
-                  COS_DLO = -DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
+
+                  IF(IS_PARTICLE_ORIENTATION_RAMP) THEN
+                     COS_DLO = -DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
+                  ELSE
+                     COS_DLO = -DLO_ORIENTATION(LP%ORIENTATION_INDEX,N)
+                  ENDIF
+
                   IF (COS_DLO > COS_HALF_VIEW_ANGLE(LP%ORIENTATION_INDEX)) THEN
                      DLO = -(TEMP_ORIENTATION(1)*DLX(N) + TEMP_ORIENTATION(2)*DLY(N) + TEMP_ORIENTATION(3)*DLZ(N))
                      BR => BOUNDARY_RADIA(LP%BR_INDEX)
@@ -4508,6 +4703,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          B1 => BOUNDARY_PROP1(WC%B1_INDEX)
          SF => SURFACE(WC%SURF_INDEX)
          IF (SF%TMP_GAS_FRONT>0._EB) CYCLE
+         IF (SF%SKIP_INRAD) INRAD_W(IW) = 0._EB
          IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
             IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
                TSI = T
@@ -4526,6 +4722,7 @@ BAND_LOOP: DO IBND = 1,NUMBER_SPECTRAL_BANDS
          IF (CFACE(ICF)%BOUNDARY_TYPE==NULL_BOUNDARY) CYCLE
          B1 => BOUNDARY_PROP1(CFA%B1_INDEX)
          SF => SURFACE(CFA%SURF_INDEX)
+         IF (SF%SKIP_INRAD) INRAD_W(ICF) = 0._EB
          IF (SF%TMP_GAS_FRONT>0._EB) CYCLE
          IF (SF%EXTERNAL_FLUX > TWENTY_EPSILON_EB) THEN
             IF (ABS(T_BEGIN) <= SPACING(B1%T_IGN)) THEN
@@ -4609,8 +4806,25 @@ IF (SOLID_PARTICLES .AND. UPDATE_INTENSITY) THEN
          IF (LP%ORIENTATION_INDEX>0) THEN
             BR => BOUNDARY_RADIA(LP%BR_INDEX)
             B1%Q_RAD_IN = 0._EB
+            IO = LP%ORIENTATION_INDEX
+            IS_PARTICLE_ORIENTATION_RAMP = .FALSE.
+            IF (LP%INIT_INDEX > 0) THEN
+               IN => INITIALIZATION(LP%INIT_INDEX)
+               IF (ANY(IN%ORIENTATION_RAMP_INDEX > 0)) THEN
+                  IS_PARTICLE_ORIENTATION_RAMP = .TRUE.
+                  CALL CALC_PARTICLE_TEMP_ORIENTATION(T,IN%ORIENTATION_RAMP_INDEX(1:3),TEMP_ORIENTATION)
+                  DO N=1,NRA
+                     COS_DLO_ARR(N) = DOT_PRODUCT(TEMP_ORIENTATION(1:3),DLANG(1:3,N))
+                  ENDDO
+               ENDIF
+            ENDIF
             DO IBND=1,NUMBER_SPECTRAL_BANDS
-               B1%Q_RAD_IN = B1%Q_RAD_IN + B1%EMISSIVITY * (WEIGH_CYL*SUM(BR%BAND(IBND)%ILW(1:NUMBER_RADIATION_ANGLES)) + EFLUX)
+               IF (IS_PARTICLE_ORIENTATION_RAMP) THEN
+                  SUMILW = SUM(BR%BAND(IBND)%ILW,MASK = -COS_DLO_ARR(:) > COS_HALF_VIEW_ANGLE(IO))
+               ELSE
+                  SUMILW = SUM(BR%BAND(IBND)%ILW,MASK = -DLO_ORIENTATION(IO,:) > COS_HALF_VIEW_ANGLE(IO))
+               ENDIF
+               B1%Q_RAD_IN = B1%Q_RAD_IN + B1%EMISSIVITY*(WEIGH_CYL*SUMILW + EFLUX)
             ENDDO
          ELSE
             BC => BOUNDARY_COORD(LP%BC_INDEX)
@@ -4649,84 +4863,25 @@ ENDIF
 
 END SUBROUTINE RADIATION_FVM
 
+!> \brief Provide the temporary orientation of a particle, given a ramp.
+SUBROUTINE CALC_PARTICLE_TEMP_ORIENTATION(T, ORIENTATION_RAMP_INDEX, TEMP_ORIENTATION)
 
-!> \brief Sweep one row (J,K) of a 3-D Cartesian mesh without cut cells along I for angle N (see CPU_SWEEP_MODE).
-!> The same arithmetic as SLICE_LOOP of RADIATION_FVM, so that all sweep orders give identical intensities.
+REAL(EB), INTENT(IN)  :: T
+INTEGER,  INTENT(IN)  :: ORIENTATION_RAMP_INDEX(3)
+REAL(EB), INTENT(OUT) :: TEMP_ORIENTATION(3)
 
-SUBROUTINE SWEEP_ROW(J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP,RSA_RAT,IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD)
+REAL(EB) :: NORM
 
-INTEGER, INTENT(IN) :: J,K,N,ISTART,IEND,ISTEP,JSTEP,KSTEP
-REAL(EB), INTENT(IN) :: RSA_RAT
-REAL(EB), POINTER, INTENT(IN), DIMENSION(:,:,:) :: IL,IL_UP,EXTCOE,KFST4_GAS,KFST4_PART,SCAEFF,SCAEFF_G,UIIOLD  ! no copies
-INTEGER :: I,IC
-REAL(EB) :: AY1,AX,VC1,AZ1,ILXU,ILYU,ILZU,VC,AY,AZ,AXU,AYU,AZU,AXD,AYD,AZD,AFD,AILFU,A_SUM,AIU_SUM,RAP
+TEMP_ORIENTATION(1) = EVALUATE_RAMP(T, ORIENTATION_RAMP_INDEX(1))
+TEMP_ORIENTATION(2) = EVALUATE_RAMP(T, ORIENTATION_RAMP_INDEX(2))
+TEMP_ORIENTATION(3) = EVALUATE_RAMP(T, ORIENTATION_RAMP_INDEX(3))
 
-AY1 = DZ(K) * ABS(DLY(N))
-AX  = DY(J) * DZ(K) * ABS(DLX(N))
-VC1 = DY(J) * DZ(K)
-AZ1 = DY(J) * ABS(DLZ(N))
+NORM = SQRT(SUM(TEMP_ORIENTATION**2)) + TWENTY_EPSILON_EB
 
-ROW_LOOP: DO I=ISTART,IEND,ISTEP
-   ILXU  = IL(I-ISTEP,J,K)
-   ILYU  = IL(I,J-JSTEP,K)
-   ILZU  = IL(I,J,K-KSTEP)
-   IC = CELL_INDEX(I,J,K)
-   IF (IC/=0) THEN
-      IF (CELL(IC)%SOLID) CYCLE ROW_LOOP
-      IF (CELL_ILW(IC,1)>-1.E6_EB) ILXU = CELL_ILW(IC,1)
-      IF (CELL_ILW(IC,2)>-1.E6_EB) ILYU = CELL_ILW(IC,2)
-      IF (CELL_ILW(IC,3)>-1.E6_EB) ILZU = CELL_ILW(IC,3)
-   ENDIF
-   VC  = DX(I) * VC1
-   AY  = DX(I) * AY1
-   AZ  = DX(I) * AZ1
+TEMP_ORIENTATION = TEMP_ORIENTATION / NORM
 
-   AXU = AX; AXD = AX
-   AYU = AY; AYD = AY
-   AZU = AZ; AZD = AZ
+END SUBROUTINE CALC_PARTICLE_TEMP_ORIENTATION
 
-   AILFU = 0._EB; AFD = 0._EB
-
-   A_SUM = AXD + AYD + AZD + AFD
-   AIU_SUM = AXU*ILXU + AYU*ILYU + AZU*ILZU + AILFU
-   IF (SOLID_PARTICLES) IL_UP(I,J,K) = MAX(0._EB,AIU_SUM/A_SUM)
-   RAP = 1._EB/(A_SUM + EXTCOE(I,J,K)*VC*RSA(N))
-   IL(I,J,K) = MAX(0._EB, RAP * (AIU_SUM + VC*RSA(N)*RFPI* &
-                   ( KFST4_GAS(I,J,K) + KFST4_PART(I,J,K) + RSA_RAT*&
-                   (SCAEFF(I,J,K)+SCAEFF_G(I,J,K))*UIIOLD(I,J,K) ) ) )
-ENDDO ROW_LOOP
-
-END SUBROUTINE SWEEP_ROW
-
-
-!> \brief Choose the order of the cells in the 3-D Cartesian sweep of RADIATION_FVM (see CPU_SWEEP_MODE).
-
-SUBROUTINE SET_CPU_SWEEP_MODE
-
-!$ USE OMP_LIB, ONLY: OMP_GET_MAX_THREADS
-CHARACTER(16) :: TEXT
-INTEGER :: ISTAT,N_THREADS
-
-CPU_SWEEP_MODE = CPU_SWEEP_SERIAL
-CALL GET_ENVIRONMENT_VARIABLE('GFDS_RADI_CPU_SWEEP',TEXT,STATUS=ISTAT)
-IF (ISTAT==0) THEN
-   SELECT CASE(TRIM(TEXT))
-      CASE('SLICE','slice')   ; CPU_SWEEP_MODE = CPU_SWEEP_SLICE
-      CASE('SERIAL','serial') ; CPU_SWEEP_MODE = CPU_SWEEP_SERIAL
-      CASE('ROWS','rows')     ; CPU_SWEEP_MODE = CPU_SWEEP_ROWS
-   END SELECT
-ENDIF
-N_THREADS = 1
-!$ N_THREADS = OMP_GET_MAX_THREADS()
-SELECT CASE(CPU_SWEEP_MODE)
-   CASE(CPU_SWEEP_SLICE) ; TEXT = 'SLICE'
-   CASE(CPU_SWEEP_ROWS)  ; TEXT = 'ROWS'
-   CASE DEFAULT          ; TEXT = 'SERIAL'
-END SELECT
-IF (CC_IBM) TEXT = 'SLICE (cut cells)'
-IF (MY_RANK==0 .AND. VERBOSE) WRITE(LU_ERR,'(A,A,A,I0,A)') ' Radiation CPU sweep: ',TRIM(TEXT),' (OpenMP threads: ',N_THREADS,')'
-
-END SUBROUTINE SET_CPU_SWEEP_MODE
 
 
 !> \brief Add user-specified HRRPUV to the heat release rate term, Q
@@ -4816,21 +4971,24 @@ REAL(EB) FUNCTION GET_KAPPA(Z_IN,TMP,IBND)
 
 ! Returns the radiative absorption
 
-USE PHYSICAL_FUNCTIONS, ONLY : GET_MOLECULAR_WEIGHT
-REAL(EB), INTENT(IN) :: Z_IN(1:N_TRACKED_SPECIES),TMP
-REAL(EB) :: KAPPA_TEMP,INT_FAC,KAPPA_SUM,SCALED_X_RADCAL_SPECIES,MWA,Z_COND(1:N_TRACKED_SPECIES)
+USE PHYSICAL_FUNCTIONS, ONLY : GET_MOLECULAR_WEIGHT,GET_MASS_FRACTION_ALL
+REAL(EB), INTENT(INOUT) :: Z_IN(1:N_TRACKED_SPECIES)
+REAL(EB), INTENT(IN) :: TMP
+REAL(EB) :: KAPPA_TEMP,INT_FAC,KAPPA_SUM,SCALED_X_RADCAL_SPECIES,MWA,Y_OUT(1:N_SPECIES)
 INTEGER, INTENT(IN) :: IBND
 INTEGER :: LBND,UBND,N,TYY
+
+Z_IN = Z_IN * KAPPA_COND
 
 KAPPA_SUM = 0._EB
 
 TYY = MAX(0 , MIN(N_KAPPA_T,INT((TMP - RTMPMIN) * TYY_FAC)))
 
-Z_COND = Z_IN*KAPPA_COND
-CALL GET_MOLECULAR_WEIGHT(Z_COND,MWA)
+CALL GET_MOLECULAR_WEIGHT(Z_IN,MWA)
+CALL GET_MASS_FRACTION_ALL(Z_IN,Y_OUT)
 
 DO N = 1, N_RADCAL_ARRAY_SIZE
-   SCALED_X_RADCAL_SPECIES = DOT_PRODUCT(Z2RADCAL_SPECIES(N,:),Z_COND)
+   SCALED_X_RADCAL_SPECIES = DOT_PRODUCT(Y2RADCAL_SPECIES(N,:),Y_OUT)
    IF (SCALED_X_RADCAL_SPECIES<TWENTY_EPSILON_EB) CYCLE
    IF (RADCAL_SPECIES_INDEX(N)==16) THEN
       INT_FAC = MAX(0._EB,MIN(REAL(N_KAPPA_X,EB),LOG(SCALED_X_RADCAL_SPECIES/KAPPA_C_MIN)/LOG_KAPPA_C_FAC+1._EB))
@@ -4850,12 +5008,11 @@ GET_KAPPA = KAPPA_SUM
 END FUNCTION GET_KAPPA
 
 
-!==================================================================================
-!Function to compute the absorption coefficient according to Bordbar et al. (2014)
-!==================================================================================
-REAL(EB) FUNCTION KAPPA_WSGG(X_H2O, X_CO2, MOL_RATIO,PARTIAL_PRESSURE,JWSGG)
-USE WSGG_ARRAYS
+!> \brief Function to compute the absorption coefficient according to Bordbar et al. (2014)
 
+REAL(EB) FUNCTION KAPPA_WSGG(X_H2O, X_CO2, MOL_RATIO,PARTIAL_PRESSURE,JWSGG)
+
+USE WSGG_ARRAYS
 INTEGER, INTENT(IN) :: JWSGG
 INTEGER :: NN
 REAL(EB), INTENT(IN) :: X_H2O, X_CO2, MOL_RATIO,PARTIAL_PRESSURE
@@ -4894,26 +5051,21 @@ KAPPA_WSGG = SUM_KAPPA*PARTIAL_PRESSURE
 
 END FUNCTION KAPPA_WSGG
 
-!===================================================================================
-!Function to compute the temperature coefficient according to Bordbar et al. (2014)
-!===================================================================================
-REAL(EB) RECURSIVE FUNCTION A_WSGG(TTMP,MOL_RATIO,JWSGG) &
-   RESULT(A_FUNC_RES)
-USE WSGG_ARRAYS
 
+!> \brief Function to compute the temperature coefficient according to Bordbar et al. (2014)
+
+REAL(EB) RECURSIVE FUNCTION A_WSGG(TTMP,MOL_RATIO,JWSGG) RESULT(A_FUNC_RES)
+
+USE WSGG_ARRAYS
 INTEGER,INTENT(IN) :: JWSGG
 INTEGER :: MM,NN
 REAL(EB),INTENT(IN) :: MOL_RATIO,TTMP
 REAL(EB) :: TREF,SUM_A,SUM_B,SUM_C
 
-!------------------------
-!Parameters of the model
-!------------------------
 TREF = 1200._EB ! Reference temperature
 
-!------------------------------------------------------------------
-!Computing the temperature coefficient for the transparent windows
-!------------------------------------------------------------------
+! Computing the temperature coefficient for the transparent windows
+
 IF (JWSGG==5) THEN
    SUM_A = 0._EB
    DO MM=1,4
@@ -4922,19 +5074,17 @@ IF (JWSGG==5) THEN
    A_FUNC_RES = 1._EB - SUM_A
 
 ELSE
-!---------------------------------------------------------
-!Computing the temperature coefficient for the gray gases
-!(within three intervals of molar ratio)
-!---------------------------------------------------------
+   ! Computing the temperature coefficient for the gray gases (within three intervals of molar ratio)
+
    IF (MOL_RATIO < 0.01_EB) THEN               !Only CO2
-      !Computing the polynomial
+      ! Computing the polynomial
       SUM_B = 0._EB
       DO MM=0,4
          SUM_B = SUM_B + WSGG_B1_ARRAY(JWSGG,MM)*(TTMP/TREF)**(REAL(MM,EB))
       ENDDO
 
    ELSEIF (MOL_RATIO > 4._EB) THEN               !Only H2O
-      !Computing the polynomial
+      ! Computing the polynomial
       SUM_B = 0._EB
       DO MM=0,4
          SUM_B = SUM_B + WSGG_B2_ARRAY(JWSGG,MM)*(TTMP/TREF)**(REAL(MM,EB))
@@ -4958,18 +5108,16 @@ ENDIF
 END FUNCTION A_WSGG
 
 
-!====================================================
-!Function to compute the gray absorption coefficient
-!of soot (same function as the one used by Fluent)
-!====================================================
+!> \brief Function to compute the gray absorption coefficient of soot (same function as the one used by Fluent)
+
 REAL(EB) FUNCTION KAPPA_SOOT(SOOT_MASS_CONCENTRATION,TTMP)
 
 REAL(EB),INTENT(IN) :: SOOT_MASS_CONCENTRATION,TTMP
 
-   !KAPPA_SOOT = 1232.4_EB*SOOT_MASS_CONCENTRATION*(1._EB+4.8E-4_EB*(TTMP-2000._EB))
-   KAPPA_SOOT = SOOT_MASS_CONCENTRATION*(1232.4_EB+0.591552_EB*(TTMP-2000._EB))
+KAPPA_SOOT = SOOT_MASS_CONCENTRATION*(1232.4_EB+0.591552_EB*(TTMP-2000._EB))
 
 END FUNCTION KAPPA_SOOT
 
 
 END MODULE RAD
+

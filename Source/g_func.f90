@@ -8,7 +8,8 @@ MODULE G_FUNC
 
     ! Per-mesh results of the block-max reductions (max, i, j, k) that the host needs, kept on the device until all
     ! meshes were launched and then read back at once: MESH_REDUCE_D(MESH_REDUCE_OFFSET(MR_KIND,NM)+1:+4).
-    INTEGER, PARAMETER :: MR_RESIDUAL=1,MR_VELOCITY_ERROR=2,MR_CFL=3,MR_VN=4,N_MESH_REDUCE_KINDS=4
+    ! MR_CLIP: 1 (2) if the predictor DENSITY clipped a cell at RHOMIN (RHOMAX), mass.f90 CLIP_RHOMIN (CLIP_RHOMAX).
+    INTEGER, PARAMETER :: MR_RESIDUAL=1,MR_VELOCITY_ERROR=2,MR_CFL=3,MR_VN=4,MR_CLIP=5,N_MESH_REDUCE_KINDS=5
     REAL(EB), DEVICE, ALLOCATABLE :: MESH_REDUCE_D(:)
     REAL(EB), ALLOCATABLE :: MESH_REDUCE_H(:)
     LOGICAL, ALLOCATABLE :: MESH_REDUCE_PENDING(:,:)

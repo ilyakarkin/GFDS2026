@@ -14,3 +14,15 @@ The Python script called `swaps.py` reads a comma-delimited spreadsheet file cal
 
 The script then reads the file called `Template` which is an FDS input file except that it contains the character strings `param1`, `param2`, and `param3`. It then creates the three FDS input files `file01.fds`, `file02.fds`, and `file03.fds` in which the character strings in the first row are replaced by the character strings in the subsequent rows. There is no number or string typing; the strings in the first row are replaced exactly as is by the strings in the subsequent rows. There is no need to add quotes or anything else.
 
+## Creating a simple pan using OBST lines
+
+The script `pan_with_lip.py` creates a simple circular pan with a lip. Input your desired dimensions directly in the script.
+
+## FDS Simple Chemistry
+
+The script `fds_simple_chemistry.py` replicates the internal processing done by FDS when simple chemistry is being used for a `REAC` input. The begining of the script contains inputs for the fuel chemistry, soot and CO yields, ambient conditions, one or two-step chemistry, and if soot should be tracked seperately or as part of product lumped species.  The script outputs stoichiometry, heats of combustion, and EPUMO2 for all reactions and the total reaction; a mass and molar definition, molecular weight, and heat of formation for all lumped species used by the reactions; the fuel specifc heat calculated using gamma; and provides warning messages for EPUMO2 or gamma based fuel specific heat values that are abnormal.
+
+## One-Dimensional Mesh Stretching
+
+The script `mesh_quad_stretch.py` generates `&TRNX`, `&TRNY`, or `&TRNZ` ramp lines for a one-dimensional stretched mesh, writes the ramp file, and produces plots of the stretched cell boundaries and the computational-to-physical coordinate mapping. You can define an initial section of uniform grid, and subsequent stretching up to a specified mesh size and number of cells.
+
