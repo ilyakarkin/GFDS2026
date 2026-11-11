@@ -79,8 +79,9 @@ The CPU source is FDS 6.11.1 (tag `FDS-6.11.1`); `--c` runs the FDS 6.11.1 time 
 Features that the GPU time loop does not implement stop a `--g` run at set-up with
 `ERROR: GPU: … is not supported; run this case with --c`, and the case has to be run on CPU: pyrolysis (`MATL` with
 reactions), `THERMOCOUPLE`, cylindrical geometry, solid particles, CVODE, `BLOWING`, `MP5`, turbulence models other
-than Deardorff, complex geometry (`GEOM`, CC_IBM), a burning thin obstruction inside a mesh, LES/DNS at the boundary
-of meshes of different cell size, non-standard `HEAT_TRANSFER_MODEL`, and output quantities with no GPU mapping.
+than Deardorff, complex geometry (`GEOM`, CC_IBM), specified mass flux on a thin obstruction in a model without
+gas-phase reactions or particles, LES/DNS at the boundary of meshes of different cell size, non-standard
+`HEAT_TRANSFER_MODEL`, and output quantities with no GPU mapping.
 
 The background pressure of closed rooms is very sensitive (1 Pa is about 0.003 K of the mean room
 temperature) and still differs from FDS 6.11.1 by a few pascals.
