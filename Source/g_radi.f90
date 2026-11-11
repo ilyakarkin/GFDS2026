@@ -422,13 +422,18 @@ MODULE G_RADI
 
         END SUBROUTINE RADI_REFRESH_WALL_STORAGE
 
+        !> Copy the wall intensities from the device to the host. Only the entries of WALL cells are written on the device:
+        !> the entries of oriented particles (ILW of the massless targets) are computed on the host by
+        !> RADIATION_FINISH_TARGETS_GPU and must not be replaced by the values packed at start-up.
         SUBROUTINE RADI_SYNC_BOUNDARY_RADIA_ILW_D2H
-            INTEGER :: IBR,IB,N,NLIM
+            INTEGER :: IW,IBR,IB,N,NLIM
 
             IF (.NOT.ALLOCATED(GM%RADI%BOUNDARY_RADIA_ILW_H)) RETURN
 
             GM%RADI%BOUNDARY_RADIA_ILW_H = GM%RADI%BOUNDARY_RADIA_ILW_D
-            DO IBR=1,N_BOUNDARY_RADIA_DIM
+            DO IW=LBOUND(GM%RADI%WALL_BR_INDEX_H,1),UBOUND(GM%RADI%WALL_BR_INDEX_H,1)
+                IBR = GM%RADI%WALL_BR_INDEX_H(IW)
+                IF (IBR<=0 .OR. IBR>N_BOUNDARY_RADIA_DIM) CYCLE
                 IF (.NOT.ALLOCATED(BOUNDARY_RADIA(IBR)%BAND)) CYCLE
                 DO IB=1,NUMBER_SPECTRAL_BANDS
                     IF (.NOT.ALLOCATED(BOUNDARY_RADIA(IBR)%BAND(IB)%ILW)) CYCLE

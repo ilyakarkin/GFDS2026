@@ -8,8 +8,21 @@ an NVIDIA A100 this release is 4–19 times faster than FDS 6.11.1 on CPU, typic
 
 Author and maintainer of the fork: **Ilya Karkin**, [pyrosim.ru](https://pyrosim.ru).
 
-The default branch `firesim` holds the current release, `firecat-611`: the GFDS GPU code on the FDS 6.11.1 source
+The default branch `firesim` holds the current release, `firecat-611b`: the GFDS GPU code on the FDS 6.11.1 source
 (tag `FDS-6.11.1`).
+
+### Changes since `firecat-611`
+
+Fixes found by comparing GPU runs of building models with FDS 6.11.1 on CPU:
+
+- HT1D: the first solve of a newly exposed wall as in FDS 6.11.1;
+- radiation: particle intensities kept in the device-to-host wall sync (`RADIATIVE HEAT FLUX GAS` at oriented targets);
+- walls with specified mass flux: `RHO_F` of cells that are not burning, as `CALCULATE_RHO_F`;
+- thin burning obstructions run on the GPU: specified mass flux on thin plates as `CALCULATE_ZZ_F`;
+- wall `DEVC` `GAS DENSITY` follows the gas density and species of the wall cell (it stayed at its t=0 value);
+- `VENT` defaults reach `READ_VENT` again (an nvfortran host-association issue), the OBST count and the
+  `.s3d.sz` version written as FDS 6.11.1;
+- formatted output files round decimal ties to even, as FDS 6.11.1 built with Intel Fortran.
 
 ### What runs on the GPU
 

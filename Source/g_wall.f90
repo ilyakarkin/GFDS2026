@@ -827,6 +827,8 @@ MODULE G_WALL
                 ENDIF
             ENDDO
 
+            IF (.NOT.GM%THIN_SMF_LIST_VALID) CALL BUILD_THIN_SMF_LIST(NM)
+
             CALL UPDATE_WALL_ZZ_F_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(TOTAL_WALL_CELLS, N_TOTAL_SCALARS, N_TRACKED_SPECIES, GM%WALL_TOPO_AOS, &
                 GM%WALL_SF_INDEX, SF_SPECIES_BC_INDEX, SF_MASS_FRACTION, GM%WALL_U_NORMAL_S, WALL_ZZ_GD, GM%WALL_ZZ_F, &
                 UUD, VVD, WWD, GM%WALL_RHO_F, GM%WALL_RHO_D_DZDN_F, GM%WALL_M_DOT_G_PP_ADJUST, GM%WALL_M_DOT_G_PP_ACTUAL, &
@@ -848,7 +850,23 @@ MODULE G_WALL
                 NULL_BOUNDARY, OPEN_BOUNDARY, INTERPOLATED_BOUNDARY, SOLID_BOUNDARY, SPECIFIED_MASS_FLUX, RAMP_T_MIN_D, &
                 RAMP_SPAN_D, RAMP_RDT_D, RAMP_NPOINTS_D, RAMP_OFFSET_D, RAMP_INTERP_D, T, DT, T_BEGIN, &
                 MERGE(1,0,INITIALIZATION_PHASE),MERGE(1,0,PREDICTOR), &
-                GM%SURF_LB,GM%SURF_UB,GM%WALL_LB,GM%WALL_UB,KBP1)
+                GM%SURF_LB,GM%SURF_UB,GM%WALL_LB,GM%WALL_UB,KBP1,GM%WALL_THIN_SMF_D)
+
+            ! Specified mass flux on a thin obstruction face (CALCULATE_ZZ_F, corrector): the gas goes into the adjacent
+            ! gas cell as D_SOURCE and M_DOT_PPP. One thread per gas cell sums its WALL cells in WALL cell order.
+            IF (CORRECTOR .AND. .NOT.INITIALIZATION_PHASE .AND. GM%THIN_SMF_NCELL>0) THEN
+                CALL WALL_THIN_SMF_SOURCE_GPU<<<(GM%THIN_SMF_NCELL+GPU_BLKD_1D-1)/GPU_BLKD_1D,GPU_BLKD_1D,0,GM%STRM>>>( &
+                    GM%THIN_SMF_NCELL,N_TRACKED_SPECIES,GM%THIN_SMF_START_D,GM%THIN_SMF_IW_D,GM%WALL_TOPO_AOS, &
+                    GM%WALL_M_DOT_G_PP_ADJUST,GM%WALL_AREA,GM%WALL_RHO_G,GM%RSUMD,SPECIES_RCOND, &
+                    GM%RDXD,GM%RRND,GM%RDYD,GM%RDZD,GM%D_SOURCED,GM%M_DOT_PPPD,IBP1,JBP1,KBP1,GM%WALL_LB,GM%WALL_UB)
+                IF (GPU_DEBUG_H2D_D2H .AND. ALLOCATED(MESHES(NM)%D_SOURCE)) THEN
+                    CALL GPU_WAIT(GM%STRM)
+                    D_SOURCE = GM%D_SOURCED
+                    DO N=1,N_TRACKED_SPECIES
+                        M_DOT_PPP(:,:,:,N) = GM%M_DOT_PPPD(:,:,:,N)
+                    ENDDO
+                ENDIF
+            ENDIF
 
             CALL WALL_RHO_F_RHOP_GPU<<<GRDD_1D,BLKD_1D,0,GM%STRM>>>(TOTAL_WALL_CELLS, N_TRACKED_SPECIES, N_EXTERNAL_WALL_CELLS, &
                 GM%WALL_TOPO_AOS, GM%WALL_SF_INDEX, GM%WALL_PRESSURE_ZONE, GM%WALL_U_NORMAL, GM%WALL_U_NORMAL_S, SF_ADIABATIC, &
@@ -1063,6 +1081,154 @@ MODULE G_WALL
             ENDDO
             MDOT_D(I) = MSUM
         END SUBROUTINE GATHER_WALL_MASS_LOSS_GPU
+
+
+        !> \brief List the WALL cells of mesh NM with a specified mass flux on a thin obstruction face
+        !> \details CALCULATE_ZZ_F (wall.f90) takes its thin obstruction branch for a WALL cell that is not OPEN or
+        !> INTERPOLATED, has a SPECIFIED_MASS_FLUX surface, N_TRACKED_SPECIES>1 and a cell behind the face that is neither
+        !> SOLID nor EXTERIOR. WALL_SPECIFIED_MASS_FLUX_GPU treats SOLID_BOUNDARY cells, so those are listed. The cells are
+        !> grouped by their gas cell; a group keeps the WALL cell order. The list is rebuilt after obstructions are
+        !> created or removed (the SOLID state of the cells changes only then).
+        SUBROUTINE BUILD_THIN_SMF_LIST(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW,N,L,NW,NCELL,IC
+            INTEGER(8) :: NKEY,ICG
+            INTEGER, ALLOCATABLE :: FLAG_H(:),START_H(:),IW_H(:)
+            INTEGER(8), ALLOCATABLE :: KEY(:)
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(WALL_TYPE), POINTER :: WC
+            TYPE(BOUNDARY_COORD_TYPE), POINTER :: BC
+
+            M => MESHES(NM)
+            GM => GPU_MESHES(NM)
+            NW = M%N_EXTERNAL_WALL_CELLS+M%N_INTERNAL_WALL_CELLS
+            NKEY = INT(NW,8)+1_8
+            ALLOCATE(FLAG_H(0:MAX(0,NW)),KEY(1:MAX(1,NW)))
+            FLAG_H = 0
+            N = 0
+            IF (N_TRACKED_SPECIES>1) THEN
+                DO IW=1,NW
+                    WC => M%WALL(IW)
+                    IF (WC%BOUNDARY_TYPE/=SOLID_BOUNDARY) CYCLE
+                    IF (WC%SURF_INDEX<0 .OR. WC%SURF_INDEX>UBOUND(SURFACE,1)) CYCLE
+                    IF (SURFACE(WC%SURF_INDEX)%SPECIES_BC_INDEX/=SPECIFIED_MASS_FLUX) CYCLE
+                    BC => M%BOUNDARY_COORD(WC%BC_INDEX)
+                    IC = M%CELL_INDEX(BC%II,BC%JJ,BC%KK)
+                    IF (M%CELL(IC)%SOLID .OR. M%CELL(IC)%EXTERIOR) CYCLE
+                    FLAG_H(IW) = 1
+                    N = N + 1
+                    ICG = (INT(BC%KKG,8)*INT(M%JBP1+1,8)+INT(BC%JJG,8))*INT(M%IBP1+1,8)+INT(BC%IIG,8)
+                    KEY(N) = ICG*NKEY + INT(IW,8)
+                ENDDO
+            ENDIF
+            IF (N>1) CALL HEAPSORT_I8(KEY,N)
+
+            NCELL = 0
+            ALLOCATE(START_H(1:N+1),IW_H(1:MAX(1,N)))
+            DO L=1,N
+                IW_H(L) = INT(MOD(KEY(L),NKEY))
+                IF (L==1) THEN
+                    NCELL = 1 ; START_H(1) = 1
+                ELSEIF (KEY(L)/NKEY/=KEY(L-1)/NKEY) THEN
+                    NCELL = NCELL + 1 ; START_H(NCELL) = L
+                ENDIF
+            ENDDO
+            START_H(NCELL+1) = N + 1
+
+            IF (ALLOCATED(GM%WALL_THIN_SMF_D))  DEALLOCATE(GM%WALL_THIN_SMF_D)
+            IF (ALLOCATED(GM%THIN_SMF_START_D)) DEALLOCATE(GM%THIN_SMF_START_D)
+            IF (ALLOCATED(GM%THIN_SMF_IW_D))    DEALLOCATE(GM%THIN_SMF_IW_D)
+            ALLOCATE(GM%WALL_THIN_SMF_D(0:MAX(0,NW)))
+            GM%WALL_THIN_SMF_D = FLAG_H
+            GM%THIN_SMF_NCELL = NCELL
+            IF (NCELL>0) THEN
+                ALLOCATE(GM%THIN_SMF_START_D(1:NCELL+1),GM%THIN_SMF_IW_D(1:N))
+                GM%THIN_SMF_START_D = START_H(1:NCELL+1)
+                GM%THIN_SMF_IW_D = IW_H(1:N)
+            ENDIF
+            DEALLOCATE(FLAG_H,KEY,START_H,IW_H)
+            GM%THIN_SMF_LIST_VALID = .TRUE.
+
+        END SUBROUTINE BUILD_THIN_SMF_LIST
+
+
+        !> \brief Sort the first N elements of A in increasing order (heapsort; the keys are distinct)
+        SUBROUTINE HEAPSORT_I8(A,N)
+            INTEGER, INTENT(IN) :: N
+            INTEGER(8), INTENT(INOUT) :: A(:)
+            INTEGER :: I,J,L,IR
+            INTEGER(8) :: T
+
+            L = N/2 + 1
+            IR = N
+            DO
+                IF (L>1) THEN
+                    L = L - 1
+                    T = A(L)
+                ELSE
+                    T = A(IR)
+                    A(IR) = A(1)
+                    IR = IR - 1
+                    IF (IR==1) THEN
+                        A(1) = T
+                        RETURN
+                    ENDIF
+                ENDIF
+                I = L
+                J = L + L
+                DO WHILE (J<=IR)
+                    IF (J<IR) THEN
+                        IF (A(J)<A(J+1)) J = J + 1
+                    ENDIF
+                    IF (T<A(J)) THEN
+                        A(I) = A(J)
+                        I = J
+                        J = J + J
+                    ELSE
+                        J = IR + 1
+                    ENDIF
+                ENDDO
+                A(I) = T
+            ENDDO
+        END SUBROUTINE HEAPSORT_I8
+
+
+        !> \brief Gas source of a specified mass flux on thin obstruction faces (CALCULATE_ZZ_F, corrector)
+        !> \details One thread per gas cell of the thin list adds, for each of its WALL cells in WALL cell order and
+        !> each species with a mass flux, M_DOT_PPP_SINGLE = M_DOT_G_PP_ADJUST*AREA*RVC to M_DOT_PPP and
+        !> M_DOT_PPP_SINGLE*MW_RATIO/RHO_G to D_SOURCE, with the same operations as wall.f90. The term
+        !> -Q_DOT_G_PP*AREA*RVC/(H_G*RHO_G) of wall.f90 is zero: Q_DOT_G_PP is set only by predicted solid-phase
+        !> pyrolysis, which the GPU refuses.
+        ATTRIBUTES(GLOBAL) SUBROUTINE WALL_THIN_SMF_SOURCE_GPU(NCELL,N_TRACKED_SPECIES_IN,START_D,IW_D,WALL_TOPO, &
+            WALL_M_DOT_G_PP_ADJUSTD,WALL_AREAD,WALL_RHO_GD,RSUMD,SPECIES_RCON_D,RDXD,RRND,RDYD,RDZD,D_SOURCE_D, &
+            M_DOT_PPP_D,IBP1,JBP1,KBP1,WALL_LB,WALL_UB)
+            INTEGER, VALUE :: NCELL,N_TRACKED_SPECIES_IN,IBP1,JBP1,KBP1,WALL_LB,WALL_UB
+            INTEGER, DEVICE :: START_D(*),IW_D(*)
+            TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
+            REAL(EB), DEVICE :: WALL_M_DOT_G_PP_ADJUSTD(WALL_LB:WALL_UB,1:*),WALL_AREAD(WALL_LB:WALL_UB), &
+                                WALL_RHO_GD(0:*),SPECIES_RCON_D(*),RDXD(0:*),RRND(0:*),RDYD(0:*),RDZD(0:*)
+            REAL(EB), DEVICE :: RSUMD(0:IBP1,0:JBP1,0:*),D_SOURCE_D(0:IBP1,0:JBP1,0:*)
+            REAL(EB), DEVICE :: M_DOT_PPP_D(0:IBP1,0:JBP1,0:KBP1,1:*)
+            INTEGER :: I,L,IW,NS,IIG,JJG,KKG
+            REAL(EB) :: RVC,MW_RATIO,M_DOT_PPP_SINGLE
+
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (I<1 .OR. I>NCELL) RETURN
+            DO L=START_D(I),START_D(I+1)-1
+                IW = IW_D(L)
+                IIG = WALL_TOPO(IW)%IIG
+                JJG = WALL_TOPO(IW)%JJG
+                KKG = WALL_TOPO(IW)%KKG
+                RVC = RDXD(IIG)*RRND(IIG)*RDYD(JJG)*RDZD(KKG)
+                DO NS=1,N_TRACKED_SPECIES_IN
+                    IF (ABS(WALL_M_DOT_G_PP_ADJUSTD(IW,NS))<=TWENTY_EPSILON_EB) CYCLE
+                    MW_RATIO = SPECIES_RCON_D(NS)/RSUMD(IIG,JJG,KKG)
+                    M_DOT_PPP_SINGLE = WALL_M_DOT_G_PP_ADJUSTD(IW,NS)*WALL_AREAD(IW)*RVC
+                    D_SOURCE_D(IIG,JJG,KKG) = D_SOURCE_D(IIG,JJG,KKG) + M_DOT_PPP_SINGLE*MW_RATIO/WALL_RHO_GD(IW)
+                    M_DOT_PPP_D(IIG,JJG,KKG,NS) = M_DOT_PPP_D(IIG,JJG,KKG,NS) + M_DOT_PPP_SINGLE
+                ENDDO
+            ENDDO
+        END SUBROUTINE WALL_THIN_SMF_SOURCE_GPU
 
         !--------------------------------------------------------------------------
         ! Wall gas, heat-transfer, mass-transfer, and ghost-value kernels
@@ -2080,12 +2246,13 @@ MODULE G_WALL
             WALL_M_DOT_G_PP_ADJUSTD, WALL_M_DOT_G_PP_ACTUALD, WALL_U_NORMALD, WALL_U_NORMAL_SD, PBARD_IN, MWR_ZD_IN, &
             R0D_IN, NULL_BOUNDARY_IN, OPEN_BOUNDARY_IN, INTERPOLATED_BOUNDARY_IN, SOLID_BOUNDARY_IN, &
             SPECIFIED_MASS_FLUX_IN, RAMP_T_MIND, RAMP_SPAND, RAMP_RDTD, RAMP_NPOINTSD, RAMP_OFFSETD, RAMP_INTERPD, T_IN, &
-            DT_IN,T_BEGIN_IN,INITIALIZATION_PHASE_FLAG,PREDICTOR_FLAG,SURF_LB,SURF_UB,WALL_LB,WALL_UB,KBP1)
+            DT_IN,T_BEGIN_IN,INITIALIZATION_PHASE_FLAG,PREDICTOR_FLAG,SURF_LB,SURF_UB,WALL_LB,WALL_UB,KBP1,WALL_THIN_SMFD)
 
             IMPLICIT NONE
             TYPE(WALL_TOPO_AOS_TYPE), DEVICE :: WALL_TOPO(0:*)
 
             INTEGER, VALUE :: TOTAL_WALL_CELLS,N_TRACKED_SPECIES,N_REACTIONS_IN,SURF_LB,SURF_UB,WALL_LB,WALL_UB,KBP1
+            INTEGER, DEVICE, DIMENSION(0:*) :: WALL_THIN_SMFD
             INTEGER, VALUE :: NULL_BOUNDARY_IN, OPEN_BOUNDARY_IN, INTERPOLATED_BOUNDARY_IN
             INTEGER, VALUE :: SOLID_BOUNDARY_IN, SPECIFIED_MASS_FLUX_IN, INITIALIZATION_PHASE_FLAG, PREDICTOR_FLAG
             REAL(EB), VALUE :: R0D_IN, T_IN, DT_IN, T_BEGIN_IN
@@ -2272,6 +2439,22 @@ MODULE G_WALL
             ! As CALCULATE_ZZ_F: a tiny (or zero) mass flux total is kept and goes through the face iteration below.
             ! Zeroing it here dropped HRRPUA of order 1E-10 kW/m2 that the CPU keeps (spreading_fire after the ramp).
 
+            ! As CALCULATE_ZZ_F: on a thin obstruction face (the cell behind it is neither SOLID nor EXTERIOR) no gas
+            ! goes through the face; the corrector adds it to the adjacent gas cell (WALL_THIN_SMF_SOURCE_GPU).
+            ! RHO_F and RHO_D_F are left as they are, as on the CPU.
+            IF (WALL_THIN_SMFD(IW)==1) THEN
+                UN = 0._EB
+                DO N=1,N_TRACKED_SPECIES
+                    WALL_ZZ_FD(IW,N) = WALL_ZZ_GD(IW,N)
+                ENDDO
+                IF (PREDICTOR_FLAG == 1) THEN
+                    WALL_U_NORMAL_SD(IW) = -UN
+                ELSE
+                    WALL_U_NORMALD(IW) = -UN
+                ENDIF
+                RETURN
+            ENDIF
+
             KK = WALL_TOPO(IW)%KK
             IPZ = WALL_PRESSURE_ZONED(IW)
             RHO_F_PREVIOUS = WALL_RHO_FD(IW)
@@ -2384,21 +2567,14 @@ MODULE G_WALL
                 CASE(-3); KK2 = KK+1
             END SELECT
 
-            IF (SF_SPECIES_BC_INDEXD(SF_IDX) == SPECIFIED_MASS_FLUX_IN) THEN
-                RHO_F_LOCAL = WALL_RHO_FD(IW)
-                RSUM_F = 0._EB
-                DO N = 1, N_TRACKED_SPECIES
-                    RSUM_F = RSUM_F + MWR_ZD_IN(N)*MAX(0._EB,WALL_ZZ_FD(IW,N))
-                ENDDO
-                RSUM_F = R0D_IN*RSUM_F
-            ELSE
-                RSUM_F = 0._EB
-                DO N = 1, N_TRACKED_SPECIES
-                    RSUM_F = RSUM_F + MWR_ZD_IN(N)*MAX(0._EB,WALL_ZZ_FD(IW,N))
-                ENDDO
-                RSUM_F = R0D_IN*RSUM_F
-                RHO_F_LOCAL = PBARD_IN(KK,IPZ)/(RSUM_F*WALL_TMP_FD(IW))
-            ENDIF
+            ! As CALCULATE_RHO_F: every cell takes RHO_F from the current surface values and background pressure.
+            ! This includes SPECIFIED_MASS_FLUX cells that are not burning, which do not update RHO_F in their kernel.
+            RSUM_F = 0._EB
+            DO N = 1, N_TRACKED_SPECIES
+                RSUM_F = RSUM_F + MWR_ZD_IN(N)*MAX(0._EB,WALL_ZZ_FD(IW,N))
+            ENDDO
+            RSUM_F = R0D_IN*RSUM_F
+            RHO_F_LOCAL = PBARD_IN(KK,IPZ)/(RSUM_F*WALL_TMP_FD(IW))
 
             ! Exterior ghost cells, both layers (CPU: end of CALCULATE_ZZ_F, i.e. before the SOLID inflow override below).
             ! FDS 54bd18d6e5, 47c184ddf4: Z_ghost=Z_F in II and II2.

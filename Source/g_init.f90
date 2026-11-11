@@ -62,13 +62,14 @@ MODULE G_INIT
             IF (.NOT.WALL_BC_ON) RETURN
             MESH_LOOP: DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
                 ! A specified mass flux (HRRPUA, MLRPUA, MASS_FLUX) on a thin (zero cells thick) obstruction face: wall.f90
-                ! sets UN=0 there and adds the gas to the adjacent cell as a volume source (D_SOURCE, M_DOT_PPP); the GPU
-                ! wall kernels have no such branch and blow the gas through the face. wall.f90 takes that branch where the
-                ! cell behind the face is neither SOLID nor EXTERIOR, which is WC%THIN (init.f90): the wall cells are
-                ! checked below. A hidden (not yet created) thin obstruction is refused here already, unless its thin
+                ! (CALCULATE_ZZ_F) sets UN=0 there and adds the gas to the adjacent cell as a volume source (D_SOURCE,
+                ! M_DOT_PPP), as the GPU does (WALL_SPECIFIED_MASS_FLUX_GPU, WALL_THIN_SMF_SOURCE_GPU). FDS allocates
+                ! D_SOURCE and M_DOT_PPP only with gas-phase reactions, particles, aerosol deposition, condensation or
+                ! solid-phase pyrolysis (init.f90); without them CALCULATE_ZZ_F writes to arrays that do not exist, so that
+                ! case is refused. A hidden (not yet created) thin obstruction is checked here already, unless its thin
                 ! plane is on the mesh boundary, where the cell behind the face is EXTERIOR and the ordinary mass flux
                 ! boundary condition applies; this check is repeated after every creation or removal.
-                IF (N_TRACKED_SPECIES>1) THEN
+                IF (N_TRACKED_SPECIES>1 .AND. .NOT.ALLOCATED(MESHES(NM)%D_SOURCE)) THEN
                     SURF_THIN = 0
                     DO N=1,MESHES(NM)%N_OBST
                         OB => MESHES(NM)%OBSTRUCTION(N)
@@ -94,7 +95,7 @@ MODULE G_INIT
                         ELSE
                             REASON = SURFACE(SURF_THIN)%ID
                         ENDIF
-                        WRITE(MESSAGE,'(3A)') 'ERROR: GPU: HRRPUA, MLRPUA or MASS_FLUX on a thin obstruction (SURF ', &
+                        WRITE(MESSAGE,'(3A)') 'ERROR: GPU: MASS_FLUX on a thin obstruction without gas-phase reactions (SURF ', &
                             TRIM(REASON),') is not supported; run this case with --c'
                         CALL SHUTDOWN(MESSAGE,PROCESS_0_ONLY=.FALSE.)
                         EXIT MESH_LOOP

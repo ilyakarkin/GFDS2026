@@ -272,6 +272,14 @@ MODULE G_MESH
         REAL(EB), ALLOCATABLE :: CONSUME_MDOT_H(:)
         INTEGER, DEVICE, ALLOCATABLE :: CONSUME_IW_D(:)
         REAL(EB), DEVICE, ALLOCATABLE :: CONSUME_MDOT_D(:)
+        ! WALL cells with a specified mass flux on a thin obstruction face (CALCULATE_ZZ_F: the cell behind the face is
+        ! neither SOLID nor EXTERIOR). No gas goes through the face; on the corrector it is added to the adjacent gas
+        ! cell as D_SOURCE and M_DOT_PPP. WALL_THIN_SMF_D(IW)=1 marks such a cell. THIN_SMF_IW_D lists them grouped by
+        ! gas cell, THIN_SMF_START_D(1:THIN_SMF_NCELL+1) gives the groups; within a group the WALL cells are in WALL
+        ! cell order, so the sums are formed in the order of the CPU WALL loop. Rebuilt after obstructions change.
+        INTEGER :: THIN_SMF_NCELL = 0
+        LOGICAL :: THIN_SMF_LIST_VALID = .FALSE.
+        INTEGER, DEVICE, ALLOCATABLE :: WALL_THIN_SMF_D(:),THIN_SMF_START_D(:),THIN_SMF_IW_D(:)
         REAL(EB), DEVICE, ALLOCATABLE :: WALL_Q_IN_SMOOTH(:),WALL_Q_IN_SMOOTH_INT(:,:),WALL_QDOTPP_INT(:,:)
         REAL(EB), DEVICE, ALLOCATABLE :: U_GHOSTD(:),V_GHOSTD(:),W_GHOSTD(:),UVW_SAVED(:)
 
@@ -283,6 +291,7 @@ MODULE G_MESH
         LOGICAL :: HT1D_INITIALIZED = .FALSE.
         LOGICAL :: HT1D_STATIC_MATERIALS = .FALSE.
         LOGICAL :: HT1D_STATIC_PROPERTIES_INITIALIZED = .FALSE.
+        LOGICAL :: HT1D_ANY_FRESH = .FALSE.  ! some line has not been through SOLID_HEAT_TRANSFER_GPU since INITIALIZE_BOUNDARY_ONE_D
         INTEGER :: HT1D_BACKSIDE_REMOTE_LINES = 0
         INTEGER :: HT1D_BACKSIDE_VALID_LINES = 0
         INTEGER, ALLOCATABLE :: HT1D_WALL_TO_LINE_H(:),HT1D_NODE_OFFSET_H(:),HT1D_NWP_H(:)
@@ -312,6 +321,7 @@ MODULE G_MESH
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_MATL_RHO_S_D(:),HT1D_MATL_K_S_D(:,:),HT1D_MATL_C_S_D(:,:)
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_K_NODE_D(:)
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_K_S_D(:),HT1D_RHO_C_S_D(:),HT1D_Q_S_D(:),HT1D_Q_BASE_D(:)
+        REAL(EB), DEVICE, ALLOCATABLE :: HT1D_FRESH_RHO_C_S_D(:)  ! per line: ONE_D%RHO_C_S of a fresh line, 0 otherwise
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_AAS_D(:),HT1D_BBS_D(:),HT1D_DDS_D(:),HT1D_CCS_D(:),HT1D_DDT_D(:)
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_RFACF2_D(:),HT1D_QDXKF_D(:),HT1D_RFACB2_D(:),HT1D_QDXKB_D(:)
         REAL(EB), DEVICE, ALLOCATABLE :: HT1D_DT_SUB_D(:),HT1D_DT_FO_D(:),HT1D_DXF_D(:),HT1D_DXB_D(:)

@@ -160,6 +160,7 @@ MODULE G_HT1D
             REAL(EB) :: DXF_W,DXB_W,X_DIVIDE_W
             INTEGER, ALLOCATABLE :: INT_RAD_H(:)
             REAL(EB), ALLOCATABLE :: TWO_DX_KAPPA_H(:)
+            REAL(EB), ALLOCATABLE :: K_S_H(:),RHO_C_S_H(:),FRESH_RHO_C_S_H(:)
             REAL(EB) :: VOLSUM,KAPSUM,RHO_ADJ
             INTEGER :: LI,SURF_BACK
 
@@ -529,6 +530,7 @@ MODULE G_HT1D
             ALLOCATE(GM%HT1D_MATL_C_S_D(0:I_MAX_TEMP,1:GM%HT1D_N_UNIQUE_MATL))
             ALLOCATE(GM%HT1D_K_NODE_D(1:GM%HT1D_N_NODES))
             ALLOCATE(GM%HT1D_K_S_D(1:GM%HT1D_N_NODES),GM%HT1D_RHO_C_S_D(1:GM%HT1D_N_NODES))
+            ALLOCATE(GM%HT1D_FRESH_RHO_C_S_D(1:GM%HT1D_N_LINES))
             ALLOCATE(GM%HT1D_Q_S_D(1:GM%HT1D_N_NODES),GM%HT1D_Q_BASE_D(1:GM%HT1D_N_NODES))
             ALLOCATE(GM%HT1D_AAS_D(1:GM%HT1D_N_NODES),GM%HT1D_BBS_D(1:GM%HT1D_N_NODES))
             ALLOCATE(GM%HT1D_DDS_D(1:GM%HT1D_N_NODES),GM%HT1D_CCS_D(1:GM%HT1D_N_NODES))
@@ -620,8 +622,32 @@ MODULE G_HT1D
                     IF (ALLOCATED(ONE_D%HEAT_SOURCE)) GM%HT1D_Q_S_H(BASE+I) = ONE_D%HEAT_SOURCE(NL)
                 ENDDO
             ENDDO
-            GM%HT1D_K_S_D = 0._EB
-            GM%HT1D_RHO_C_S_D = 0._EB
+            ! Thermal properties held by the host ONE_D arrays: the placeholders of INITIALIZE_BOUNDARY_ONE_D (RHO_C_S=1.E6, K_S=0)
+            ! for a line that has not been through SOLID_HEAT_TRANSFER yet, otherwise the values of its last sub-step
+            ! (HT1D_SYNC_PROPERTIES_D2H, restart file). wall.f90 picks the first sub-step of a call from these stored values.
+            ALLOCATE(K_S_H(1:GM%HT1D_N_NODES),RHO_C_S_H(1:GM%HT1D_N_NODES),FRESH_RHO_C_S_H(1:GM%HT1D_N_LINES))
+            K_S_H = 0._EB
+            RHO_C_S_H = 0._EB
+            FRESH_RHO_C_S_H = 0._EB
+            DO IL=1,GM%HT1D_N_LINES
+                ONE_D => M%BOUNDARY_ONE_D(M%WALL(WALL_INDEX_H(IL))%OD_INDEX)
+                IF (.NOT.ALLOCATED(ONE_D%K_S) .OR. .NOT.ALLOCATED(ONE_D%RHO_C_S)) CYCLE
+                BASE = GM%HT1D_NODE_OFFSET_H(IL)
+                NWP = GM%HT1D_NWP_H(IL)
+                DO I=0,NWP+1
+                    K_S_H(BASE+I) = ONE_D%K_S(I)
+                ENDDO
+                DO I=1,NWP
+                    RHO_C_S_H(BASE+I) = ONE_D%RHO_C_S(I)
+                ENDDO
+                ! After a solve K_S is positive at every node (zero is replaced by 10000 in wall.f90)
+                IF (NWP>=1 .AND. ONE_D%K_S(1)<=0._EB) FRESH_RHO_C_S_H(IL) = ONE_D%RHO_C_S(1)
+            ENDDO
+            GM%HT1D_K_S_D = K_S_H
+            GM%HT1D_RHO_C_S_D = RHO_C_S_H
+            GM%HT1D_FRESH_RHO_C_S_D = FRESH_RHO_C_S_H
+            GM%HT1D_ANY_FRESH = ANY(FRESH_RHO_C_S_H>0._EB)
+            DEALLOCATE(K_S_H,RHO_C_S_H,FRESH_RHO_C_S_H)
             GM%HT1D_Q_S_D = GM%HT1D_Q_S_H
             GM%HT1D_Q_BASE_D = GM%HT1D_Q_S_H
             GM%HT1D_AAS_D = 0._EB
@@ -761,6 +787,7 @@ MODULE G_HT1D
             IF (ALLOCATED(GM%HT1D_IOR_D)) DEALLOCATE(GM%HT1D_IOR_D)
             IF (ALLOCATED(GM%HT1D_K_NODE_D)) DEALLOCATE(GM%HT1D_K_NODE_D)
             IF (ALLOCATED(GM%HT1D_K_S_D)) DEALLOCATE(GM%HT1D_K_S_D)
+            IF (ALLOCATED(GM%HT1D_FRESH_RHO_C_S_D)) DEALLOCATE(GM%HT1D_FRESH_RHO_C_S_D)
             IF (ALLOCATED(GM%HT1D_LAYER_INDEX_D)) DEALLOCATE(GM%HT1D_LAYER_INDEX_D)
             IF (ALLOCATED(GM%HT1D_LINE_ACTIVE_D)) DEALLOCATE(GM%HT1D_LINE_ACTIVE_D)
             IF (ALLOCATED(GM%HT1D_MATL_COMP_OFFSET_D)) DEALLOCATE(GM%HT1D_MATL_COMP_OFFSET_D)
@@ -834,6 +861,7 @@ MODULE G_HT1D
             GM%HT1D_N_MATL_LAYER_VALUES = 0
             GM%HT1D_MAX_SUBSTEPS = 1
             GM%HT1D_STATIC_MATERIALS = .FALSE.
+            GM%HT1D_ANY_FRESH = .FALSE.
             GM%HT1D_STATIC_PROPERTIES_INITIALIZED = .FALSE.
             GM%HT1D_INITIALIZED = .FALSE.
         END SUBROUTINE RELEASE_GPU_HT1D
@@ -1051,7 +1079,7 @@ MODULE G_HT1D
                     GM%HT1D_Q_IR_D,GM%HT1D_TMP_D,GM%HT1D_K_S_D,GM%HT1D_RDX_D,GM%HT1D_RDXN_D,GM%HT1D_INT_RAD_D, &
                     GM%HT1D_BACKING_D,GM%HT1D_H_FIXED_B_D,GM%HT1D_TMP_F_D,GM%HT1D_TMP_G_F_D,GM%HT1D_HTCF_D, &
                     GM%HT1D_Q_RAD_IN_F_D,GM%HT1D_EMISSIVITY_F_D,GM%HT1D_TMP_B_D,GM%HT1D_TMP_G_B_D,GM%HT1D_HTCB_D, &
-                    GM%HT1D_Q_RAD_IN_B_D,GM%HT1D_EMISSIVITY_B_D)
+                    GM%HT1D_Q_RAD_IN_B_D,GM%HT1D_EMISSIVITY_B_D,GM%HT1D_FRESH_RHO_C_S_D)
                 IF (.NOT.GM%HT1D_STATIC_PROPERTIES_INITIALIZED) THEN
                     CALL HT1D_BUILD_MATERIAL_PROPERTIES_GPU<<<GM%HT1D_N_LINES,HT1D_THREADS,0,GM%STRM>>>(GM%HT1D_N_LINES, &
                         GM%HT1D_NODE_OFFSET_D,GM%HT1D_NWP_D,GM%HT1D_MATL_OFFSET_D,GM%HT1D_N_MATL_D,GM%HT1D_LAYER_INDEX_D, &
@@ -1102,6 +1130,13 @@ MODULE G_HT1D
             CALL HT1D_UPDATE_IGNITION_GPU<<<GRDD,HT1D_THREADS,0,GM%STRM>>>(GM%HT1D_N_LINES,GM%HT1D_WALL_INDEX_D, &
                 GM%HT1D_SURF_INDEX_D,GM%WALL_TMP_F,GM%WALL_M_DOT_G_PP_ADJUST,GM%WALL_T_IGN,SF_PYROLYSIS_MODEL, &
                 SF_TMP_IGN,SF_TMP_EXT,N_TRACKED_SPECIES,GM%WALL_LB,GM%WALL_UB,T)
+
+            ! The lines now hold the properties of their last sub-step, as ONE_D%K_S and ONE_D%RHO_C_S in wall.f90
+            IF (GM%HT1D_ANY_FRESH) THEN
+                CALL GPU_WAIT(GM%STRM)
+                GM%HT1D_FRESH_RHO_C_S_D = 0._EB
+                GM%HT1D_ANY_FRESH = .FALSE.
+            ENDIF
 
             ! Following wall kernels consume WALL_TMP_F, WALL_Q_CON_F and WALL_Q_RAD_OUT.
         END SUBROUTINE SOLID_HEAT_TRANSFER_GPU
@@ -1164,6 +1199,47 @@ MODULE G_HT1D
             IF (SF_TMP_IGN_D(SF_IDX)<50000._EB .AND. WALL_TMP_F_D(IW)<SF_TMP_EXT_D(SF_IDX) .AND. &
                 WALL_T_IGN_D(IW)<T_IN) WALL_T_IGN_D(IW) = HUGE(1._EB)
         END SUBROUTINE HT1D_UPDATE_IGNITION_GPU
+
+        !> \brief Copy the thermal properties of the device lines to the host ONE_D arrays
+        !> \details Called before obstructions are created or removed and before a restart file is written. Lines that have
+        !> not been through SOLID_HEAT_TRANSFER_GPU keep the placeholders of INITIALIZE_BOUNDARY_ONE_D, as in wall.f90.
+        SUBROUTINE HT1D_SYNC_PROPERTIES_D2H(NM)
+            INTEGER, INTENT(IN) :: NM
+            INTEGER :: IW,LINE,BASE,NWP,I
+            REAL(EB), ALLOCATABLE :: K_S_H(:),RHO_C_S_H(:),FRESH_H(:)
+            TYPE(MESH_TYPE), POINTER :: M
+            TYPE(WALL_TYPE), POINTER :: WC
+            TYPE(BOUNDARY_ONE_D_TYPE), POINTER :: ONE_D
+            TYPE(GPU_MESH_TYPE), POINTER :: GM
+
+            GM => GPU_MESHES(NM)
+            IF (.NOT.GM%HT1D_INITIALIZED .OR. GM%HT1D_N_LINES<=0) RETURN
+            IF (.NOT.ALLOCATED(GM%HT1D_WALL_TO_LINE_H)) RETURN
+            CALL GPU_WAIT(GM%STRM)
+            ALLOCATE(K_S_H(1:GM%HT1D_N_NODES),RHO_C_S_H(1:GM%HT1D_N_NODES),FRESH_H(1:GM%HT1D_N_LINES))
+            K_S_H = GM%HT1D_K_S_D
+            RHO_C_S_H = GM%HT1D_RHO_C_S_D
+            FRESH_H = GM%HT1D_FRESH_RHO_C_S_D
+            M => MESHES(NM)
+            DO IW=1,SIZE(GM%HT1D_WALL_TO_LINE_H)
+                LINE = GM%HT1D_WALL_TO_LINE_H(IW)
+                IF (LINE<1 .OR. LINE>GM%HT1D_N_LINES) CYCLE
+                IF (FRESH_H(LINE)>0._EB) CYCLE
+                WC => M%WALL(IW)
+                IF (WC%OD_INDEX<1 .OR. WC%OD_INDEX>SIZE(M%BOUNDARY_ONE_D)) CYCLE
+                ONE_D => M%BOUNDARY_ONE_D(WC%OD_INDEX)
+                IF (.NOT.ALLOCATED(ONE_D%K_S) .OR. .NOT.ALLOCATED(ONE_D%RHO_C_S)) CYCLE
+                NWP = GM%HT1D_NWP_H(LINE)
+                BASE = GM%HT1D_NODE_OFFSET_H(LINE)
+                DO I=0,NWP+1
+                    ONE_D%K_S(I) = K_S_H(BASE+I)
+                ENDDO
+                DO I=1,NWP
+                    ONE_D%RHO_C_S(I) = RHO_C_S_H(BASE+I)
+                ENDDO
+            ENDDO
+            DEALLOCATE(K_S_H,RHO_C_S_H,FRESH_H)
+        END SUBROUTINE HT1D_SYNC_PROPERTIES_D2H
 
         SUBROUTINE HT1D_SYNC_OUTPUT_D2H(NM)
             INTEGER, INTENT(IN) :: NM
@@ -1554,9 +1630,12 @@ MODULE G_HT1D
             RHO_C_S_D,DT_FO_D,T_BC_SUB_D,DT_SUB_D,LINE_ACTIVE_D,DT_BC,DELTA_TMP_MAX_D,TIME_STEP_FACTOR_D, &
             WALL_INCREMENT,TWO_EPS_D,USE_FO,ADAPT_SUBSTEP, &
             Q_IR_D,TMP_D,K_S_D,RDX_D,RDXN_D,INT_RAD_D,BACKING_D,H_FIXED_B_D,TMP_F_D,TMP_G_F_D,HTCF_D,Q_RAD_IN_F_D, &
-            EMISSIVITY_F_D,TMP_B_D,TMP_G_B_D,HTCB_D,Q_RAD_IN_B_D,EMISSIVITY_B_D)
+            EMISSIVITY_F_D,TMP_B_D,TMP_G_B_D,HTCB_D,Q_RAD_IN_B_D,EMISSIVITY_B_D,FRESH_RHO_C_S_D)
             ! Sub-time step of SOLID_HEAT_TRANSFER (FDS 6.11.1): the explicit temperature change over DT_BC from
             ! conduction, the net boundary fluxes and the volumetric sources, relative to DELTA_TMP_MAX.
+            ! wall.f90 takes ONE_D%K_S and ONE_D%RHO_C_S as stored: the first sub-step of a line that was just created or uncovered
+            ! sees the placeholders of INITIALIZE_BOUNDARY_ONE_D (no conduction, RHO_C_S=FRESH_RHO_C_S_D), unless CHECK_FO
+            ! has computed the real values before the loop.
             INTEGER, VALUE :: N_LINES,WALL_INCREMENT,USE_FO,ADAPT_SUBSTEP
             INTEGER, DEVICE :: NODE_OFFSET_D(*),NWP_D(*),COEFF_VALID_D(*),LINE_ACTIVE_D(*)
             REAL(EB), DEVICE :: Q_S_D(*),RHO_C_S_D(*),DT_FO_D(*),T_BC_SUB_D(*),DT_SUB_D(*)
@@ -1565,9 +1644,11 @@ MODULE G_HT1D
             REAL(EB), DEVICE :: Q_IR_D(*),TMP_D(*),K_S_D(*),RDX_D(*),RDXN_D(*),H_FIXED_B_D(*)
             INTEGER, DEVICE :: INT_RAD_D(*),BACKING_D(*)
             REAL(EB), DEVICE :: TMP_F_D(*),TMP_G_F_D(*),HTCF_D(*),Q_RAD_IN_F_D(*),EMISSIVITY_F_D(*)
-            REAL(EB), DEVICE :: TMP_B_D(*),TMP_G_B_D(*),HTCB_D(*),Q_RAD_IN_B_D(*),EMISSIVITY_B_D(*)
+            REAL(EB), DEVICE :: TMP_B_D(*),TMP_G_B_D(*),HTCB_D(*),Q_RAD_IN_B_D(*),EMISSIVITY_B_D(*),FRESH_RHO_C_S_D(*)
 
             INTEGER :: LINE,BASE,NWP,TID,I,IDX,NREDUCE,OFFSET
+            LOGICAL :: USE_FRESH
+            REAL(EB) :: RHO_C,K_P,K_M
             REAL(EB) :: TMP_RATIO,DELTA_TMP,DT_SUB,DT_FO_USE,DELTA_TMP_MAX,Q_CON_F,Q_CON_B,Q_NET_F,Q_NET_B,HTCB,FLUX
             REAL(EB), SHARED :: MAX_RATIO(HT1D_THREADS)
 
@@ -1599,18 +1680,28 @@ MODULE G_HT1D
                         Q_NET_F = Q_RAD_IN_F_D(LINE) - EMISSIVITY_F_D(LINE)*SIGMA*TMP_F_D(LINE)**4 + Q_CON_F
                         Q_NET_B = Q_RAD_IN_B_D(LINE) - EMISSIVITY_B_D(LINE)*SIGMA*TMP_B_D(LINE)**4 + Q_CON_B
                     ENDIF
+                    USE_FRESH = USE_FO==0 .AND. FRESH_RHO_C_S_D(LINE)>0._EB .AND. T_BC_SUB_D(LINE)<=0._EB
                     DO I=TID,NWP,BLOCKDIM%X
                         IDX = BASE + I
-                        IF (RHO_C_S_D(IDX)>TWO_EPS_D) THEN
+                        IF (USE_FRESH) THEN
+                            RHO_C = FRESH_RHO_C_S_D(LINE)
+                            K_P = 0._EB
+                            K_M = 0._EB
+                        ELSE
+                            RHO_C = RHO_C_S_D(IDX)
+                            K_P = K_S_D(IDX)
+                            K_M = K_S_D(IDX-1)
+                        ENDIF
+                        IF (RHO_C>TWO_EPS_D) THEN
                             IF (I==NWP) THEN
-                                FLUX = RDX_D(IDX)*(-Q_NET_B-K_S_D(IDX-1)*RDXN_D(IDX-1)*(TMP_D(IDX)-TMP_D(IDX-1)))
+                                FLUX = RDX_D(IDX)*(-Q_NET_B-K_M*RDXN_D(IDX-1)*(TMP_D(IDX)-TMP_D(IDX-1)))
                             ELSEIF (I==1) THEN
-                                FLUX = RDX_D(IDX)*(K_S_D(IDX)*RDXN_D(IDX)*(TMP_D(IDX+1)-TMP_D(IDX))+Q_NET_F)
+                                FLUX = RDX_D(IDX)*(K_P*RDXN_D(IDX)*(TMP_D(IDX+1)-TMP_D(IDX))+Q_NET_F)
                             ELSE
-                                FLUX = RDX_D(IDX)*(K_S_D(IDX)*RDXN_D(IDX)*(TMP_D(IDX+1)-TMP_D(IDX)) - &
-                                                   K_S_D(IDX-1)*RDXN_D(IDX-1)*(TMP_D(IDX)-TMP_D(IDX-1)))
+                                FLUX = RDX_D(IDX)*(K_P*RDXN_D(IDX)*(TMP_D(IDX+1)-TMP_D(IDX)) - &
+                                                   K_M*RDXN_D(IDX-1)*(TMP_D(IDX)-TMP_D(IDX-1)))
                             ENDIF
-                            DELTA_TMP = (DT_BC/RHO_C_S_D(IDX))*(FLUX + Q_S_D(IDX) + Q_IR_D(IDX))
+                            DELTA_TMP = (DT_BC/RHO_C)*(FLUX + Q_S_D(IDX) + Q_IR_D(IDX))
                             TMP_RATIO = MAX(TMP_RATIO,ABS(DELTA_TMP)/DELTA_TMP_MAX)
                         ENDIF
                     ENDDO
