@@ -3150,9 +3150,29 @@ INTEGER, PARAMETER :: SYMM_POSITIVE_DEFINITE= 2
 ! Timing variable:
 REAL(EB):: TNOW
 
+! Bench of the host UGLMAT path (this build only): GFDS_UGL_PROF=1 writes the times of the parts of every host pressure
+! solve to CHID_uglb.txt; GFDS_UGL_DUMP=<dir> writes the zone matrices (CSR, upper triangle, 1-based), the right-hand
+! sides given to the solver and its solutions of the calls UGLB_DUMP_FIRST..UGLB_DUMP_LAST to <dir>.
+LOGICAL, SAVE, PUBLIC :: UGLB_PROF=.FALSE.
+LOGICAL, SAVE :: UGLB_READ=.FALSE., UGLB_DUMP=.FALSE.
+LOGICAL, SAVE :: UGLB_MAT_DONE(0:63)=.FALSE.
+CHARACTER(256), SAVE :: UGLB_DIR=''
+INTEGER, SAVE, PUBLIC :: UGLB_CALL=0
+INTEGER, SAVE :: UGLB_DUMP_FIRST=11, UGLB_DUMP_LAST=14, UGLB_LU=-1
+REAL(EB), SAVE, PUBLIC :: UGLB_T(0:39)=0._EB
+
+! GPU solve of the UGLMAT/GLMAT matrices (g_ugl.f90, NVIDIA cuDSS): with GLMAT_DEFER_MKL set before the setup, the MKL
+! reordering and factorization of the zone matrices (GET_H_MATRIX_LUDCMP) are left for the first host solve
+! (GLMAT_MKL_FACTOR_PENDING, GLMAT_MKL_FACTOR_ALL); the CSR matrices are built as before.
+LOGICAL, SAVE, PUBLIC :: GLMAT_DEFER_MKL=.FALSE., GLMAT_MKL_FACTOR_PENDING=.FALSE.
+
 PRIVATE
 
 PUBLIC GLMAT_SOLVER_SETUP,GLMAT_SOLVER,COPY_H_OMESH_TO_MESH,FINISH_GLMAT_SOLVER,PRESSURE_SOLVER_CHECK_RESIDUALS_U
+PUBLIC UGLB_SETUP,UGLB_FLUSH,COMPUTE_GUARD_CELL_INDEXES,REG_INTERP_WALL_DISTANCES,IS_UNKH
+#ifdef WITH_MKL
+PUBLIC GLMAT_MKL_FACTOR_ALL
+#endif
 
 CONTAINS
 
@@ -3238,6 +3258,66 @@ END SUBROUTINE DEALLOCATE_H_RESTORE_STORAGE
 
 ! --------------------------- GLMAT_SOLVER -------------------------------------
 
+SUBROUTINE UGLB_SETUP
+INTEGER :: LEN_ENV,ISTAT
+CHARACTER(32) :: BUF
+IF (UGLB_READ) RETURN
+UGLB_READ = .TRUE.
+CALL GET_ENVIRONMENT_VARIABLE('GFDS_UGL_PROF',LENGTH=LEN_ENV,STATUS=ISTAT)
+UGLB_PROF = (ISTAT==0 .AND. LEN_ENV>0)
+CALL GET_ENVIRONMENT_VARIABLE('GFDS_UGL_DUMP',UGLB_DIR,LENGTH=LEN_ENV,STATUS=ISTAT)
+UGLB_DUMP = (ISTAT==0 .AND. LEN_ENV>0)
+CALL GET_ENVIRONMENT_VARIABLE('GFDS_UGL_DUMP_FIRST',BUF,LENGTH=LEN_ENV,STATUS=ISTAT)
+IF (ISTAT==0 .AND. LEN_ENV>0) READ(BUF,*) UGLB_DUMP_FIRST
+CALL GET_ENVIRONMENT_VARIABLE('GFDS_UGL_DUMP_LAST',BUF,LENGTH=LEN_ENV,STATUS=ISTAT)
+IF (ISTAT==0 .AND. LEN_ENV>0) READ(BUF,*) UGLB_DUMP_LAST
+IF (UGLB_PROF .AND. MY_RANK==0) THEN
+   OPEN(NEWUNIT=UGLB_LU,FILE=TRIM(CHID)//'_uglb.txt',STATUS='REPLACE',ACTION='WRITE',FORM='FORMATTED')
+   WRITE(UGLB_LU,'(A)') '# call icyc iter predictor | wait d2h cfacebc fh solve back exch_copy h2d resid_u (ms) | solve per zone (ms)'
+ENDIF
+END SUBROUTINE UGLB_SETUP
+
+SUBROUTINE UGLB_FLUSH(ICYC_IN,ITER_IN)
+INTEGER, INTENT(IN) :: ICYC_IN,ITER_IN
+INTEGER :: IZ
+IF (.NOT.UGLB_PROF .OR. MY_RANK/=0) RETURN  ! NEWUNIT units are negative
+WRITE(UGLB_LU,'(I6,1X,I6,1X,I3,1X,L1,9(1X,F9.3),A,64(1X,F9.3))') UGLB_CALL,ICYC_IN,ITER_IN,PREDICTOR, &
+   1000._EB*UGLB_T(1:9),' |',(1000._EB*UGLB_T(10+IZ),IZ=0,MIN(N_ZONE_GLOBMAT,29))
+FLUSH(UGLB_LU)
+UGLB_T = 0._EB
+END SUBROUTINE UGLB_FLUSH
+
+SUBROUTINE UGLB_WRITE_ZONE(IPZ_IN,WHAT)
+! Dump the matrix (once per zone), or the RHS/solution of call UGLB_CALL, of zone IPZ_IN.
+INTEGER, INTENT(IN) :: IPZ_IN
+CHARACTER(*), INTENT(IN) :: WHAT
+INTEGER :: LU,NNZ
+CHARACTER(512) :: FN
+IF (N_MPI_PROCESSES>1) RETURN
+SELECT CASE(WHAT)
+CASE('mat')
+   IF (UGLB_MAT_DONE(IPZ_IN)) RETURN
+   UGLB_MAT_DONE(IPZ_IN) = .TRUE.
+   NNZ = ZSL%IA_H(ZSL%NUNKH_LOCAL+1)-1
+   WRITE(FN,'(A,"/",A,"_z",I0,"_mat.bin")') TRIM(UGLB_DIR),TRIM(CHID),IPZ_IN
+   OPEN(NEWUNIT=LU,FILE=TRIM(FN),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='REPLACE')
+   WRITE(LU) INT(ZSL%NUNKH_LOCAL,4),INT(NNZ,4),INT(ZSL%MTYPE,4),INT(UGLB_CALL,4)
+   WRITE(LU) INT(ZSL%IA_H(1:ZSL%NUNKH_LOCAL+1),4),INT(ZSL%JA_H(1:NNZ),4),REAL(ZSL%A_H(1:NNZ),8)
+   CLOSE(LU)
+CASE('rhs','sol')
+   WRITE(FN,'(A,"/",A,"_z",I0,"_c",I0,"_",A,".bin")') TRIM(UGLB_DIR),TRIM(CHID),IPZ_IN,UGLB_CALL,WHAT
+   OPEN(NEWUNIT=LU,FILE=TRIM(FN),ACCESS='STREAM',FORM='UNFORMATTED',STATUS='REPLACE')
+   WRITE(LU) INT(ZSL%NUNKH_LOCAL,4)
+   IF (WHAT=='rhs') THEN
+      WRITE(LU) REAL(ZSL%F_H(1:ZSL%NUNKH_LOCAL),8)
+   ELSE
+      WRITE(LU) REAL(ZSL%X_H(1:ZSL%NUNKH_LOCAL),8)
+   ENDIF
+   CLOSE(LU)
+END SELECT
+END SUBROUTINE UGLB_WRITE_ZONE
+
+
 SUBROUTINE GLMAT_SOLVER(T,DT)
 
 USE COMP_FUNCTIONS, ONLY: CURRENT_TIME
@@ -3261,6 +3341,8 @@ TYPE (BOUNDARY_COORD_TYPE), POINTER :: BC
 REAL(EB), POINTER, DIMENSION(:,:,:)   :: HP,RHOP
 REAL(EB) :: SUM_FH(2), SUM_XH(2), SUM_GAUGE(2), MEAN_FH, MEAN_XH, SHIFT_H, VOL, RHO_CC, KRES_CC
 INTEGER :: IERR
+REAL(EB) :: UGLB_T0, UGLB_T1
+LOGICAL :: UGLB_DUMP_NOW
 
 ! INTEGER  :: JCOL
 ! REAL(EB) :: LHS
@@ -3270,7 +3352,13 @@ INTEGER :: IERR
 IF (CC_IBM) CALL_FOR_GLMAT = .TRUE.
 ! Fixed velocity soln. i.e. PERIODIC_TEST=102 => FREEZE_VELOCITY=.TRUE.
 IF (FREEZE_VELOCITY .OR. SOLID_PHASE_ONLY) RETURN
+#ifdef WITH_MKL
+IF (GLMAT_MKL_FACTOR_PENDING) CALL GLMAT_MKL_FACTOR_ALL
+#endif
 TNOW=CURRENT_TIME()
+CALL UGLB_SETUP
+UGLB_CALL = UGLB_CALL + 1
+UGLB_T0 = CURRENT_TIME()
 
 ! Solve:
 NRHS   =  1
@@ -3284,12 +3372,14 @@ DO NM=LOWER_MESH_INDEX,UPPER_MESH_INDEX
    ! Pressure Boundary conditions due to CFACES change BXS, BXF, BYS, BYF.. in external CFACES, and
    CALL GET_PRES_CFACE_BCS(NM,T,DT)
 ENDDO
+UGLB_T1 = CURRENT_TIME(); UGLB_T(3) = UGLB_T(3) + UGLB_T1-UGLB_T0; UGLB_T0 = UGLB_T1
 
 IPZ_LOOP : DO IPZ=0,N_ZONE_GLOBMAT
 
    ZSL => ZONE_SOLVE(IPZ)
 
    IF (ZSL%NUNKH_TOTAL==0) CYCLE
+   UGLB_T0 = CURRENT_TIME()
 
    ! Define rhs F_H, here we use Source and BCs populated on PRESSURE_SOLVER:
    ZSL%F_H = 0._EB
@@ -3344,6 +3434,12 @@ IPZ_LOOP : DO IPZ=0,N_ZONE_GLOBMAT
       ENDIF WHOLE_DOM_IF1
    ENDIF
    ! WRITE(LU_ERR,*) 'SUM_FH=',SUM(F_H),H_MATRIX_INDEFINITE
+   UGLB_DUMP_NOW = UGLB_DUMP .AND. UGLB_CALL>=UGLB_DUMP_FIRST .AND. UGLB_CALL<=UGLB_DUMP_LAST
+   IF (UGLB_DUMP_NOW) THEN
+      CALL UGLB_WRITE_ZONE(IPZ,'mat')
+      CALL UGLB_WRITE_ZONE(IPZ,'rhs')
+   ENDIF
+   UGLB_T1 = CURRENT_TIME(); UGLB_T(4) = UGLB_T(4) + UGLB_T1-UGLB_T0; UGLB_T0 = UGLB_T1
 
    LIBRARY_SELECT: SELECT CASE(UGLMAT_SOLVER_LIBRARY)
    CASE(MKL_CPARDISO_FLAG) LIBRARY_SELECT
@@ -3384,6 +3480,10 @@ IF (ERROR /= 0 .AND. MY_RANK==0) WRITE(LU_ERR,*) 'GLMAT_SOLVER: The following ER
 #endif
 
    END SELECT LIBRARY_SELECT
+   UGLB_T1 = CURRENT_TIME(); UGLB_T(5) = UGLB_T(5) + UGLB_T1-UGLB_T0
+   IF (IPZ<=29) UGLB_T(10+IPZ) = UGLB_T(10+IPZ) + UGLB_T1-UGLB_T0
+   UGLB_T0 = UGLB_T1
+   IF (UGLB_DUMP_NOW) CALL UGLB_WRITE_ZONE(IPZ,'sol')
 
    IF (ZSL%MTYPE==SYMM_INDEFINITE) THEN
       IF ((.NOT.PRES_ON_WHOLE_DOMAIN .OR. N_ZONE<=1) .AND. PERIODIC_TEST/=7) THEN
@@ -3543,6 +3643,7 @@ IF (ERROR /= 0 .AND. MY_RANK==0) WRITE(LU_ERR,*) 'GLMAT_SOLVER: The following ER
 
       ENDDO WALL_CELL_LOOP_2
    ENDDO MESH_LOOP_2
+   UGLB_T(6) = UGLB_T(6) + CURRENT_TIME()-UGLB_T0
 ENDDO IPZ_LOOP
 
 T_USED(5)=T_USED(5)+CURRENT_TIME()-TNOW
@@ -4393,70 +4494,12 @@ IPZ_LOOP : DO IPZ=0,N_ZONE_GLOBMAT
       ZSL%PT_H(I)%DUMMY = 0
    ENDDO
 
-   ! Reorder and Symbolic factorization:
-   PHASE = 11
-#ifdef SINGLE_PRECISION_PSN_SOLVE
-   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
-   ZSL%A_H_FB, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H_FB, ZSL%X_H_FB, MPI_COMM_WORLD, ERROR)
-#else
-   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
-   ZSL%A_H, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H, ZSL%X_H, MPI_COMM_WORLD, ERROR)
-#endif
-
-   IF (ERROR /= 0) THEN
-      IF (MY_RANK==0) THEN
-      WRITE(LU_ERR,'(A,2I5)') 'GET_H_MATRIX_LUDCMP CLUSTER_SOLVER Sym Factor: The following ERROR was detected: ', ERROR,IPZ
-      IF(ERROR == -4) THEN
-         WRITE(LU_ERR,'(A,A)') 'This error is probably due to having one or more sealed compartments ',&
-         'besides a pressure zone with open boundary. Currently this situation is not supported.'
-      ELSEIF(ERROR == -2) THEN
-         WRITE(LU_ERR,'(A)') 'Not enough physical memory in your system for factoring the Poisson Matrix.'
-      ENDIF
-      ENDIF
-      ! Some error - stop flag for CALL STOP_CHECK(1).
-      STOP_STATUS = SETUP_STOP
-      RETURN
-   END IF
-
-   ! Define array of MB required by process, gather data to Master:
-   ALLOCATE(MB_FACTOR(2,0:N_MPI_PROCESSES-1)); MB_FACTOR(:,:)=0
-   MB_FACTOR(1,MY_RANK) = MAX(IPARM(15),IPARM(16)+IPARM(17))/1000
-   MB_FACTOR(2,MY_RANK) = ZSL%NUNKH_LOCAL
-   IF(N_MPI_PROCESSES > 1) &
-   CALL MPI_ALLREDUCE(MPI_IN_PLACE, MB_FACTOR(1,0), 2*N_MPI_PROCESSES, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, IERR)
-   ! Write to output file:
-   IF(MY_RANK==0 .AND. GLMAT_VERBOSE) THEN
-      IPROC=MAXLOC(MB_FACTOR(1,0:N_MPI_PROCESSES-1),DIM=1) - 1 ! MaxLoc defines which element in the array, not index.
-      WRITE(LU_OUTPUT,*) '   MPI Process, H unknowns =',IPROC,MB_FACTOR(2,IPROC), &
-         ', Peak Factorization Memory Required (MB)=',MB_FACTOR(1,IPROC)
-   ENDIF
-   ! Here do Memory test trying to allocate an array?
-   ! Difficult to do, nodes have varying numbers of MPI_PROCESSES and RAM.
-   DEALLOCATE(MB_FACTOR)
-
-   ! Numerical Factorization.
-   PHASE = 22 ! only factorization
-#ifdef SINGLE_PRECISION_PSN_SOLVE
-   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
-   ZSL%A_H_FB, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H_FB, ZSL%X_H_FB, MPI_COMM_WORLD, ERROR)
-#else
-   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
-   ZSL%A_H, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H, ZSL%X_H, MPI_COMM_WORLD, ERROR)
-#endif
-
-   IF (ERROR /= 0) THEN
-      IF (MY_RANK==0) THEN
-      WRITE(LU_ERR,'(A,2I5)') 'GET_H_MATRIX_LUDCMP CLUSTER_SOLVER Num Factor: The following ERROR was detected: ', ERROR,IPZ
-      IF(ERROR == -4) THEN
-         WRITE(LU_ERR,'(A,A)') 'This error is probably due to having one or more sealed compartments ',&
-         ' besides a compartment with/without open boundary. Currently only one pressure zone is supported.'
-      ELSEIF(ERROR == -2) THEN
-         WRITE(LU_ERR,'(A)') 'Not enough physical memory in your system for factoring the Poisson Matrix.'
-      ENDIF
-      ENDIF
-      ! Some error - stop flag for CALL STOP_CHECK(1).
-      STOP_STATUS = SETUP_STOP
-      RETURN
+   ! Reordering and factorization, or left for the first host solve (GPU solve of the matrices, g_ugl.f90):
+   IF (GLMAT_DEFER_MKL) THEN
+      GLMAT_MKL_FACTOR_PENDING = .TRUE.
+   ELSE
+      CALL MKL_FACTOR_ZONE(ERROR)
+      IF (ERROR/=0) RETURN
    ENDIF
 #endif
 
@@ -4590,6 +4633,107 @@ ENDDO IPZ_LOOP
 IF(GLMAT_VERBOSE) MSGLVL = 0
 
 END SUBROUTINE GET_H_MATRIX_LUDCMP
+
+#ifdef WITH_MKL
+! ------------------------------ GLMAT_MKL_FACTOR_ALL ---------------------------------
+! Reordering and factorization of the zone matrices left by GET_H_MATRIX_LUDCMP with GLMAT_DEFER_MKL: done at the
+! first host solve (GLMAT_SOLVER), i.e. only when the GPU solve of the matrices is not used.
+
+SUBROUTINE GLMAT_MKL_FACTOR_ALL
+INTEGER :: ERROR
+GLMAT_MKL_FACTOR_PENDING = .FALSE.
+IF (UGLMAT_SOLVER_LIBRARY/=MKL_CPARDISO_FLAG) RETURN
+IF(GLMAT_VERBOSE) MSGLVL = 1
+DO IPZ=0,N_ZONE_GLOBMAT
+   ZSL => ZONE_SOLVE(IPZ); IF(ZSL%NUNKH_TOTAL==0) CYCLE
+   CALL MKL_FACTOR_ZONE(ERROR)
+   IF (ERROR/=0) EXIT
+ENDDO
+IF(GLMAT_VERBOSE) MSGLVL = 0
+END SUBROUTINE GLMAT_MKL_FACTOR_ALL
+
+! ------------------------------ MKL_FACTOR_ZONE --------------------------------------
+! MKL cluster sparse solver reordering (phase 11) and numerical factorization (phase 22) of the matrix of zone IPZ (ZSL),
+! as GET_H_MATRIX_LUDCMP did them. ERROR/=0 (and STOP_STATUS=SETUP_STOP) on failure.
+
+SUBROUTINE MKL_FACTOR_ZONE(ERROR)
+USE MPI_F08
+INTEGER, INTENT(OUT) :: ERROR
+INTEGER :: PHASE, PERM(1), IPROC, IERR, MAXFCT, MNUM, NRHS
+INTEGER, ALLOCATABLE, DIMENSION(:,:) :: MB_FACTOR
+
+NRHS = 1; MAXFCT = 1; MNUM = 1; ERROR = 0; IERR = 0
+IPARM(41) = ZSL%LOWER_ROW
+IPARM(42) = ZSL%UPPER_ROW
+
+   ! Reorder and Symbolic factorization:
+   PHASE = 11
+#ifdef SINGLE_PRECISION_PSN_SOLVE
+   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
+   ZSL%A_H_FB, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H_FB, ZSL%X_H_FB, MPI_COMM_WORLD, ERROR)
+#else
+   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
+   ZSL%A_H, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H, ZSL%X_H, MPI_COMM_WORLD, ERROR)
+#endif
+
+   IF (ERROR /= 0) THEN
+      IF (MY_RANK==0) THEN
+      WRITE(LU_ERR,'(A,2I5)') 'GET_H_MATRIX_LUDCMP CLUSTER_SOLVER Sym Factor: The following ERROR was detected: ', ERROR,IPZ
+      IF(ERROR == -4) THEN
+         WRITE(LU_ERR,'(A,A)') 'This error is probably due to having one or more sealed compartments ',&
+         'besides a pressure zone with open boundary. Currently this situation is not supported.'
+      ELSEIF(ERROR == -2) THEN
+         WRITE(LU_ERR,'(A)') 'Not enough physical memory in your system for factoring the Poisson Matrix.'
+      ENDIF
+      ENDIF
+      ! Some error - stop flag for CALL STOP_CHECK(1).
+      STOP_STATUS = SETUP_STOP
+      RETURN
+   END IF
+
+   ! Define array of MB required by process, gather data to Master:
+   ALLOCATE(MB_FACTOR(2,0:N_MPI_PROCESSES-1)); MB_FACTOR(:,:)=0
+   MB_FACTOR(1,MY_RANK) = MAX(IPARM(15),IPARM(16)+IPARM(17))/1000
+   MB_FACTOR(2,MY_RANK) = ZSL%NUNKH_LOCAL
+   IF(N_MPI_PROCESSES > 1) &
+   CALL MPI_ALLREDUCE(MPI_IN_PLACE, MB_FACTOR(1,0), 2*N_MPI_PROCESSES, MPI_INTEGER, MPI_SUM, MPI_COMM_WORLD, IERR)
+   ! Write to output file:
+   IF(MY_RANK==0 .AND. GLMAT_VERBOSE) THEN
+      IPROC=MAXLOC(MB_FACTOR(1,0:N_MPI_PROCESSES-1),DIM=1) - 1 ! MaxLoc defines which element in the array, not index.
+      WRITE(LU_OUTPUT,*) '   MPI Process, H unknowns =',IPROC,MB_FACTOR(2,IPROC), &
+         ', Peak Factorization Memory Required (MB)=',MB_FACTOR(1,IPROC)
+   ENDIF
+   ! Here do Memory test trying to allocate an array?
+   ! Difficult to do, nodes have varying numbers of MPI_PROCESSES and RAM.
+   DEALLOCATE(MB_FACTOR)
+
+   ! Numerical Factorization.
+   PHASE = 22 ! only factorization
+#ifdef SINGLE_PRECISION_PSN_SOLVE
+   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
+   ZSL%A_H_FB, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H_FB, ZSL%X_H_FB, MPI_COMM_WORLD, ERROR)
+#else
+   CALL CLUSTER_SPARSE_SOLVER (ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
+   ZSL%A_H, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H, ZSL%X_H, MPI_COMM_WORLD, ERROR)
+#endif
+
+   IF (ERROR /= 0) THEN
+      IF (MY_RANK==0) THEN
+      WRITE(LU_ERR,'(A,2I5)') 'GET_H_MATRIX_LUDCMP CLUSTER_SOLVER Num Factor: The following ERROR was detected: ', ERROR,IPZ
+      IF(ERROR == -4) THEN
+         WRITE(LU_ERR,'(A,A)') 'This error is probably due to having one or more sealed compartments ',&
+         ' besides a compartment with/without open boundary. Currently only one pressure zone is supported.'
+      ELSEIF(ERROR == -2) THEN
+         WRITE(LU_ERR,'(A)') 'Not enough physical memory in your system for factoring the Poisson Matrix.'
+      ENDIF
+      ENDIF
+      ! Some error - stop flag for CALL STOP_CHECK(1).
+      STOP_STATUS = SETUP_STOP
+      RETURN
+   ENDIF
+
+END SUBROUTINE MKL_FACTOR_ZONE
+#endif
 
 ! -------------------------------- SET_CLUSTER_SOLVER_IPARM ---------------------------------
 #ifdef WITH_MKL
@@ -5781,7 +5925,7 @@ PHASE = -1
 DO IPZ=0,N_ZONE_GLOBMAT
    ZSL => ZONE_SOLVE(IPZ); IF(ZSL%NUNKH_TOTAL==0) CYCLE
    ! Finalize Cluster Sparse Solver:
-   IF (UGLMAT_SOLVER_LIBRARY==MKL_CPARDISO_FLAG) THEN
+   IF (UGLMAT_SOLVER_LIBRARY==MKL_CPARDISO_FLAG .AND. .NOT.GLMAT_MKL_FACTOR_PENDING) THEN
 #ifdef WITH_MKL
    CALL CLUSTER_SPARSE_SOLVER(ZSL%PT_H, MAXFCT, MNUM, ZSL%MTYPE, PHASE, ZSL%NUNKH_TOTAL, &
    ZSL%A_H, ZSL%IA_H, ZSL%JA_H, PERM, NRHS, IPARM, MSGLVL, ZSL%F_H, ZSL%X_H, MPI_COMM_WORLD, ERROR)
@@ -5804,6 +5948,7 @@ DO NOM=1,NMESHES
 ENDDO
 
 DEALLOCATE(ZONE_SOLVE)
+GLMAT_MKL_FACTOR_PENDING = .FALSE.
 
 RETURN
 END SUBROUTINE FINISH_GLMAT_SOLVER

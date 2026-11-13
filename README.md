@@ -8,10 +8,32 @@ an NVIDIA A100 this release is 4–19 times faster than FDS 6.11.1 on CPU, typic
 
 Author and maintainer of the fork: **Ilya Karkin**, [pyrosim.ru](https://pyrosim.ru).
 
-The default branch `firesim` holds the current release, `firecat-611b`: the GFDS GPU code on the FDS 6.11.1 source
+The default branch `firesim` holds the current release, `firecat-611c`: the GFDS GPU code on the FDS 6.11.1 source
 (tag `FDS-6.11.1`).
 
-### Changes since `firecat-611`
+### Changes since `firecat-611b`
+
+- **UGLMAT pressure solver on the GPU.** With `&PRES SOLVER='UGLMAT' /` (also `'GLMAT PARDISO'`) the pressure
+  Poisson equation is now solved on the GPU with [NVIDIA cuDSS](https://developer.nvidia.com/cudss) instead of MKL
+  on the host. The default solver is still FFT and its path is unchanged; UGLMAT is used only when the input asks
+  for it. UGLMAT has no FFT error at mesh interfaces, so closed rooms and pressure zones keep their pressure as in
+  FDS 6.11.1 with UGLMAT; we recommend it for models where zone pressure matters.
+  - Speed on an A100, ms per time step: model of 8 meshes 19–21 (MKL on the host: 286–318, FFT: 26); one mesh
+    13.7 (MKL: 272–305); FDS verification cases with UGLMAT 2–10 times faster than with MKL.
+  - Checked against FDS 6.11.1 (UGLMAT on CPU): 8-mesh building model to 306 s, zone pressures within 1e-7–1e-5;
+    simple FDS verification cases within 1e-9 and closer; against UGLMAT with MKL in this build — within the
+    run-to-run spread of the GPU build.
+  - The matrix is rebuilt on the GPU when obstructions or holes change. If the cuDSS library is not found or the
+    card has too little free memory, the run falls back to MKL on the host and says so in the `.out`.
+    `GFDS_UGLMAT_GPU=0` always uses MKL. The GPU solve is used with one MPI process.
+- **Models of many small meshes:** the stages of a time step run as CUDA graphs per mesh, fills and copies go in
+  the mesh streams, pressure-zone sums are read back in one copy: an 8-mesh model of 95 000 cells went from
+  37–40 to 29–30 ms per step. Large meshes are unchanged.
+- **Numerical instability on the GPU** now writes the same diagnostics block to the `.out` as FDS 6.11.1 (CFL,
+  VN, velocity and pressure errors with mesh and cell), and the slices at the stop step are written from current
+  fields.
+
+### Changes in `firecat-611b`
 
 Fixes found by comparing GPU runs of building models with FDS 6.11.1 on CPU:
 
@@ -29,7 +51,7 @@ Fixes found by comparing GPU runs of building models with FDS 6.11.1 on CPU:
 - fires: `HRRPUA` with `SPREAD_RATE`, `BURN_AWAY`, `MATL` with `RAMP` properties;
 - lumped species and `VISIBILITY`; `SLCF`, `BNDF`, `DEVC`, including smoke and heat detectors;
 - `OBST`/`HOLE`, many meshes, `VENT` with `RAMP`, `DEVC`/`CTRL`, pressure zones with `LEAK`;
-- wind, Deardorff turbulence, the FFT pressure solver, `CONSTANT_SPECIFIC_HEAT_RATIO`;
+- wind, Deardorff turbulence, the FFT pressure solver and UGLMAT (NVIDIA cuDSS), `CONSTANT_SPECIFIC_HEAT_RATIO`;
 - particles and sprinklers (on the host).
 
 ### How it was checked
@@ -138,6 +160,16 @@ cmake --build build-single -j8
 ```
 
 The resulting executable is `build/fds`.
+
+UGLMAT on the GPU needs NVIDIA cuDSS 1.0 for CUDA 12 (not included; download it from NVIDIA under its license):
+
+```bash
+cmake -S . -B build -DGFDS_CUDSS=ON -DCUDSS_ROOT=/path/to/libcudss
+cmake --build build -j8
+```
+
+`libcudss.so.1` is opened at the first UGLMAT solve, looked up in `GFDS_CUDSS_LIB`, next to `fds`, in
+`CUDSS_ROOT/lib` and in `LD_LIBRARY_PATH`. A build without `GFDS_CUDSS` solves UGLMAT with MKL as before.
 
 ## Run
 

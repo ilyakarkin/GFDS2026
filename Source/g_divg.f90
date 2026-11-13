@@ -8,6 +8,10 @@ MODULE G_DIVG
     USE G_CONS
     USE G_FUNC
     USE CUDAFOR
+    ! The zone sums DSUM, PSUM, USUM (1:N_ZONE each) of all meshes, gathered on the device by DIVERGENCE_PART_1_GPU
+    ! (slot 3*N_ZONE*(NM-1)) and read back at once by DIVERGENCE_PART_1_ZONE_SUMS_GPU
+    REAL(EB), DEVICE, ALLOCATABLE :: ZONE_SUMS_ALL_D(:)
+    REAL(EB), PINNED, ALLOCATABLE :: ZONE_SUMS_ALL_H(:)
     CONTAINS
 
         !--------------------------------------------------------------------------
@@ -254,7 +258,13 @@ MODULE G_DIVG
                 ZZPD => GM%ZZD
             END SELECT
 
-            DPD = 0._EB
+            ! Fill kernels on the mesh stream instead of array assignments: an assignment fills on the legacy default
+            ! stream, which waits for the device work of all meshes and cannot be captured into a stage graph
+            IF (PREDICTOR) THEN
+                CALL GPU_FILL(GM%DS_D,SIZE(GM%DS_D),0._EB,GM%STRM)
+            ELSE
+                CALL GPU_FILL(GM%D_D,SIZE(GM%D_D),0._EB,GM%STRM)
+            ENDIF
 
             R_PBAR = 1._EB/PBAR_P
             SM_RCON_1 = SPECIES_MIXTURE(1)%RCON
@@ -269,7 +279,7 @@ MODULE G_DIVG
             ! KDTDN_GPU_BOUNDARY stores the gas conductivity at the wall (B1%K_G in divg.f90) for WALL_BC_GPU: the
             ! Q_CON_F of OPEN boundaries (INFLOW_OUTFLOW) and the Q_COND output use it.
             WALL_K_G_D_TMP => GM%WALL_K_G
-            IF (CHECK_VN) GM%D_Z_MAXD = 0._EB
+            IF (CHECK_VN) CALL GPU_FILL(GM%D_Z_MAXD,SIZE(GM%D_Z_MAXD),0._EB,GM%STRM)
 
             IF (GPU_DEBUG_H2D_D2H) THEN
                 GM%TMPD      = TMP
@@ -425,7 +435,7 @@ MODULE G_DIVG
                         DPD,GM%DEL_RHO_D_DEL_ZD,GM%SWORK1D,GM%SWORK2D,GM%SWORK3D,GM%WORK5D,GM%WORK6D,GM%WORK7D,GM%RDXD,GM%RDYD,GM%RDZD,IBAR,JBAR,KBAR,N)
                 ENDDO
             ELSE
-                GM%DEL_RHO_D_DEL_ZD = 0._EB
+                CALL GPU_FILL(GM%DEL_RHO_D_DEL_ZD,SIZE(GM%DEL_RHO_D_DEL_ZD),0._EB,GM%STRM)
             ENDIF
 
             ! ---- CPU block: cp / r_h_g (divg.f90: not with CONSTANT_SPECIFIC_HEAT_RATIO) ----
@@ -611,6 +621,16 @@ MODULE G_DIVG
                     GM%WALL_PRESSURE_ZONE, GM%WALL_TOPO_AOS, N_EXTERNAL_WALL_CELLS, N_INTERNAL_WALL_CELLS, N_ZONE, &
                     MERGE(1,0,PREDICTOR), GM%INTERPOLATED_MESHD, IBAR, JBAR)
 
+                ! Gather the three sums of this mesh in its slot of ZONE_SUMS_ALL_D (one read-back for all meshes)
+                IF (.NOT.ALLOCATED(ZONE_SUMS_ALL_D)) THEN
+                    ALLOCATE(ZONE_SUMS_ALL_D(3*N_ZONE*NMESHES),ZONE_SUMS_ALL_H(3*N_ZONE*NMESHES))
+                ELSEIF (SIZE(ZONE_SUMS_ALL_D)<3*N_ZONE*NMESHES) THEN
+                    DEALLOCATE(ZONE_SUMS_ALL_D,ZONE_SUMS_ALL_H)
+                    ALLOCATE(ZONE_SUMS_ALL_D(3*N_ZONE*NMESHES),ZONE_SUMS_ALL_H(3*N_ZONE*NMESHES))
+                ENDIF
+                CALL ZONE_SUMS_GATHER_GPU<<<(N_ZONE+127)/128,128,0,GM%STRM>>>(ZONE_SUMS_ALL_D,GM%DSUM_BLOCK_D, &
+                    GM%PSUM_BLOCK_D,GM%USUM_BLOCK_D,3*N_ZONE*(NM-1),N_ZONE)
+
                 ! The zone sums are read back by DIVERGENCE_PART_1_ZONE_SUMS_GPU after the mesh loop, so that the host does
                 ! not wait here for the device work of this mesh before it launches the next one.
                 GM%ZONE_SUMS_PENDING = .TRUE.
@@ -654,29 +674,40 @@ MODULE G_DIVG
 
         END SUBROUTINE DIVERGENCE_PART_1_GPU
 
-        !> Add the pressure-zone integrals of mesh NM, accumulated on the device by DIVERGENCE_PART_1_GPU, to DSUM, PSUM
-        !> and USUM. Called for the meshes in the order of the DIVERGENCE_PART_1_GPU loop, after it, so the sums are
-        !> formed in the same order as before (bitwise the same).
+        !> Add the pressure-zone integrals of the meshes NM_LO:NM_HI, accumulated on the device by DIVERGENCE_PART_1_GPU,
+        !> to DSUM, PSUM and USUM. Called after the DIVERGENCE_PART_1_GPU loop; the sums are added mesh by mesh in the
+        !> order of that loop, as before (bitwise the same). One device-to-host copy for all meshes (ZONE_SUMS_ALL_D,
+        !> the synchronous copy waits for the device work of all mesh streams) instead of three copies and a wait per mesh.
 
-        SUBROUTINE DIVERGENCE_PART_1_ZONE_SUMS_GPU(NM)
-            INTEGER, INTENT(IN) :: NM
-            REAL(EB), ALLOCATABLE, DIMENSION(:) :: DSUM_ZONE_H, PSUM_ZONE_H, USUM_ZONE_H
+        SUBROUTINE DIVERGENCE_PART_1_ZONE_SUMS_GPU(NM_LO,NM_HI)
+            INTEGER, INTENT(IN) :: NM_LO,NM_HI
+            INTEGER :: NM,O,ISTAT
 
-            GM => GPU_MESHES(NM)
-            IF (.NOT.GM%ZONE_SUMS_PENDING) RETURN
-            GM%ZONE_SUMS_PENDING = .FALSE.
-
-            ALLOCATE(DSUM_ZONE_H(1:N_ZONE),PSUM_ZONE_H(1:N_ZONE),USUM_ZONE_H(1:N_ZONE))
-            CALL GPU_WAIT(GM%STRM)
-            DSUM_ZONE_H = GM%DSUM_BLOCK_D(1:N_ZONE)
-            PSUM_ZONE_H = GM%PSUM_BLOCK_D(1:N_ZONE)
-            USUM_ZONE_H = GM%USUM_BLOCK_D(1:N_ZONE)
-            DSUM(1:N_ZONE) = DSUM(1:N_ZONE) + DSUM_ZONE_H(1:N_ZONE)
-            PSUM(1:N_ZONE) = PSUM(1:N_ZONE) + PSUM_ZONE_H(1:N_ZONE)
-            USUM(1:N_ZONE) = USUM(1:N_ZONE) + USUM_ZONE_H(1:N_ZONE)
-            DEALLOCATE(DSUM_ZONE_H,PSUM_ZONE_H,USUM_ZONE_H)
+            IF (.NOT.ANY(GPU_MESHES(NM_LO:NM_HI)%ZONE_SUMS_PENDING)) RETURN
+            O = 3*N_ZONE*(NM_LO-1)
+            ISTAT = cudaMemcpy(ZONE_SUMS_ALL_H(O+1),ZONE_SUMS_ALL_D(O+1),3*N_ZONE*(NM_HI-NM_LO+1))
+            DO NM=NM_LO,NM_HI
+                GM => GPU_MESHES(NM)
+                IF (.NOT.GM%ZONE_SUMS_PENDING) CYCLE
+                GM%ZONE_SUMS_PENDING = .FALSE.
+                O = 3*N_ZONE*(NM-1)
+                DSUM(1:N_ZONE) = DSUM(1:N_ZONE) + ZONE_SUMS_ALL_H(O+1:O+N_ZONE)
+                PSUM(1:N_ZONE) = PSUM(1:N_ZONE) + ZONE_SUMS_ALL_H(O+N_ZONE+1:O+2*N_ZONE)
+                USUM(1:N_ZONE) = USUM(1:N_ZONE) + ZONE_SUMS_ALL_H(O+2*N_ZONE+1:O+3*N_ZONE)
+            ENDDO
 
         END SUBROUTINE DIVERGENCE_PART_1_ZONE_SUMS_GPU
+
+        ATTRIBUTES(GLOBAL) SUBROUTINE ZONE_SUMS_GATHER_GPU(ZS,DSUM_B,PSUM_B,USUM_B,O,N_ZONE)
+            REAL(EB), DEVICE :: ZS(*),DSUM_B(*),PSUM_B(*),USUM_B(*)
+            INTEGER, VALUE :: O,N_ZONE
+            INTEGER :: I
+            I = (BLOCKIDX%X-1)*BLOCKDIM%X + THREADIDX%X
+            IF (I>N_ZONE) RETURN
+            ZS(O+I)          = DSUM_B(I)
+            ZS(O+N_ZONE+I)   = PSUM_B(I)
+            ZS(O+2*N_ZONE+I) = USUM_B(I)
+        END SUBROUTINE ZONE_SUMS_GATHER_GPU
 
         !--------------------------------------------------------------------------
         ! Divergence part 1 wall-input synchronization

@@ -5,7 +5,7 @@
 MODULE G_VELO
     USE G_MESH_POINTERS
     USE G_FUNC
-    USE G_ERRO, ONLY: GPU_WAIT
+    USE G_ERRO, ONLY: GPU_WAIT,GPU_FILL
 
     CONTAINS
         SUBROUTINE COMPUTE_VISCOSITY_GPU(NM,DT,APPLY_TO_ESTIMATED_VARIABLES)
@@ -2529,8 +2529,9 @@ MODULE G_VELO
             GRD_AXIS2 = DIM3((GM%N_EDGE_AXIS2 + BLK%X - 1)/BLK%X,1,1)
             GRD_AXIS3 = DIM3((GM%N_EDGE_AXIS3 + BLK%X - 1)/BLK%X,1,1)
 
-            GM%EDGE_GHOST_1 = 0._EB
-            GM%EDGE_GHOST_2 = 0._EB
+            ! Fill kernels on the mesh stream (an array assignment fills on the legacy default stream)
+            CALL GPU_FILL(GM%EDGE_GHOST_1,SIZE(GM%EDGE_GHOST_1),0._EB,GM%STRM)
+            CALL GPU_FILL(GM%EDGE_GHOST_2,SIZE(GM%EDGE_GHOST_2),0._EB,GM%STRM)
             DO NOM=1,NMESHES
                 IF (.NOT.ALLOCATED(GM%OMESH)) EXIT
                 GOM_LOCAL => GM%OMESH(NOM)

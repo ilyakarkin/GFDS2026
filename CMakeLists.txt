@@ -11,6 +11,7 @@ project(FDS LANGUAGES Fortran)
 # Optional SUNDIALS dependency for CVODE detailed chemistry.
 option(USE_SUNDIALS "Enable CVODE detailed chemistry through SUNDIALS" OFF)
 option(SINGLE_PRECISION "Build with EB and QB in single precision" OFF)
+option(GFDS_CUDSS "GLMAT/UGLMAT pressure equation on the GPU with NVIDIA cuDSS (libcudss.so.1 loaded at run time)" OFF)
 
 # Source directory.
 set(SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/Source")
@@ -65,6 +66,7 @@ set(FDS_SOURCES
   ${SRC_DIR}/g_wall.f90
   ${SRC_DIR}/g_divg.f90
   ${SRC_DIR}/g_pres.f90
+  ${SRC_DIR}/g_ugl.f90
   ${SRC_DIR}/g_velo.f90
   ${SRC_DIR}/g_radi.f90
   ${SRC_DIR}/g_tools.f90
@@ -117,6 +119,27 @@ set_source_files_properties(Source/func.f90 Source/dump.f90 PROPERTIES COMPILE_D
 
 if(SINGLE_PRECISION)
   target_compile_definitions(fds PRIVATE GFDS_SINGLE_PRECISION)
+endif()
+
+# cuDSS (G_UGLMAT, g_ugl.f90) is not linked: libcudss.so.1 is opened at run time (GFDS_CUDSS_LIB, next to the
+# executable, CUDSS_ROOT/lib given here, or the library path); its dependencies libcublas.so.12, libcublasLt.so.12,
+# libnvrtc.so.12 are looked up on the library path, next to the executable and in GFDS_CUDA_LIBDIRS.
+if(GFDS_CUDSS)
+  set(CUDSS_ROOT "" CACHE PATH "cuDSS root (lib/libcudss.so.1), searched at run time")
+  get_filename_component(_cudss_fc_bin "${CMAKE_Fortran_COMPILER}" DIRECTORY)
+  get_filename_component(_cudss_nvhpc "${_cudss_fc_bin}/../.." ABSOLUTE)
+  file(GLOB _cudss_cuda_dirs LIST_DIRECTORIES true "${_cudss_nvhpc}/math_libs/12.*/lib64" "${_cudss_nvhpc}/cuda/12.*/lib64")
+  string(REPLACE ";" ":" _cudss_cuda_dirs "${_cudss_cuda_dirs}")
+  set(GFDS_CUDA_LIBDIRS "${_cudss_cuda_dirs}" CACHE STRING "Directories of libcublas.so.12 and libnvrtc.so.12 (colon separated)")
+  target_compile_definitions(fds PRIVATE WITH_CUDSS)
+  if(CUDSS_ROOT)
+    target_compile_definitions(fds PRIVATE "GFDS_CUDSS_LIBDIR='${CUDSS_ROOT}/lib'")
+  endif()
+  if(GFDS_CUDA_LIBDIRS)
+    target_compile_definitions(fds PRIVATE "GFDS_CUDA_LIBDIRS='${GFDS_CUDA_LIBDIRS}'")
+  endif()
+  target_link_libraries(fds PRIVATE dl)
+  message(STATUS "cuDSS: ${CUDSS_ROOT}, CUDA 12 libraries: ${GFDS_CUDA_LIBDIRS}")
 endif()
 
 if(USE_SUNDIALS)

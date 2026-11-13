@@ -4,11 +4,50 @@
 !------------------------------------------------------------------------------
 MODULE G_MASS
     USE GLOBAL_CONSTANTS, ONLY: STORE_SPECIES_FLUX
-    USE G_ERRO, ONLY: GPU_WAIT
+    USE G_ERRO, ONLY: GPU_WAIT,GPU_FILL,GPU_COPY
     USE G_MESH_POINTERS
     USE G_FUNC
     USE CUDAFOR
+    ! Page-locked copies of the zone pressures PBAR_S (predictor) and PBAR (corrector) of zones 1:N_ZONE, one slab of
+    ! (KBP1+1)*N_ZONE values per mesh and kind from PBAR_PIN_OFF(1:2,NM) on, the source of their host-to-device copies
+    ! in DENSITY_GPU: a copy from pageable memory cannot be captured into a stage graph. A slab is written again at the
+    ! next DENSITY_GPU of the same mesh and kind, after the device waits of the time step.
+    REAL(EB), PINNED, ALLOCATABLE :: PBAR_PIN(:)
+    INTEGER, ALLOCATABLE :: PBAR_PIN_OFF(:,:)
     CONTAINS
+        !> The page-locked zone pressures of DENSITY_GPU, allocated at its first call with zones
+        SUBROUTINE PBAR_PIN_ENSURE
+            INTEGER :: NM_P,N_TOTAL
+            IF (ALLOCATED(PBAR_PIN)) RETURN
+            ALLOCATE(PBAR_PIN_OFF(2,NMESHES))
+            N_TOTAL = 0
+            DO NM_P=1,NMESHES
+                PBAR_PIN_OFF(1,NM_P) = N_TOTAL
+                PBAR_PIN_OFF(2,NM_P) = N_TOTAL + (MESHES(NM_P)%KBP1+1)*N_ZONE
+                N_TOTAL = N_TOTAL + 2*(MESHES(NM_P)%KBP1+1)*N_ZONE
+            ENDDO
+            ALLOCATE(PBAR_PIN(N_TOTAL))
+            PBAR_PIN = 0._EB
+        END SUBROUTINE PBAR_PIN_ENSURE
+
+        !> Zones 1:N_ZONE of P(0:KBP1,0:N_ZONE) to the page-locked slab IKIND of mesh NM and on to PD (asynchronous, STREAM)
+        SUBROUTINE PBAR_PIN_TO_DEVICE(P,PD,IKIND,NM,STREAM)
+            REAL(EB), INTENT(IN) :: P(0:,0:)
+            REAL(EB), DEVICE :: PD(0:,0:)
+            INTEGER, INTENT(IN) :: IKIND,NM
+            INTEGER(KIND=CUDA_STREAM_KIND), INTENT(IN) :: STREAM
+            INTEGER :: I,K,O,NK,ISTAT
+            CALL PBAR_PIN_ENSURE
+            NK = MESHES(NM)%KBP1+1
+            O = PBAR_PIN_OFF(IKIND,NM)
+            DO I=1,N_ZONE
+                DO K=0,NK-1
+                    PBAR_PIN(O+(I-1)*NK+K+1) = P(K,I)
+                ENDDO
+            ENDDO
+            ISTAT = cudaMemcpyAsync(PD(0,1),PBAR_PIN(O+1),NK*N_ZONE,STREAM)
+        END SUBROUTINE PBAR_PIN_TO_DEVICE
+
         !--------------------------------------------------------------------------
         ! Mass finite-difference host orchestration and kernels
         !--------------------------------------------------------------------------
@@ -405,7 +444,10 @@ MODULE G_MASS
                         ENDDO
                     ENDIF
                 ENDIF
-                IF (FIRST_PASS) GM%SWORK4D = GM%DEL_RHO_D_DEL_ZD
+                ! Copy and fill kernels on the mesh stream instead of array assignments here and below: an assignment
+                ! runs on the legacy default stream, which waits for the device work of all meshes and cannot be captured
+                ! into a stage graph
+                IF (FIRST_PASS) CALL GPU_COPY(GM%SWORK4D,GM%DEL_RHO_D_DEL_ZD,SIZE(GM%SWORK4D),GM%STRM)
                 ! Predictor pressure-zone update.
                 ! Pressure zone 0 is static and was copied during GPU initialization.
                 DO I=1,N_ZONE
@@ -414,12 +456,13 @@ MODULE G_MASS
                 ! One contiguous host-to-device copy of zones 1:N_ZONE, in the order of the mesh stream. The array section
                 ! assignment was compiled as a copy of the whole device array to the host and back, and its device-to-host
                 ! part waited for all queued device work.
-                IF (N_ZONE>0) ISTAT = cudaMemcpyAsync(GM%PBAR_SD(0,1),PBAR_S(0,1),(KBP1+1)*N_ZONE,GM%STRM)
+                ! Through a page-locked copy (PBAR_PIN), which a stage graph can capture
+                IF (N_ZONE>0) CALL PBAR_PIN_TO_DEVICE(PBAR_S,GM%PBAR_SD,1,NM,GM%STRM)
 
                 ! Restore density-equation velocity at interpolated boundaries.
-                UUD = GM%UD
-                VVD = GM%VD
-                WWD = GM%WD
+                CALL GPU_COPY(GM%WORK_UD,GM%UD,SIZE(GM%WORK_UD),GM%STRM)
+                CALL GPU_COPY(GM%WORK_VD,GM%VD,SIZE(GM%WORK_VD),GM%STRM)
+                CALL GPU_COPY(GM%WORK_WD,GM%WD,SIZE(GM%WORK_WD),GM%STRM)
                 CALL DENSITY_APPLY_UVW_SAVE_KERNEL<<<(N_EXTERNAL_WALL_CELLS+255)/256,256,0,GM%STRM>>>( &
                     UUD,VVD,WWD,GM%UVW_SAVED,GM%WALL_TOPO_AOS,GM%WALL_BOUNDARY_TYPE_PREVIOUSD, &
                     0,N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY,IBP1,JBP1)
@@ -504,12 +547,12 @@ MODULE G_MASS
                 DO I=1,N_ZONE
                     PBAR(:,I) = 0.5_EB*(PBAR(:,I) + PBAR_S(:,I) + D_PBAR_DT_S(I)*DT)
                 ENDDO
-                IF (N_ZONE>0) ISTAT = cudaMemcpyAsync(GM%PBARD(0,1),PBAR(0,1),(KBP1+1)*N_ZONE,GM%STRM)
+                IF (N_ZONE>0) CALL PBAR_PIN_TO_DEVICE(PBAR,GM%PBARD,2,NM,GM%STRM)
 
                 ! Restore density-equation velocity at interpolated boundaries.
-                UUD = GM%USD
-                VVD = GM%VSD
-                WWD = GM%WSD
+                CALL GPU_COPY(GM%WORK_UD,GM%USD,SIZE(GM%WORK_UD),GM%STRM)
+                CALL GPU_COPY(GM%WORK_VD,GM%VSD,SIZE(GM%WORK_VD),GM%STRM)
+                CALL GPU_COPY(GM%WORK_WD,GM%WSD,SIZE(GM%WORK_WD),GM%STRM)
                 CALL DENSITY_APPLY_UVW_SAVE_KERNEL<<<(N_EXTERNAL_WALL_CELLS+255)/256,256,0,GM%STRM>>>( &
                     UUD,VVD,WWD,GM%UVW_SAVED,GM%WALL_TOPO_AOS,GM%WALL_BOUNDARY_TYPE_PREVIOUSD, &
                     1,N_EXTERNAL_WALL_CELLS,INTERPOLATED_BOUNDARY,IBP1,JBP1)
@@ -575,11 +618,11 @@ MODULE G_MASS
             BLKD = GM%BLKD_3D_BP1
             GRDD = GM%GRDD_3D_BP1
 
-            GM%WORK10D = 0._EB
-            GM%IWORK1D(0,0,0) = 0
-            GM%IWORK1D(0,0,1) = 0
-            ! IWORK1D(1,0,0) and IWORK1D(2,0,0) are mass.f90 CLIP_RHOMIN and CLIP_RHOMAX (cleared on the mesh stream)
-            CALL CLIP_FLAGS_ZERO_GPU<<<1,1,0,GM%STRM>>>(GM%IWORK1D)
+            ! Fill kernels on the mesh stream (array assignments run on the legacy default stream)
+            CALL GPU_FILL(GM%WORK10D,SIZE(GM%WORK10D),0._EB,GM%STRM)
+            ! IWORK1D(0,0,0) and IWORK1D(0,0,1) count clipped cells, IWORK1D(1,0,0) and IWORK1D(2,0,0) are mass.f90
+            ! CLIP_RHOMIN and CLIP_RHOMAX
+            CALL CLIP_FLAGS_ZERO_GPU<<<1,1,0,GM%STRM>>>(GM%IWORK1D,(IBP1+1)*(JBP1+1))
             CALL CHECK_MASS_DENSITY_RHO_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                 RHOPD,GM%WORK10D,GM%DXD,GM%DYD,GM%DZD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%CELL_WALL_INDEX, &
                 GM%IWORK1D,RHOMIN,RHOMAX,TWO_EPSILON_EB,IBAR,JBAR,KBAR,GM%CELL_LB,GM%CELL_UB)
@@ -597,7 +640,7 @@ MODULE G_MASS
             ! IWORK1D(0,0,1) counts clipped cells over all species; it is not reset per species, so the
             ! final normalization runs if any species was clipped (FDS 48399d97ad)
             DO N=1,N_TRACKED_SPECIES
-                GM%WORK11D = 0._EB
+                CALL GPU_FILL(GM%WORK11D,SIZE(GM%WORK11D),0._EB,GM%STRM)
                 CALL CHECK_MASS_DENSITY_RHO_ZZ_GPU<<<GRDD,BLKD,0,GM%STRM>>>( &
                     RHOPD,RHO_ZZD,GM%WORK11D,GM%DXD,GM%DYD,GM%DZD,GM%CELL_INDEXD,GM%CELL_SOLID,GM%CELL_WALL_INDEX, &
                     GM%IWORK1D,TWO_EPSILON_EB,IBAR,JBAR,KBAR,N,GM%CELL_LB,GM%CELL_UB)
@@ -610,10 +653,13 @@ MODULE G_MASS
 
         END SUBROUTINE CHECK_MASS_DENSITY_GPU
 
-        ATTRIBUTES(GLOBAL) SUBROUTINE CLIP_FLAGS_ZERO_GPU(CLIP_FLAG)
-            INTEGER, DEVICE :: CLIP_FLAG(0:*)   ! IWORK1D(0:IBP1,0:JBP1,0:KBP1): (1,0,0) and (2,0,0)
+        ATTRIBUTES(GLOBAL) SUBROUTINE CLIP_FLAGS_ZERO_GPU(CLIP_FLAG,K1)
+            INTEGER, DEVICE :: CLIP_FLAG(0:*)   ! IWORK1D(0:IBP1,0:JBP1,0:KBP1): (0,0,0), (1,0,0), (2,0,0) and (0,0,1)
+            INTEGER, VALUE :: K1                ! offset of (0,0,1)
+            CLIP_FLAG(0) = 0
             CLIP_FLAG(1) = 0
             CLIP_FLAG(2) = 0
+            CLIP_FLAG(K1) = 0
         END SUBROUTINE CLIP_FLAGS_ZERO_GPU
 
         ATTRIBUTES(GLOBAL) SUBROUTINE CLIP_FLAGS_TO_MESH_REDUCE_GPU(CLIP_FLAG,MESH_REDUCE,I0)
